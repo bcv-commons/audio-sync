@@ -1,0 +1,21 @@
+# Whisper transcription dependencies
+# Install with: pip install -r requirements-whisper.txt
+#
+# Backend is selected automatically at runtime:
+#   - Apple Silicon Mac  → mlx-whisper  (Metal GPU via MLX framework)
+#   - NVIDIA CUDA GPU    → faster-whisper (CUDA via CTranslate2)
+#   - Other / CPU        → faster-whisper (CPU via CTranslate2)
+
+# Apple Silicon / MLX backend (only works on macOS arm64)
+mlx>=0.21.0
+mlx-whisper>=0.4.0
+
+# CUDA / CPU backend (works on Linux, Windows, and non-Apple-Silicon macOS)
+faster-whisper>=1.0.0
+
+# CUDA 12 runtime libraries required by faster-whisper on NVIDIA GPU systems.
+# These install the shared libraries (.so/.dll) that CTranslate2 needs.
+# Safe to install on CPU-only systems (they are no-ops without a GPU).
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cuda-nvrtc-cu12

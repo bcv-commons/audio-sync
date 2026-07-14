@@ -1,0 +1,33 @@
+# Claude local context (not committed)
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+
+# Batch manifests (fetched/hand-crafted locally)
+_batches/
+_runs/
+
+# Downloaded/generated audio, text, and alignment output (runtime data)
+downloads/
+sorted/
+export/
+api-cache/
+download_log/
+
+# OS cruft
+.DS_Store
