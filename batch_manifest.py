@@ -12,7 +12,9 @@ Usage:
     BATCH_ID=<id> python whisper_transcribe.py
     or set --batch-id CLI arg and pass it through to load_batch().
 
-Expected manifest shape at _batches/<id>.json (or data/_batches/<id>.json):
+Expected manifest shape at _batches/<id>.json (or data/_batches/<id>.json),
+or at https://cdn.bibel.wiki/_batches/queue/{high,normal,low}/<id>.json if
+not found locally:
 {
   "id": "<batch_id>",
   "template": "<template_id>",
@@ -28,24 +30,35 @@ Expected manifest shape at _batches/<id>.json (or data/_batches/<id>.json):
   ]
 }
 
-Status (2026-07-14): STUB. Core's batch emitter (Phase 3 of the repo split)
-is not yet implemented. Until then, place a hand-crafted _batches/<id>.json
-and set BATCH_ID. See internal-docs/audio-sync-interface.md in MONO for
-the full contract specification.
+Status (2026-07-15): Core now publishes under the Contract C tiered queue
+(internal-docs/audio-sync-interface.md §7 in MONO) — high/normal/low
+priority directories, not the old flat _batches/<id>.json path. This module
+only does discovery/fetch (checks local dirs, then tries each CDN tier);
+the priority-queue worker loop itself (§7.2 cooperative preemption between
+chapters) is future work, not built yet.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 _BATCH_DIRS = [Path("_batches"), Path("data/_batches")]
 
+BATCH_CDN_QUEUE_BASE = "https://cdn.bibel.wiki/_batches/queue/"
+_QUEUE_TIERS = ("high", "normal", "low")
+
 
 def load_batch(batch_id: Optional[str] = None) -> dict:
-    """Load a batch manifest by ID (env BATCH_ID or explicit arg)."""
+    """Load a batch manifest by ID (env BATCH_ID or explicit arg).
+
+    Checks local dirs first (for hand-crafted test manifests), then falls
+    back to fetching from CDN — tries each priority tier (high, normal,
+    low) in turn — and caches the result to _batches/<id>.json.
+    """
     bid = batch_id or os.environ.get("BATCH_ID")
     if not bid:
         raise RuntimeError(
@@ -58,9 +71,27 @@ def load_batch(batch_id: Optional[str] = None) -> dict:
         if path.exists():
             with open(path) as f:
                 return json.load(f)
+
+    # Not found locally — try each CDN priority tier, cache what we get
+    for tier in _QUEUE_TIERS:
+        try:
+            req = urllib.request.Request(
+                f"{BATCH_CDN_QUEUE_BASE}{tier}/{bid}.json",
+                headers={"User-Agent": "audio-sync"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+        except Exception:
+            continue
+        cache_path = _BATCH_DIRS[0] / f"{bid}.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(data)
+        return json.loads(data)
+
     searched = ", ".join(str(d / f"{bid}.json") for d in _BATCH_DIRS)
+    searched += ", " + ", ".join(f"{BATCH_CDN_QUEUE_BASE}{t}/{bid}.json" for t in _QUEUE_TIERS)
     raise FileNotFoundError(
-        f"Batch manifest not found for id={bid!r}.\nSearched: {searched}"
+        f"Batch manifest not found for id={bid!r} locally or on CDN.\nSearched: {searched}"
     )
 
 

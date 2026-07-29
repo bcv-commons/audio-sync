@@ -50,7 +50,6 @@ import argparse
 import difflib
 import json
 import re
-import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -59,6 +58,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from batch_manifest import load_batch, get_book_chapters
+from download_language_content import download_job
 from text_processing import LanguageConfig, load_language_config, normalize_text
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -248,19 +248,6 @@ def classify_template_refs(refs: Dict[str, Set[int]]) -> Dict[str, Dict[str, Set
         elif book in OT_BOOKS:
             result["ot"][book] = chapters
     return result
-
-
-def refs_to_books_spec(refs: Dict[str, Set[int]]) -> str:
-    """
-    Convert {BOOK: {chapters}} to download_language_content.py --books format.
-    E.g., "GEN:1,2,3 MAT:1,5,10"
-    """
-    specs = []
-    for book in sorted(refs.keys()):
-        chapters = sorted(refs[book])
-        chapter_list = ",".join(str(c) for c in chapters)
-        specs.append(f"{book}:{chapter_list}")
-    return " ".join(specs)
 
 
 # ─── Language Resolution ────────────────────────────────────────────────────
@@ -639,12 +626,13 @@ def discover_chapter_files(
                 srt_filename = f"{file_book}_{chapter_str}_{audio_fileset}.srt"
                 srt_path = out_book_dir / srt_filename
 
-                # Skip if whisper words already generated
-                if whisper_words_path.exists() and not force:
-                    skipped += 1
-                    continue
-
-                # Skip if final timing output already exists
+                # Skip only if the chapter is fully complete (final fused
+                # output already exists) — NOT merely because Whisper's
+                # word-timing exists. Whisper finishing doesn't mean MMS/
+                # fusion did too (e.g. a crash mid-chapter); each step's own
+                # skip-if-exists check in align_pipeline.py's main loop is
+                # what actually short-circuits already-done steps, so this
+                # must still surface the chapter for those checks to run.
                 timing_filename = f"{file_book}_{chapter_str}_{audio_fileset}_timing.json"
                 timing_path = out_book_dir / timing_filename
                 if timing_path.exists() and not force:
@@ -704,27 +692,46 @@ def check_and_report_audio(
         if total_available == 0:
             log(f"  {iso}/{canon.upper()}/{distinct_id}: 0/{expected} chapters (no audio+text pairs)")
         elif total_available >= expected:
-            done_info = f", {skipped} already transcribed" if skipped else ""
+            done_info = f", {skipped} already complete" if skipped else ""
             log(f"  {iso}/{canon.upper()}/{distinct_id}: {total_available}/{expected} chapters (complete{done_info})")
         else:
             log(f"  {iso}/{canon.upper()}/{distinct_id}: {total_available}/{expected} chapters ({', '.join(books_found)})")
 
 
-def download_audio_for_chapters(iso: str, books_spec: str):
-    """Download audio+text for specific chapters using the existing download script."""
-    cmd = [
-        sys.executable, "download_language_content.py",
-        iso,
-        "--books", books_spec,
-        "--content-types", "audio,text",
-    ]
-    log(f"Downloading: {' '.join(cmd)}")
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        log(f"Download failed with exit code {e.returncode}", "ERROR")
-    except FileNotFoundError:
-        log("download_language_content.py not found", "ERROR")
+def download_audio_for_chapters(
+    iso: str,
+    canon: str,
+    distinct_id: Optional[str],
+    chapters_by_book: Dict[str, Set[int]],
+    audio_fileset: Optional[str] = None,
+    text_fileset: Optional[str] = None,
+    text_source: Optional[str] = None,
+) -> bool:
+    """Fetch audio+text for specific chapters via download_language_content.download_job().
+
+    audio_fileset/text_fileset/text_source come from an enriched batch job
+    (see batch_manifest.py) when the caller has one — passed straight
+    through so download_job() can skip its own catalog resolution entirely.
+    """
+    if distinct_id is None:
+        log(
+            f"  Skipping {iso}/{canon.upper()}: no distinct_id resolved "
+            "(batch job must supply one — see batch_manifest.py)",
+            "WARN",
+        )
+        return False
+    job = {
+        "iso": iso,
+        "canon": canon.upper(),
+        "distinct_id": distinct_id,
+        "chapters": {book: sorted(chs) for book, chs in chapters_by_book.items()},
+    }
+    if audio_fileset:
+        job["audio_fileset"] = audio_fileset
+        job["text_fileset"] = text_fileset
+        job["text_source"] = text_source
+    log(f"Downloading: {iso}/{canon.upper()}/{distinct_id}")
+    return download_job(job, content_types=["audio", "text"])
 
 
 # ─── Whisper Transcription ──────────────────────────────────────────────────
@@ -1507,8 +1514,6 @@ Examples:
             if not canon_refs:
                 continue
 
-            books_spec = refs_to_books_spec(canon_refs)
-
             # Check what's already downloaded (flat structure)
             existing = 0
             iso_dir = DOWNLOADS_DIR / canon / iso
@@ -1532,8 +1537,8 @@ Examples:
             if existing >= needed:
                 continue  # All files present, skip download
 
-            log(f"Downloading audio+text for {iso}/{canon.upper()} ({books_spec})...")
-            download_audio_for_chapters(iso, books_spec)
+            log(f"Downloading audio+text for {iso}/{canon.upper()}...")
+            download_audio_for_chapters(iso, canon, item["distinct_id"], canon_refs)
 
         # Regenerate work items after download (directories may now exist)
         work_items = generate_work_items(languages, args.testament, refs_by_canon)

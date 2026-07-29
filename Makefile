@@ -1,6 +1,8 @@
 PYTHON := .venv/bin/python
 
 .PHONY: all align align-whisper align-mms align-fuse \
+        import-contrib prepare-cross-source \
+        publish-align publish-align-dry \
         quality-check quality-compare quality-report \
         install check help
 
@@ -16,6 +18,16 @@ help: ## Show available targets
 	@echo "  make align-whisper  Step 1a: Whisper transcription"
 	@echo "  make align-mms      Step 1b: MMS forced alignment"
 	@echo "  make align-fuse     Step 2:  Fuse Whisper + MMS into final timing"
+	@echo ""
+	@echo "  Content preparation"
+	@echo "  ────────────────────"
+	@echo "  make import-contrib       Import contrib/ into downloads/contrib/"
+	@echo "  make prepare-cross-source Fetch helloAO text for DBT audio-only filesets"
+	@echo ""
+	@echo "  Publishing"
+	@echo "  ──────────"
+	@echo "  make publish-align      Publish timing-data + run manifest to cdn.bibel.wiki/align/"
+	@echo "  make publish-align-dry  Dry-run (no writes)"
 	@echo ""
 	@echo "  Quality tools"
 	@echo "  ─────────────"
@@ -47,6 +59,26 @@ align-mms: ## Step 1b: MMS forced alignment
 
 align-fuse: ## Step 2: Fuse Whisper + MMS into final timing
 	$(PYTHON) align_words.py $(ARGS)
+
+# ---------------------------------------------------------------------------
+# Content preparation
+# ---------------------------------------------------------------------------
+
+import-contrib: ## Import contrib/ into downloads/contrib/
+	$(PYTHON) import_contrib.py $(ARGS)
+
+prepare-cross-source: ## Fetch helloAO text for DBT audio-only filesets
+	$(PYTHON) prepare_cross_source.py $(ARGS)
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+publish-align: ## Publish timing-data + run manifest to cdn.bibel.wiki/align/
+	scripts/publish-align.sh
+
+publish-align-dry: ## Dry-run publish-align (no writes)
+	DRY_RUN=1 scripts/publish-align.sh
 
 # ---------------------------------------------------------------------------
 # Quality tools

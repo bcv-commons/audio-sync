@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """
-Download Bible content using canonical structure (NT/OT/PARTIAL).
+Fetch Bible audio/text/timing content from DBT (+ helloAO fallback) for a
+single resolved batch_manifest.py job.
 
-This script uses the new canonical metadata from sorted/BB/ which organizes
-content by canon (NT, OT, PARTIAL).
+This is the fetch half of what used to be a combined catalog+fetch script.
+The "what to align" decision (which language/version/chapters) is made
+upstream by core (bible-story-builder) and handed to this repo as a batch
+manifest job — see batch_manifest.py. This file no longer does any of its
+own template/language/exclusion scanning; it only knows how to pull DBT
+filesets (and helloAO external text) down to disk for a job it's given.
 
 Usage:
-    # Download specific language and books (default: all content types)
-    python download_language_content.py eng --books Test
-    python download_language_content.py spa --books GEN:1-3,MAT:1-5
+    # Fetch every job in a batch manifest (BATCH_ID env var or --batch-id)
+    BATCH_ID=<id> python download_language_content.py
+    python download_language_content.py --batch-id <id> --content-types audio,text
 
-    # Download with story sets
-    python download_language_content.py eng --books "OBS Intro OT+NT"
-
-    # Download specific content types
-    python download_language_content.py eng --books Test --content-types audio
-    python download_language_content.py eng --books Test --content-types text,timing
-    python download_language_content.py eng --books Test --content-types audio,text,timing
+    # Call the fetch primitive directly from another script (preferred):
+    from download_language_content import download_job
+    download_job({"iso": "eng", "canon": "NT", "distinct_id": "ENGKJV",
+                  "chapters": {"MAT": [1, 2, 3]}})
 
 Prerequisites:
-    1. Run sort_cache_data.py first to generate sorted/BB/
-    2. Set BIBLE_API_KEY in .env file
+    1. Set BIBLE_API_KEY in .env file
+
+Fileset resolution for unenriched jobs (no audio_fileset/text_fileset given)
+comes from the `bibles` repo's published DBT catalogs on CDN — see
+get_best_fileset_from_catalog() and its module comment. This replaced the
+old local sorted/BB scan (2026-07-29): sorted/BB required running MONO's
+sort_cache_data.py locally and was never populated in this repo; the CDN
+catalogs need no local generation step and are validated against the live
+DBT API at publish time.
 
 Output:
     downloads/BB/{canon}/{iso}/{distinct_id}/{BOOK}/
@@ -30,14 +39,13 @@ Output:
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 try:
     import requests
@@ -47,6 +55,8 @@ except ImportError as e:
     print("Please run: pip install -r requirements.txt")
     print(f"Missing module: {e.name}")
     sys.exit(1)
+
+from batch_manifest import load_batch, get_jobs
 
 # Load environment variables
 load_dotenv()
@@ -59,15 +69,23 @@ DOWNLOAD_TIMEOUT = 60
 API_RATE_DELAY = 0.0  # seconds between API calls, set via --rate-delay
 
 # Directories
-SORTED_DIR = Path("sorted/BB")
 OUTPUT_DIR = Path("downloads/BB")
-CONFIG_DIR = Path("config")
-STORY_SET_CONFIG = CONFIG_DIR / "story-set.conf"
-TEMPLATE_DIR = Path("templates")
 ERROR_LOG_DIR = Path("download_log")
+# CROSSREF_PATH / _load_crossref() below is MONO's own naming-convention
+# ebible crossref — same unverified-guessing category as the old helloAO ID
+# matching (see _find_helloao_id's history). It's only used as a last-resort
+# ebible_id lookup in _get_external_text_source() and has no catalog-overlap
+# equivalent yet (catalog-overlap.json only covers dbt/helloao/pkf, no
+# ebible ids) — still a real gap, not superseded.
 CROSSREF_PATH = Path("data/version-crossref.json")
 HELLOAO_API = "https://bible.helloao.org/api"
-HELLOAO_CACHE = Path("api-cache/helloao")
+
+# `bibles` repo's published DBT catalogs (2026-07-29) — replace the old
+# local sorted/BB fileset scan and the old {iso}_{version} naming-guess for
+# helloAO matching. See get_best_fileset_from_catalog() / _find_helloao_id().
+DBT_CATALOG_CDN_BASE = "https://cdn.bibel.wiki/dbt/_app/"
+DBT_CATALOG_CACHE_DIR = Path("api-cache/dbt-catalog")
+_dbt_catalog_cache: Dict[str, dict] = {}
 
 _crossref_cache = None
 
@@ -113,30 +131,167 @@ def _extract_version_id(iso, distinct_id):
     return distinct_id
 
 
-def _find_helloao_id(iso, version_id):
-    """Find the helloAO translation ID for a language/version.
-    Convention: {iso}_{vid} in lowercase, e.g., gaz_bib."""
-    # Check helloAO cache for matching translation
-    cache_file = HELLOAO_CACHE / "available_translations.json"
-    if not cache_file.exists():
-        return None
+def _load_dbt_catalog(name: str) -> dict:
+    """Fetch+cache one of the `bibles` repo's published DBT catalogs.
+
+    name is one of "catalog-text", "catalog-audio", "catalog-overlap"
+    (cdn.bibel.wiki/dbt/_app/<name>.json). Checks the on-disk cache first,
+    then fetches from CDN and caches the raw response — same
+    fetch-then-cache pattern as batch_manifest.py's queue tiers. Returns
+    {} (not an exception) on any fetch/parse failure so callers degrade to
+    "no match found" rather than crashing a whole batch over one lookup.
+    """
+    if name in _dbt_catalog_cache:
+        return _dbt_catalog_cache[name]
+
+    cache_path = DBT_CATALOG_CACHE_DIR / f"{name}.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                data = json.load(f)
+            _dbt_catalog_cache[name] = data
+            return data
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    import urllib.request
+
+    url = f"{DBT_CATALOG_CDN_BASE}{name}.json"
     try:
-        with open(cache_file) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, IOError):
+        req = urllib.request.Request(url, headers={"User-Agent": "audio-sync"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        data = json.loads(raw)
+    except Exception as e:
+        log(f"Failed to fetch {url}: {e}", "WARNING")
+        data = {}
+        _dbt_catalog_cache[name] = data
+        return data
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(raw)
+    _dbt_catalog_cache[name] = data
+    return data
+
+
+def _catalog_entries(iso: str, canon: str, distinct_id: str, catalog_name: str) -> list:
+    """Look up one distinct_id's entries in catalog-text.json/catalog-audio.json.
+
+    Tries the full canon key (nt/ot) first, then the portion variant
+    (ntp/otp) for languages whose only DBT coverage is a partial testament.
+    """
+    catalog = _load_dbt_catalog(catalog_name).get("entries", {})
+    canon_l = canon.lower()
+    for key in (f"{iso}:{canon_l}", f"{iso}:{canon_l}p"):
+        by_distinct_id = catalog.get(key, {})
+        if distinct_id in by_distinct_id:
+            return by_distinct_id[distinct_id]
+    return []
+
+
+def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Optional[Dict]:
+    """
+    Resolve the best audio/text fileset for (iso, canon, distinct_id) from
+    the `bibles` repo's catalog-text.json/catalog-audio.json — the CDN
+    replacement for the old local sorted/BB scan.
+
+    Each catalog entry stores only the *suffix* after distinct_id (e.g.
+    "id": "a:N2DA" under distinct_id "ENGKJV" reconstructs to fileset id
+    "ENGKJVN2DA"); the bibles team validated this reconstruction against
+    the live DBT API at publish time, and it round-tripped independently
+    against a couple of samples used here too (e.g. AAIWBT, AAAMLTN_ET).
+
+    Canon-level only — catalog entries don't carry DBT's per-book size/
+    coverage field the way sorted/BB metadata did, so a fileset picked
+    here is assumed to cover every book in canon. That matches how batch
+    jobs are already scoped (core resolves iso/canon/distinct_id, not
+    individual books, before chapters are handed to this job).
+
+    Returns the same shape as the old get_best_fileset_for_book(), minus
+    per-book text_fileset variation.
+    """
+    audio_entries = _catalog_entries(iso, canon, distinct_id, "catalog-audio")
+    text_entries = _catalog_entries(iso, canon, distinct_id, "catalog-text")
+
+    if not audio_entries and not text_entries:
         return None
 
-    vid_lower = version_id.lower()
-    for t in data.get("translations", []):
-        if not isinstance(t, dict):
+    # Audio priority (lower tuple = preferred), same ordering as the old
+    # sorted/BB logic: non-dramatized > dramatized, non-streaming >
+    # streaming, mp3 > opus.
+    audio_fileset = None
+    alt_audio_fileset = None
+    audio_candidates = []
+    for e in audio_entries:
+        suffix = e["id"][2:]  # strip "a:" prefix
+        fid = f"{distinct_id}{suffix}"
+        is_dramatized = "2DA" in fid or "2SA" in fid
+        is_stream = fid.endswith("SA")
+        is_opus = e.get("c") == "opus"
+        priority = (int(is_dramatized), int(is_stream), int(is_opus), fid)
+        audio_candidates.append((priority, fid, is_dramatized))
+    if audio_candidates:
+        audio_candidates.sort()
+        audio_fileset = audio_candidates[0][1]
+        primary_is_drama = audio_candidates[0][2]
+        for _, fid, is_drama in audio_candidates[1:]:
+            if is_drama != primary_is_drama and "-opus" not in fid:
+                alt_audio_fileset = fid
+                break
+
+    # Text priority: plain > json > other. USX dropped entirely — same
+    # reasoning as the old code: DBT's USX endpoint often 404s even when
+    # the fileset is listed.
+    text_candidates = []
+    for e in text_entries:
+        fmt = e.get("fmt", [])
+        if fmt == ["u"]:
             continue
-        tid = t.get("id", "")
-        lang = t.get("language", "")
-        if lang == iso:
-            # Match by version ID suffix
-            tid_suffix = tid.replace(f"{iso}_", "").replace(f"{iso}", "")
-            if tid_suffix.lower() == vid_lower or tid_suffix.upper() == version_id:
-                return tid
+        suffix = e["id"][2:]  # strip "t:" prefix
+        fid = f"{distinct_id}{suffix}"
+        base = 0 if "pl" in fmt else 1 if "j" in fmt else 2
+        text_candidates.append(((base, fid), fid))
+    text_candidates.sort()
+    text_fileset_candidates = [fid for _, fid in text_candidates]
+    text_fileset = text_fileset_candidates[0] if text_fileset_candidates else None
+
+    if not audio_fileset and not text_fileset:
+        return None
+
+    result = {
+        "distinct_id": distinct_id,
+        "canon": canon,
+        "audio_fileset": audio_fileset,
+        "text_fileset": text_fileset,
+        "text_fileset_candidates": text_fileset_candidates,
+        # Not carried by catalog-{text,audio}.json — timing existence is
+        # discovered per-chapter by download_timing()'s own 404 handling,
+        # same as the enriched-manifest path already does.
+        "timing_available": False,
+    }
+    if alt_audio_fileset:
+        result["alt_audio_fileset"] = alt_audio_fileset
+    return result
+
+
+def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> Optional[str]:
+    """Find a *verified* helloAO translation match via catalog-overlap.json.
+
+    This is real text comparison done by the `bibles` repo, not naming-
+    convention guessing — replaces the old {iso}_{version_id} pattern
+    match, which the bibles team flagged as unreliable and dropped from
+    their own equivalent tooling for the same reason.
+    """
+    catalog = _load_dbt_catalog("catalog-overlap").get("entries", {})
+    canon_l = canon.lower()
+    for key in (f"{iso}:{canon_l}", f"{iso}:{canon_l}p"):
+        for group in catalog.get(key, []):
+            ids = group.get("ids", [])
+            if f"d:{distinct_id}" not in ids:
+                continue
+            for i in ids:
+                if i.startswith("h:"):
+                    return i[2:]
     return None
 
 
@@ -187,7 +342,7 @@ def _get_external_text_source(iso, distinct_id):
         dbt = sources.get("dbt", "")
         if "a" in dbt and "t" not in dbt:
             if sources.get("helloao") == "t":
-                hao_id = _find_helloao_id(iso, vid)
+                hao_id = _find_helloao_id(iso, tkey, distinct_id)
                 if hao_id:
                     return "helloao", hao_id
             if sources.get("ebible") == "t":
@@ -297,9 +452,6 @@ NT_BOOKS = {
     "JUD": 1,
     "REV": 22,
 }
-
-ALL_BOOKS = {**OT_BOOKS, **NT_BOOKS}
-
 
 # Statistics tracking
 class DownloadStats:
@@ -430,148 +582,6 @@ def log(message: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 
-def load_story_sets() -> Dict[str, List[Tuple[str, List[int]]]]:
-    """Load story sets from config file."""
-    story_sets = {}
-
-    if not STORY_SET_CONFIG.exists():
-        return story_sets
-
-    with open(STORY_SET_CONFIG) as f:
-        current_set = None
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            if ":" not in line:
-                # Story set name
-                current_set = line
-                story_sets[current_set] = []
-            elif current_set:
-                # Parse comma-separated book:chapter specs
-                for spec in line.split(","):
-                    spec = spec.strip()
-                    if ":" in spec:
-                        book, chapter_spec = spec.split(":", 1)
-                        chapters = parse_chapter_spec(chapter_spec.strip())
-                        story_sets[current_set].append((book.strip(), chapters))
-
-    return story_sets
-
-
-def load_template_references(template_id: str) -> List[Tuple[str, List[int]]]:
-    """
-    Load Bible references from all .md files in templates/<template_id>/.
-
-    Supports both flat and hierarchical template structures:
-    - Flat: templates/OBS/01.md, templates/OBS/02.md
-    - Hierarchical: templates/OBS/01/01.md, templates/OBS/02/04.md
-
-    Only processes numbered .md files (story content), ignores index.md (navigation).
-
-    Returns list of (book, chapters) tuples similar to story sets.
-    """
-    template_path = TEMPLATE_DIR / template_id
-
-    if not template_path.exists() or not template_path.is_dir():
-        log(f"Error: Template directory not found: {template_path}", "ERROR")
-        return []
-
-    # Pattern to match: [[ref:BOOK CHAPTER:VERSES]]
-    # Examples: [[ref:GEN 1:1-2]], [[ref:LUK 1:5-7]], [[ref:GEN 1:10,22]]
-    ref_pattern = re.compile(r"\[\[ref:\s*([A-Z0-9]+)\s+(\d+):[^\]]+\]\]")
-
-    # Dictionary to collect chapters per book
-    book_chapters: Dict[str, set] = defaultdict(set)
-
-    # Find all .md files in template directory (recursive to support hierarchical structure)
-    md_files = sorted(template_path.rglob("*.md"))
-
-    if not md_files:
-        log(f"Warning: No .md files found in {template_path}", "WARN")
-        return []
-
-    log(f"Scanning {len(md_files)} template files in {template_path}", "INFO")
-
-    # Process each markdown file
-    for md_file in md_files:
-        # Only process numbered files (story content), skip index.md and other non-story files
-        if not md_file.stem[0:1].isdigit():
-            continue
-
-        try:
-            with open(md_file, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            # Find all references
-            matches = ref_pattern.findall(content)
-            for book, chapter in matches:
-                book_chapters[book.upper()].add(int(chapter))
-
-        except Exception as e:
-            log(f"Warning: Error reading {md_file}: {e}", "WARN")
-            continue
-
-    # Convert to list of tuples with sorted chapters
-    result = []
-    for book in sorted(book_chapters.keys()):
-        chapters = sorted(list(book_chapters[book]))
-        result.append((book, chapters))
-
-    # Log what was found
-    if result:
-        log(f"Found references in template '{template_id}':", "INFO")
-        for book, chapters in result:
-            chapter_str = ",".join(map(str, chapters))
-            log(f"  {book}: {chapter_str}", "INFO")
-    else:
-        log(f"Warning: No Bible references found in template '{template_id}'", "WARN")
-
-    return result
-
-
-def parse_chapter_spec(spec: str) -> List[int]:
-    """Parse chapter specification like '1', '1-5', '1,3,5' into list of chapter numbers."""
-    chapters = []
-    for part in spec.split(","):
-        part = part.strip()
-        if "-" in part:
-            start, end = part.split("-")
-            chapters.extend(range(int(start), int(end) + 1))
-        else:
-            chapters.append(int(part))
-    return sorted(set(chapters))
-
-
-def expand_book_spec(book_spec: str) -> List[Tuple[str, List[int]]]:
-    """
-    Expand book specification into list of (book, chapters).
-
-    Examples:
-        'GEN' -> [('GEN', [1..50])]
-        'GEN:1-3' -> [('GEN', [1,2,3])]
-        'Test' -> [('PSA', [117]), ('REV', [15])]
-    """
-    story_sets = load_story_sets()
-
-    # Check if it's a story set
-    if book_spec in story_sets:
-        return story_sets[book_spec]
-
-    # Parse individual book spec
-    if ":" in book_spec:
-        book, chapter_spec = book_spec.split(":", 1)
-        book = book.strip().upper()
-        chapters = parse_chapter_spec(chapter_spec)
-    else:
-        book = book_spec.strip().upper()
-        if book not in ALL_BOOKS:
-            log(f"Unknown book: {book}", "ERROR")
-            return []
-        chapters = list(range(1, ALL_BOOKS[book] + 1))
-
-    return [(book, chapters)]
 
 
 def determine_book_canon(book: str) -> str:
@@ -581,234 +591,6 @@ def determine_book_canon(book: str) -> str:
     elif book in NT_BOOKS:
         return "NT"
     return "UNKNOWN"
-
-
-def load_language_metadata(iso: str, canon: Optional[str] = None) -> Dict[str, Dict]:
-    """
-    Load metadata for a language from sorted/BB/{iso}/.
-
-    Args:
-        iso: Language ISO code
-        canon: Optional canon filter (NT, OT, PARTIAL)
-
-    Returns:
-        Dictionary of metadata by fileset_id
-    """
-    metadata_by_fileset = {}
-
-    lang_dir = SORTED_DIR / iso
-    if not lang_dir.exists():
-        return metadata_by_fileset
-
-    for fileset_dir in lang_dir.iterdir():
-        if not fileset_dir.is_dir():
-            continue
-
-        metadata_file = fileset_dir / "metadata.json"
-        if not metadata_file.exists():
-            continue
-
-        with open(metadata_file) as f:
-            metadata = json.load(f)
-
-        # Filter by canon if specified
-        if canon:
-            metadata_canon = metadata.get("canon", "")
-            if metadata_canon != canon:
-                continue
-
-        fileset_id = metadata.get("fileset", {}).get("id", "")
-        if fileset_id:
-            metadata_by_fileset[fileset_id] = metadata
-
-    return metadata_by_fileset
-
-
-def get_distinct_id_from_metadata(metadata: dict) -> str:
-    """Extract distinct ID (Bible abbreviation) from metadata."""
-    bible_abbr = metadata.get("bible", {}).get("abbr", "")
-    if bible_abbr:
-        return bible_abbr.upper()
-
-    # Fallback to extracting from fileset_id if bible.abbr is missing
-    fileset_id = metadata.get("fileset", {}).get("id", "")
-    if len(fileset_id) >= 6:
-        return fileset_id[:6].upper()
-    return fileset_id.upper()
-
-
-def fileset_contains_book(metadata: Dict, book: str, canon: str) -> bool:
-    """Check if a fileset contains a specific book based on size field.
-
-    DBT size codes seen in the wild:
-      NT      — full New Testament
-      OT      — full Old Testament
-      C       — Complete (NT + OT)
-      NTP     — NT Portion (partial NT)
-      OTP     — OT Portion (partial OT)
-      NTOTP   — NT (full) + OT Portion (partial OT)   ← common for IBT bibles
-      NTPOTP  — NT Portion + OT Portion (both partial)
-      OTNTP   — OT (full) + NT Portion (legacy spelling)
-      P / S / PARTIAL — generic partial/story content
-    """
-    fileset_size = metadata.get("fileset", {}).get("size", "")
-
-    # Full NT coverage
-    if fileset_size in ("NT", "C", "NTOTP"):
-        if book in NT_BOOKS:
-            return True
-    # Full OT coverage
-    if fileset_size in ("OT", "C", "OTNTP"):
-        if book in OT_BOOKS:
-            return True
-    # Partial NT (may or may not contain this specific NT book — let API decide)
-    if fileset_size in ("NTP", "NTTP", "NTPOTP", "OTNTP") and book in NT_BOOKS:
-        return True
-    # Partial OT (may or may not contain this specific OT book — let API decide)
-    if fileset_size in ("OTP", "OTTP", "NTPOTP", "NTOTP") and book in OT_BOOKS:
-        return True
-    # Generic partial / story
-    if fileset_size in ("P", "S", "PARTIAL"):
-        return True
-
-    return False
-
-
-def get_best_fileset_for_book(
-    metadata_by_fileset: Dict[str, Dict], book: str
-) -> Optional[Dict]:
-    """
-    Get the best fileset for a specific book.
-
-    Returns a dict with:
-        - distinct_id: Bible version abbreviation
-        - canon: NT/OT/PARTIAL
-        - audio_fileset: Audio fileset ID (if available)
-        - text_fileset: Text fileset ID (if available)
-        - timing_available: Whether timing data exists
-    """
-    if not metadata_by_fileset:
-        return None
-
-    # Use the first available metadata to get common info
-    # (all filesets for same version should have same distinct_id/canon)
-    first_metadata = next(iter(metadata_by_fileset.values()))
-
-    distinct_id = get_distinct_id_from_metadata(first_metadata)
-    canon = first_metadata.get("canon", "")
-
-    # Find best audio and text filesets
-    audio_fileset = None
-    alt_audio_fileset = None  # Secondary audio (drama if primary is standard)
-    text_fileset = None
-    timing_available = False
-
-    # Collect all usable audio filesets with priorities
-    audio_candidates = []
-
-    for fileset_id, metadata in metadata_by_fileset.items():
-        fileset_type = metadata.get("fileset", {}).get("type", "")
-        fileset_size = metadata.get("fileset", {}).get("size", "")
-
-        # Check if this fileset contains the book
-        if not fileset_contains_book(metadata, book, canon):
-            continue
-
-        # Audio priority (lower tuple = preferred):
-        # 1. Plain MP3, non-dramatized, DA (N1DA or O1DA)
-        # 2. Opus, non-dramatized, DA
-        # 3. Plain MP3, dramatized, DA (N2DA or O2DA)
-        # 4. Opus, dramatized, DA
-        # 5-8. Same order but SA (streaming) variants
-        if "audio" in fileset_type:
-            is_dramatized = "2DA" in fileset_id or "2SA" in fileset_id
-            is_opus = "-opus" in fileset_id
-            is_stream = fileset_id.endswith("SA") or "stream" in fileset_type
-
-            priority = (
-                int(is_dramatized),
-                int(is_stream),
-                int(is_opus),
-                fileset_id,
-            )
-            audio_candidates.append((priority, fileset_id, is_dramatized))
-
-    # Sort by priority and select primary + alt
-    if audio_candidates:
-        audio_candidates.sort()
-        audio_fileset = audio_candidates[0][1]
-        # Find alt: if primary is standard, alt is the best drama (and vice versa)
-        primary_is_drama = audio_candidates[0][2]
-        for _, fid, is_drama in audio_candidates[1:]:
-            if is_drama != primary_is_drama and "-opus" not in fid:
-                alt_audio_fileset = fid
-                break
-
-    # Text priority — USX is intentionally skipped because the DBT USX
-    # endpoint often 404s while the same content's plain/JSON/format variant
-    # works fine.
-    #
-    # Order:
-    #   0: plain text (_ET suffix or text_plain type)
-    #   1: JSON (-json suffix or text_json type)
-    #   2: other text (text_format, etc.)
-    # Canon-specific (size != "C") variants get +4 within their bucket so
-    # Complete bibles outrank partial ones at the same format.
-    text_candidates = []  # list of (priority_tuple, fileset_id)
-    for fileset_id, metadata in metadata_by_fileset.items():
-        fileset_type = metadata.get("fileset", {}).get("type", "")
-        fileset_size = metadata.get("fileset", {}).get("size", "")
-
-        if "text" not in fileset_type:
-            continue
-        if not fileset_contains_book(metadata, book, canon):
-            continue
-        # Skip USX entirely — see comment above
-        if fileset_id.endswith("-usx") or fileset_type == "text_usx":
-            continue
-
-        is_complete = fileset_size == "C"
-        if (fileset_id.endswith("_ET") and "-" not in fileset_id) or fileset_type == "text_plain":
-            base = 0
-        elif fileset_id.endswith("-json") or fileset_type == "text_json":
-            base = 1
-        else:
-            base = 2
-        score = base if is_complete else base + 4
-        text_candidates.append(((score, fileset_id), fileset_id))
-
-        # Check for timing while we're iterating text filesets
-        timing_info = metadata.get("download_ready", {})
-        if timing_info.get("timing_available"):
-            timing_available = True
-
-    # Also pick up timing flag from audio filesets
-    for fileset_id, metadata in metadata_by_fileset.items():
-        fileset_type = metadata.get("fileset", {}).get("type", "")
-        if "audio" in fileset_type:
-            timing_info = metadata.get("download_ready", {})
-            if timing_info.get("timing_available"):
-                timing_available = True
-
-    text_candidates.sort()
-    text_fileset_candidates = [fid for _, fid in text_candidates]
-    if text_fileset_candidates:
-        text_fileset = text_fileset_candidates[0]
-
-    if not audio_fileset and not text_fileset:
-        return None
-
-    result = {
-        "distinct_id": distinct_id,
-        "canon": canon,
-        "audio_fileset": audio_fileset,
-        "text_fileset": text_fileset,
-        "text_fileset_candidates": text_fileset_candidates,
-        "timing_available": timing_available,
-    }
-    if alt_audio_fileset:
-        result["alt_audio_fileset"] = alt_audio_fileset
-    return result
 
 
 # Module-level record of the most recent API failure, exposed so callers
@@ -1245,6 +1027,7 @@ def download_chapter(
     content_types: Optional[List[str]] = None,
     alt_audio_fileset: Optional[str] = None,
     text_fileset_candidates: Optional[List[str]] = None,
+    text_source_override: Optional[str] = None,
 ) -> bool:
     """
     Download content for a specific chapter based on requested content types.
@@ -1252,6 +1035,12 @@ def download_chapter(
     Args:
         content_types: List of content types to download ('audio', 'text', 'timing').
                       If None, downloads all available content types (default behavior).
+        text_source_override: "helloao:<id>" or "ebible:<id>" — when text_fileset
+            is None, use this instead of calling _get_external_text_source()
+            (which needs local version-crossref.json/versions-data catalog
+            data). Lets a caller that already knows the resolved external
+            text source (e.g. an enriched batch_manifest.py job) skip that
+            catalog lookup entirely.
 
     Returns True if all required downloads succeeded or already exist, False otherwise.
     """
@@ -1338,8 +1127,14 @@ def download_chapter(
             if not text_downloaded:
                 success = False
     elif not text_fileset and audio_fileset and "text" in content_types:
-        # No DBT text — check for external text source
-        ext_type, ext_id = _get_external_text_source(iso, distinct_id)
+        # No DBT text — use the caller-supplied external source if given
+        # (skips the version-crossref.json/versions-data catalog lookup
+        # entirely), otherwise fall back to resolving it ourselves.
+        if text_source_override:
+            ext_type, _, ext_id = text_source_override.partition(":")
+        else:
+            ext_type, ext_id = _get_external_text_source(iso, distinct_id)
+
         if ext_type == "helloao" and ext_id:
             # Generate filename using helloAO convention
             hao_fid = ext_id.replace("_", "").upper()
@@ -1355,6 +1150,12 @@ def download_chapter(
                     text_source_tag = f"helloao:{ext_id}"
                 else:
                     success = False
+        elif ext_type == "ebible" and ext_id:
+            # No eBible fetcher exists in this codebase yet — fail loudly
+            # rather than silently reporting success with no text fetched.
+            log(f"  eBible text fetch not implemented (id={ext_id}) — "
+                f"{book} {chapter} has no text", "ERROR")
+            success = False
 
     # Download timing (if requested and available)
     if timing_available and audio_fileset and "timing" in content_types:
@@ -1383,391 +1184,109 @@ def download_chapter(
     return success
 
 
-def download_language(
-    iso: str,
-    books_spec: str,
-    force: bool = False,
-    force_partial: bool = False,
-    required_category: Optional[str] = None,
-    required_canon: Optional[str] = None,
+def download_job(
+    job: Dict,
     content_types: Optional[List[str]] = None,
-):
+    force: bool = False,
+) -> bool:
     """
-    Download content for a language.
+    Fetch audio/text/timing for one resolved batch_manifest.py job.
 
-    Args:
-        content_types: List of content types to download ('audio', 'text', 'timing').
-                      If None, downloads all available content types (default behavior).
+    job shape (see batch_manifest.py), since 2026-07-15 enriched with the
+    exact resolved fileset(s) — core resolves these against its own DBT
+    catalog, so a job carrying them needs no local sorted/BB catalog data:
+        {"iso": "eng", "canon": "NT", "distinct_id": "ENGKJV",
+         "chapters": {"MAT": [1, 2, 3]},
+         "audio_fileset": "ENGKJVN2DA",       # optional, enriched manifests
+         "text_fileset": "ENGKJVN_ET",        # optional; null if DBT has no text
+         "text_source": null}                 # optional; "helloao:<id>" / "ebible:<id>"
+                                               # when text_fileset is null
+
+    No selection or exclusion logic runs here — core has already resolved
+    which language/version/chapters belong in the job before it reached
+    this queue.
+
+    Returns True if every requested chapter downloaded (or already existed)
+    successfully, False if any chapter failed.
     """
-    log(f"Processing language: {iso}", "INFO")
+    iso = job["iso"]
+    canon = job["canon"].upper()
+    distinct_id = job["distinct_id"]
+    chapters_by_book = job.get("chapters", {})
 
-    # Expand book specification
-    # Split on spaces to handle template format (e.g., "GEN:1,2,3 LUK:1,2")
-    # Commas within a spec like "JHN:1,2,3" are chapter separators, not book separators
-    book_chapters = []
-    specs = books_spec.split()
+    enriched_audio_fileset = job.get("audio_fileset")
+    enriched_text_fileset = job.get("text_fileset")
+    enriched_text_source = job.get("text_source")
 
-    for spec in specs:
-        book_chapters.extend(expand_book_spec(spec.strip()))
-
-    if not book_chapters:
-        log("No valid books specified", "ERROR")
-        return
-
-    log(f"Books to download: {len(book_chapters)}", "INFO")
-
-    # Group books by canon
-    books_by_canon = defaultdict(list)
-    for book, chapters in book_chapters:
-        canon = determine_book_canon(book)
-        if canon == "UNKNOWN":
-            log(f"Cannot determine canon for {book}", "WARNING")
-            continue
-
-        # Filter by required canon if specified (for book-set filters like TIMING_OT, SYNC_NT)
-        if required_canon and canon != required_canon:
-            log(f"Skipping {book} (canon={canon}, required={required_canon})", "INFO")
-            continue
-
-        books_by_canon[canon].append((book, chapters))
-
-    # Process each canon separately
-    for canon, books in books_by_canon.items():
-        # Load metadata for this canon
-        metadata_by_fileset = load_language_metadata(iso, canon)
-        if not metadata_by_fileset:
-            # Only warn if not timing-only (timing-only commonly has canons without data)
-            if content_types != ["timing"]:
-                log(f"No metadata found for {iso} in {canon} canon", "WARNING")
-            continue
-
-        log(f"Processing {canon} canon ({len(books)} books)", "INFO")
-
-        # Filter by required category if specified
-        if required_category:
-            filtered_metadata = {}
-            for fid, meta in metadata_by_fileset.items():
-                category = meta.get("aggregate_category")
-                # For timing categories, accept both with-timecode and audio-with-timecode
-                if required_category == "with-timecode":
-                    if category in ("with-timecode", "audio-with-timecode"):
-                        filtered_metadata[fid] = meta
-                elif category == required_category:
-                    filtered_metadata[fid] = meta
-
-            if not filtered_metadata:
-                if content_types != ["timing"]:
-                    log(
-                        f"No {required_category} versions found for {iso}/{canon}",
-                        "WARNING",
-                    )
-                continue
-
-            metadata_by_fileset = filtered_metadata
-            log(
-                f"Filtered to {len(metadata_by_fileset)} {required_category} filesets",
-                "INFO",
-            )
-
-        # Check if this is partial content and skip unless forced
-        first_metadata = next(iter(metadata_by_fileset.values()))
-        category = first_metadata.get("aggregate_category", "")
-
-        if category == "partial" and not force_partial:
-            log(
-                f"Skipping {iso}/{canon} (partial content - use --force-partial to download)",
-                "INFO",
-            )
-            continue
-
-        log(f"Found {len(metadata_by_fileset)} filesets for {iso}/{canon}", "INFO")
-
-        # Process each book
-        for book, chapters in books:
-            log(
-                f"Processing {book} (chapters: {min(chapters)}-{max(chapters)})", "INFO"
-            )
-
-            # Get all distinct_ids that have this book in this canon
-            distinct_ids_to_try = {}
-            for fileset_id, metadata in metadata_by_fileset.items():
-                if not fileset_contains_book(metadata, book, canon):
-                    continue
-
-                distinct_id = get_distinct_id_from_metadata(metadata)
-                if distinct_id not in distinct_ids_to_try:
-                    distinct_ids_to_try[distinct_id] = []
-                distinct_ids_to_try[distinct_id].append(metadata)
-
-            if not distinct_ids_to_try:
-                log(f"No filesets available for {book}", "WARNING")
-                continue
-
-            # Cross-source merge: if one version has audio-only and another
-            # has text-only, merge the text filesets into the audio version
-            # so both get downloaded to the same directory.
-            audio_only_ids = []
-            text_only_ids = []
-            for did, metas in distinct_ids_to_try.items():
-                version_dict = {m.get("fileset", {}).get("id", ""): m for m in metas}
-                info = get_best_fileset_for_book(version_dict, book)
-                if info:
-                    has_audio = info["audio_fileset"] is not None
-                    has_text = info["text_fileset"] is not None
-                    if has_audio and not has_text:
-                        audio_only_ids.append((did, info))
-                    elif has_text and not has_audio:
-                        text_only_ids.append((did, info))
-
-            if audio_only_ids and text_only_ids:
-                # Cross-source merge: only merge if confirmed by versions-data
-                # versions.json shows which versions have DBT audio + external text
-                versions_data = _load_versions_data(iso)
-
-                for audio_did, audio_info in audio_only_ids:
-                    merged = False
-                    vid = _extract_version_id(iso, audio_did)
-                    v_entry = versions_data.get(vid, {})
-
-                    # Check if versions.json confirms external text for this audio
-                    for tkey in ("nt", "ot"):
-                        sources = v_entry.get(tkey, {})
-                        dbt = sources.get("dbt", "")
-                        has_external_text = (
-                            sources.get("helloao") == "t"
-                            or sources.get("ebible") == "t"
-                        )
-                        if "a" in dbt and "t" not in dbt and has_external_text:
-                            # Confirmed cross-source pairing
-                            text_did = text_only_ids[0][0]
-                            for meta in distinct_ids_to_try[text_did]:
-                                ftype = meta.get("fileset", {}).get("type", "")
-                                if "text" in ftype:
-                                    distinct_ids_to_try[audio_did].append(meta)
-                            log(f"Cross-source merge (confirmed): {audio_did} audio + {text_did} text for {book}", "INFO")
-                            merged = True
-                            break
-
-                    if not merged and text_only_ids:
-                        text_did = text_only_ids[0][0]
-                        log(f"Cross-source skipped (unconfirmed): {audio_did} audio + {text_did} text for {book}", "INFO")
-
-            distinct_ids_list = list(distinct_ids_to_try.keys())
-            log(
-                f"Found {len(distinct_ids_to_try)} version(s) to try for {book}: {', '.join(distinct_ids_list)}",
-                "INFO",
-            )
-
-            # Try each distinct_id
-            # If required_category is set: stop at first success (book-set mode)
-            # If required_category is None: download all versions (single language mode)
-
-            # Sort distinct_ids by category priority when filtering by timing
-            # Prefer with-timecode over audio-with-timecode
-            if required_category == "with-timecode":
-
-                def get_category_priority(distinct_id):
-                    # Get category from first metadata entry for this distinct_id
-                    first_meta = distinct_ids_to_try[distinct_id][0]
-                    category = first_meta.get("aggregate_category", "")
-                    # with-timecode (0) before audio-with-timecode (1)
-                    return (0 if category == "with-timecode" else 1, distinct_id)
-
-                distinct_ids_items = sorted(
-                    distinct_ids_to_try.items(),
-                    key=lambda x: get_category_priority(x[0]),
+    if enriched_audio_fileset:
+        # Enriched manifest — core already resolved the exact fileset(s) for
+        # this job, so no catalog resolution (sorted/BB) is needed at all.
+        overall_success = True
+        for book, chapters in chapters_by_book.items():
+            for chapter in chapters:
+                chapter_ok = download_chapter(
+                    iso,
+                    distinct_id,
+                    canon,
+                    book,
+                    chapter,
+                    enriched_audio_fileset,
+                    enriched_text_fileset,
+                    timing_available=False,  # not carried by the enriched
+                    # manifest; harmless — the only current caller
+                    # (download_audio_for_chapters) never requests
+                    # content_types including "timing".
+                    force=force,
+                    content_types=content_types,
+                    text_source_override=enriched_text_source,
                 )
-            else:
-                distinct_ids_items = distinct_ids_to_try.items()
+                if not chapter_ok:
+                    overall_success = False
+        return overall_success
 
-            for distinct_id, version_metadata in distinct_ids_items:
-                # Get best fileset info for this distinct_id
-                version_dict = {
-                    m.get("fileset", {}).get("id", ""): m for m in version_metadata
-                }
-                fileset_info = get_best_fileset_for_book(version_dict, book)
+    # Fallback: DBT catalog-based resolution (cdn.bibel.wiki/dbt/_app/
+    # catalog-{text,audio}.json), for manifests missing per-job fileset
+    # enrichment. Canon-level, so resolved once per job rather than per book
+    # (see get_best_fileset_from_catalog's docstring).
+    fileset_info = get_best_fileset_from_catalog(iso, canon, distinct_id)
+    if not fileset_info:
+        log(f"No fileset found for {iso}/{distinct_id}/{canon} in DBT catalog", "WARNING")
+        return False
 
-                if not fileset_info:
-                    continue
+    overall_success = True
+    for book, chapters in chapters_by_book.items():
+        for chapter in chapters:
+            chapter_ok = download_chapter(
+                iso,
+                distinct_id,
+                canon,
+                book,
+                chapter,
+                fileset_info["audio_fileset"],
+                fileset_info["text_fileset"],
+                fileset_info["timing_available"],
+                force,
+                content_types,
+                alt_audio_fileset=fileset_info.get("alt_audio_fileset"),
+                text_fileset_candidates=fileset_info.get("text_fileset_candidates"),
+            )
+            if not chapter_ok:
+                overall_success = False
 
-                log(f"Trying {distinct_id}", "INFO")
-
-                # Log which filesets were selected
-                if fileset_info["audio_fileset"]:
-                    log(f"  Audio fileset: {fileset_info['audio_fileset']}", "INFO")
-                if fileset_info["text_fileset"]:
-                    cands = fileset_info.get("text_fileset_candidates") or []
-                    if len(cands) > 1:
-                        log(f"  Text fileset: {fileset_info['text_fileset']} "
-                            f"(fallbacks: {', '.join(cands[1:])})", "INFO")
-                    else:
-                        log(f"  Text fileset: {fileset_info['text_fileset']}", "INFO")
-                elif content_types and "text" in content_types:
-                    log(f"  No text fileset selected for {distinct_id}/{book} "
-                        f"(no plain/JSON/format variant available)", "WARN")
-
-                # Download each chapter for this version
-                success = True
-                for chapter in chapters:
-                    chapter_success = download_chapter(
-                        iso,
-                        distinct_id,
-                        canon,
-                        book,
-                        chapter,
-                        fileset_info["audio_fileset"],
-                        fileset_info["text_fileset"],
-                        fileset_info["timing_available"],
-                        force,
-                        content_types,
-                        alt_audio_fileset=fileset_info.get("alt_audio_fileset"),
-                        text_fileset_candidates=fileset_info.get("text_fileset_candidates"),
-                    )
-                    if not chapter_success:
-                        success = False
-
-                if success:
-                    log(f"✓ Successfully downloaded {distinct_id}", "INFO")
-                    # Continue to download all distinct_ids (versions) regardless of mode
-                else:
-                    remaining = [
-                        d
-                        for d in distinct_ids_list
-                        if d != distinct_id
-                        and distinct_ids_list.index(d)
-                        > distinct_ids_list.index(distinct_id)
-                    ]
-                    log(
-                        f"✗ {distinct_id} had failures"
-                        + (
-                            f", trying next version... (remaining: {', '.join(remaining)})"
-                            if required_category and remaining
-                            else ""
-                        ),
-                        "WARNING",
-                    )
-
-
-def get_languages_by_book_set(book_set: str) -> List[str]:
-    """
-    Get list of language ISO codes filtered by book-set category.
-
-    Categories:
-    - ALL: All available languages (excludes PARTIAL)
-    - TIMING_ALL: Languages with timing data for NT or OT (both canons)
-    - TIMING_NT: Languages with timing data for New Testament
-    - TIMING_OT: Languages with timing data for Old Testament
-    - SYNC_NT: Languages with syncable New Testament
-    - SYNC_OT: Languages with syncable Old Testament
-    - PARTIAL: Languages with only partial content
-
-    Args:
-        book_set: Category name
-
-    Returns:
-        List of language ISO codes
-    """
-    languages = []
-    languages_to_check = []
-
-    # Get list of languages from sorted/BB
-    if SORTED_DIR.exists():
-        for lang_dir in SORTED_DIR.iterdir():
-            if lang_dir.is_dir() and len(lang_dir.name) == 3:
-                languages_to_check.append(lang_dir.name)
-
-    if not languages_to_check:
-        log("No languages found in sorted/BB directory.", "ERROR")
-        log("Please run: python sort_cache_data.py", "ERROR")
-        sys.exit(1)
-
-    # Check each language against the book-set criteria
-    for iso in sorted(languages_to_check):
-        if book_set == "ALL":
-            # ALL excludes PARTIAL - only include languages with NT or OT content
-            nt_metadata = load_language_metadata(iso, "NT")
-            ot_metadata = load_language_metadata(iso, "OT")
-            if nt_metadata or ot_metadata:
-                languages.append(iso)
-            continue
-
-        # Load metadata for this language
-        elif book_set == "TIMING_ALL":
-            # Has timing data for NT or OT (either canon)
-            for canon in ["NT", "OT"]:
-                metadata_dict = load_language_metadata(iso, canon)
-                for metadata in metadata_dict.values():
-                    category = metadata.get("aggregate_category")
-                    if category in ("with-timecode", "audio-with-timecode"):
-                        languages.append(iso)
-                        break
-                else:
-                    continue
-                break  # Found timing in this canon, move to next language
-
-        elif book_set == "TIMING_NT":
-            # Has timing data for NT
-            metadata_dict = load_language_metadata(iso, "NT")
-            for metadata in metadata_dict.values():
-                category = metadata.get("aggregate_category")
-                if category in ("with-timecode", "audio-with-timecode"):
-                    languages.append(iso)
-                    break
-
-        elif book_set == "TIMING_OT":
-            # Has timing data for OT
-            metadata_dict = load_language_metadata(iso, "OT")
-            for metadata in metadata_dict.values():
-                category = metadata.get("aggregate_category")
-                if category in ("with-timecode", "audio-with-timecode"):
-                    languages.append(iso)
-                    break
-
-        elif book_set == "SYNC_NT":
-            # Has syncable content for NT
-            metadata_dict = load_language_metadata(iso, "NT")
-            for metadata in metadata_dict.values():
-                if metadata.get("aggregate_category") == "syncable":
-                    languages.append(iso)
-                    break
-
-        elif book_set == "SYNC_OT":
-            # Has syncable content for OT
-            metadata_dict = load_language_metadata(iso, "OT")
-            for metadata in metadata_dict.values():
-                if metadata.get("aggregate_category") == "syncable":
-                    languages.append(iso)
-                    break
-
-        elif book_set == "PARTIAL":
-            # Has only partial content
-            metadata_dict = load_language_metadata(iso, "PARTIAL")
-            if metadata_dict:
-                languages.append(iso)
-
-    return languages
+    return overall_success
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download Bible content using canonical structure"
+        description="Fetch audio/text/timing for every job in a batch_manifest.py batch"
     )
     parser.add_argument(
-        "iso",
-        nargs="?",
-        help="Language ISO code (e.g., eng, spa). Not needed with --book-set",
+        "--batch-id",
+        help="Batch ID to fetch (or set BATCH_ID env var)",
     )
     parser.add_argument(
-        "--books",
-        help="Books to download (e.g., 'GEN', 'GEN:1-3', 'Test', 'OBS Intro OT+NT')",
-    )
-    parser.add_argument(
-        "--template",
-        help="Template ID to load references from (e.g., 'OBS'). Reads from templates/<template_id>/*.md",
-    )
-    parser.add_argument(
-        "--book-set",
-        help="Book-set filter: ALL, TIMING_ALL, TIMING_NT, TIMING_OT, SYNC_NT, SYNC_OT, PARTIAL",
+        "--content-types",
+        help="Content types to download: audio, text, timing (comma-separated). Default: all types",
     )
     parser.add_argument(
         "--force",
@@ -1775,36 +1294,19 @@ def main():
         help="Force re-download even if files exist",
     )
     parser.add_argument(
-        "--force-partial",
-        action="store_true",
-        help="Include partial content (single books, incomplete sets)",
-    )
-    parser.add_argument(
-        "--content-types",
-        help="Content types to download: audio, text, timing (comma-separated, e.g., 'audio,text'). Default: all types",
-    )
-    parser.add_argument(
         "--rate-delay",
         type=float,
         default=0.0,
         help="Seconds to wait between API calls (e.g., 0.5 or 1.0). Default: 0 (no delay)",
     )
-
     args = parser.parse_args()
 
-    # Initialize variables
-    required_category: Optional[str] = None
-    required_canon: Optional[str] = None
-    template_books: Optional[str] = None
-    content_types: Optional[List[str]] = None
-
-    # Set rate limiting
     global API_RATE_DELAY
     if args.rate_delay > 0:
         API_RATE_DELAY = args.rate_delay
         log(f"Rate limiting: {API_RATE_DELAY}s delay between API calls", "INFO")
 
-    # Parse content types
+    content_types: Optional[List[str]] = None
     if args.content_types:
         content_types = [ct.strip().lower() for ct in args.content_types.split(",")]
         valid_types = {"audio", "text", "timing"}
@@ -1813,153 +1315,29 @@ def main():
             log(f"Error: Invalid content types: {', '.join(invalid_types)}", "ERROR")
             log("Valid types: audio, text, timing", "ERROR")
             sys.exit(1)
-        log(f"Content types to download: {', '.join(content_types)}", "INFO")
 
-    # Handle --template argument
-    if args.template:
-        # Load references from template
-        template_refs = load_template_references(args.template)
-
-        if not template_refs:
-            log(
-                f"Error: No valid references found in template '{args.template}'",
-                "ERROR",
-            )
-            sys.exit(1)
-
-        # Convert template references to book spec format
-        # Format: BOOK:CHAPTER,CHAPTER,... with spaces between books
-        # Note: Commas within chapter lists, spaces between different books
-        book_specs = []
-        for book, chapters in template_refs:
-            chapter_list = ",".join(map(str, chapters))
-            book_specs.append(f"{book}:{chapter_list}")
-        template_books = " ".join(book_specs)
-
-        # Check for competing --books argument
-        if args.books:
-            log("=" * 70, "WARN")
-            log("WARNING: Both --template and --books specified", "WARN")
-            log(f"  --template '{args.template}' takes precedence", "WARN")
-            log(f"  Ignoring --books argument: '{args.books}'", "WARN")
-            log("=" * 70, "WARN")
-
-        # Override books with template references
-        args.books = template_books
-
-    # Validate arguments
-    if args.book_set:
-        # Batch mode - download multiple languages filtered by book-set
-        if not args.books:
-            log("Error: --books argument is required", "ERROR")
-            parser.print_help()
-            sys.exit(1)
-
-        valid_book_sets = [
-            "ALL",
-            "TIMING_ALL",
-            "TIMING_NT",
-            "TIMING_OT",
-            "SYNC_NT",
-            "SYNC_OT",
-            "PARTIAL",
-        ]
-        if args.book_set not in valid_book_sets:
-            log(f"Error: Invalid book-set '{args.book_set}'", "ERROR")
-            log(f"Valid options: {', '.join(valid_book_sets)}", "ERROR")
-            sys.exit(1)
-
-        languages = get_languages_by_book_set(args.book_set)
-
-        # Determine required category and canon based on book-set
-        if args.book_set == "TIMING_ALL":
-            required_category = "with-timecode"
-            required_canon = None  # Allow both NT and OT
-        elif args.book_set in ["TIMING_NT", "TIMING_OT"]:
-            required_category = "with-timecode"
-            required_canon = "NT" if args.book_set == "TIMING_NT" else "OT"
-        elif args.book_set in ["SYNC_NT", "SYNC_OT"]:
-            required_category = "syncable"
-            required_canon = "NT" if args.book_set == "SYNC_NT" else "OT"
-        elif args.book_set == "PARTIAL":
-            args.force_partial = True
-            required_category = "partial"
-            required_canon = "PARTIAL"
-
-        log(
-            f"Book-set '{args.book_set}' matched {len(languages)} languages",
-            "INFO",
-        )
-
-        if not languages:
-            log("No languages found matching book-set criteria", "ERROR")
-            sys.exit(1)
-    else:
-        # Single language mode
-        if not args.iso:
-            log("Error: language ISO code is required (or use --book-set)", "ERROR")
-            parser.print_help()
-            sys.exit(1)
-
-        if not args.books:
-            log("Error: --books argument is required", "ERROR")
-            parser.print_help()
-            sys.exit(1)
-
-        if args.iso.upper() == "ALL":
-            # Loop through all languages in sorted cache
-            languages = sorted(
-                d.name for d in SORTED_DIR.iterdir()
-                if d.is_dir() and len(d.name) == 3
-            )
-            log(f"Processing ALL languages: {len(languages)}", "INFO")
-        else:
-            languages = [args.iso]
-
-    # Verify API key
     if not BIBLE_API_KEY:
         log("Error: BIBLE_API_KEY not set in .env file", "ERROR")
         log("Please add BIBLE_API_KEY=your_key_here to .env", "ERROR")
         sys.exit(1)
 
-    # Verify sorted directory exists
-    if not SORTED_DIR.exists():
-        log(f"Error: Sorted directory not found: {SORTED_DIR}", "ERROR")
-        log("Please run: python sort_cache_data.py", "ERROR")
-        sys.exit(1)
+    batch = load_batch(args.batch_id)
+    jobs = get_jobs(batch)
+    log(f"Batch {batch.get('id')}: {len(jobs)} job(s) to fetch", "INFO")
 
-    # Start download
-    log("=" * 70, "INFO")
-    log("Bible Content Download Script (canonical structure)", "INFO")
-    log("=" * 70, "INFO")
-
-    if args.book_set:
-        log(f"Batch mode: {len(languages)} languages to process", "INFO")
-
-    # Download each language
-    for i, iso in enumerate(languages, 1):
-        if len(languages) > 1:
-            log(f"\n[{i}/{len(languages)}] Language: {iso}", "INFO")
-            log("-" * 70, "INFO")
-
-        download_language(
-            iso,
-            args.books,
-            args.force,
-            args.force_partial,
-            required_category if args.book_set else None,
-            required_canon if args.book_set else None,
-            content_types,
+    for i, job in enumerate(jobs, 1):
+        log(
+            f"[{i}/{len(jobs)}] {job['iso']}/{job['canon']}/{job['distinct_id']}",
+            "INFO",
         )
+        download_job(job, content_types=content_types, force=args.force)
 
-    # Save error logs
     if error_logger.errors_by_language:
         error_logger.save_logs()
-        log("\n✓ Error logs saved to download_log/", "INFO")
+        log("Error logs saved to download_log/", "INFO")
     else:
-        log("\n✓ No errors to log", "INFO")
+        log("No errors to log", "INFO")
 
-    # Report statistics
     log("=" * 70, "INFO")
     stats.report()
     log("=" * 70, "INFO")

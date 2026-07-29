@@ -6,6 +6,11 @@
 #   - NVIDIA CUDA GPU    → faster-whisper (CUDA via CTranslate2)
 #   - Other / CPU        → faster-whisper (CPU via CTranslate2)
 
+# download_language_content.py fetch primitives — imported in-process by
+# whisper_transcribe.py/align_pipeline.py to pull DBT audio/text/timing.
+requests
+python-dotenv
+
 # Apple Silicon / MLX backend (only works on macOS arm64)
 mlx>=0.21.0
 mlx-whisper>=0.4.0
@@ -15,7 +20,16 @@ faster-whisper>=1.0.0
 
 # CUDA 12 runtime libraries required by faster-whisper on NVIDIA GPU systems.
 # These install the shared libraries (.so/.dll) that CTranslate2 needs.
-# Safe to install on CPU-only systems (they are no-ops without a GPU).
-nvidia-cublas-cu12
-nvidia-cudnn-cu12
-nvidia-cuda-nvrtc-cu12
+# Safe to install on CPU-only Linux/Windows boxes (they are no-ops without a
+# GPU) but PyPI has no macOS build at all — placeholder-only package that
+# fails to install there, so it's gated to Linux via a platform marker.
+nvidia-cublas-cu12; sys_platform == "linux"
+nvidia-cudnn-cu12; sys_platform == "linux"
+nvidia-cuda-nvrtc-cu12; sys_platform == "linux"
+
+# MMS-FA (mms_align_words.py) — torch/torchaudio/uroman are still installed
+# separately (pip install torch torchaudio uroman, per align_pipeline.py's
+# module docstring), but torchaudio >=2.11 hard-requires torchcodec to load
+# audio at all (load_with_torchcodec) — without it MMS crashes on the first
+# real chapter, not an optional extra.
+torchcodec

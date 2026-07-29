@@ -58,6 +58,9 @@ Prerequisites:
 """
 
 import argparse
+import json
+import os
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -69,6 +72,7 @@ from text_processing import load_language_config
 
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
 
+from batch_manifest import load_batch, get_jobs
 from whisper_transcribe import (
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
@@ -87,9 +91,10 @@ from whisper_transcribe import (
     get_whisper_language,
     load_all_template_refs,
     load_priority_languages,
-    refs_to_books_spec,
     resolve_languages,
 )
+
+RUNS_DIR = Path("_runs")
 
 # ─── Logging ─────────────────────────────────────────────────────────────
 
@@ -223,6 +228,43 @@ def run_fusion_chapter(item: dict, config, mms_components=None) -> dict:
     """
     from align_words import process_chapter as fusion_process
     return fusion_process(item, config, mms_components=mms_components)
+
+
+# ─── Contract B — run manifest + publish ────────────────────────────────
+
+def write_run_manifest(batch_id: str, results: list) -> Path:
+    """Write the Contract B run manifest for this batch to _runs/<batch_id>.json.
+
+    See internal-docs/audio-sync-interface.md §3 in MONO for the schema.
+    """
+    manifest = {
+        "batch_id": batch_id,
+        "completed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "results": results,
+    }
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_path = RUNS_DIR / f"{batch_id}.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    return manifest_path
+
+
+def publish_run():
+    """Publish export/timing-data/ + _runs/ to cdn.bibel.wiki/align/ via rclone.
+
+    Calls scripts/publish-align.sh — same rclone/R2 pattern as MONO's
+    publish-dbt.sh/publish-batch.sh. Failures are logged, not fatal — a
+    failed publish shouldn't discard local alignment output already on disk.
+    """
+    script = Path("scripts/publish-align.sh")
+    if not script.exists():
+        log(f"{script} not found, skipping publish", "ERROR")
+        return
+    log(f"Publishing to cdn.bibel.wiki/align/ via {script} ...")
+    try:
+        subprocess.run([str(script)], check=True)
+    except subprocess.CalledProcessError as e:
+        log(f"Publish failed with exit code {e.returncode}", "ERROR")
 
 
 # ─── MMS work item builder ──────────────────────────────────────────────
@@ -380,6 +422,11 @@ Examples:
     proc_group.add_argument("--check-audio", action="store_true", help="Only report audio availability")
     proc_group.add_argument("--no-download", action="store_true",
         help="Skip auto-download, only process already-downloaded files")
+    proc_group.add_argument("--publish", action="store_true",
+        help="Publish timing-data + run manifest to cdn.bibel.wiki/align/ "
+             "after the pipeline finishes (calls scripts/publish-align.sh). "
+             "Off by default — rerun with 'make publish-align' to publish "
+             "output from a prior run.")
 
     # Step skipping
     skip_group = parser.add_argument_group("Step control")
@@ -431,6 +478,11 @@ Examples:
     if not args.skip_fusion:
         steps.append("Fusion")
     log(f"Active steps: {' → '.join(steps)}")
+
+    # Batch id for the Contract B run manifest (see internal-docs/
+    # audio-sync-interface.md §3 in MONO). Falls back to a local id when run
+    # ad hoc via --books, outside a fetched batch.
+    batch_id = os.environ.get("BATCH_ID") or f"local-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
 
     # ── Step 1: Determine required chapters ──
 
@@ -494,6 +546,20 @@ Examples:
         check_and_report_audio(work_items, args.output_dir, refs_by_canon)
         return
 
+    # Batch jobs already carry a resolved distinct_id per (iso, canon) — core
+    # resolved it before publishing (Contract A). Look it up for placeholder
+    # work items (distinct_id=None) instead of downloading blind and
+    # discovering it from disk afterward, which requires a distinct_id
+    # up front. load_batch() hits the local cache here (already fetched
+    # above via load_all_template_refs), no extra network round trip.
+    batch_jobs_by_iso_canon: Dict[Tuple[str, str], list] = defaultdict(list)
+    if os.environ.get("BATCH_ID"):
+        try:
+            for job in get_jobs(load_batch()):
+                batch_jobs_by_iso_canon[(job["iso"], job["canon"].lower())].append(job)
+        except (RuntimeError, FileNotFoundError):
+            pass
+
     # ── Auto-download missing audio+text ──
 
     if not args.no_download and not args.dry_run:
@@ -508,9 +574,10 @@ Examples:
         # Both channels write into the standard {canon}/{iso}/{distinct_id}/{BOOK}/
         # layout so the cleanup script handles them uniformly.
         from remote_audio import bulk_download_external_audio
-        # Dedup DBT downloads per (iso, canon) — books_spec is canon-scoped,
-        # so triggering per-iso would only ever cover the first canon seen.
-        downloaded_iso_canons = set()
+        # Dedup DBT downloads per (iso, canon, distinct_id) — download_job()
+        # fetches exactly the given version, so items sharing a version only
+        # need to trigger the fetch once.
+        downloaded_dbt_jobs = set()
         for item in work_items:
             iso = item["iso"]
             canon = item["canon"]
@@ -536,17 +603,49 @@ Examples:
                 if d or f:
                     log(f"  helloAO audio for {iso}/{distinct_id}: "
                         f"{d} downloaded, {a} already present, {f} failed")
-            else:
-                # DBT path: download once per (iso, canon).
-                # download_language_content.py groups by canon internally and
-                # the books_spec we pass is canon-scoped, so dedup must include
-                # canon — otherwise OT would be skipped after NT runs first.
-                key = (iso, canon)
-                if key in downloaded_iso_canons:
+            elif distinct_id is not None:
+                # DBT path: fetch the resolved (iso, canon, distinct_id) version.
+                key = (iso, canon, distinct_id)
+                if key in downloaded_dbt_jobs:
                     continue
-                books_spec = refs_to_books_spec(canon_refs)
-                download_audio_for_chapters(iso, books_spec)
-                downloaded_iso_canons.add(key)
+                # Use the batch's own enriched fields if this exact
+                # (iso, canon, distinct_id) is one of its jobs — skips
+                # download_job()'s catalog resolution entirely.
+                batch_job = next(
+                    (j for j in batch_jobs_by_iso_canon.get((iso, canon), [])
+                     if j["distinct_id"] == distinct_id),
+                    None,
+                )
+                download_audio_for_chapters(
+                    iso, canon, distinct_id, canon_refs,
+                    audio_fileset=batch_job.get("audio_fileset") if batch_job else None,
+                    text_fileset=batch_job.get("text_fileset") if batch_job else None,
+                    text_source=batch_job.get("text_source") if batch_job else None,
+                )
+                downloaded_dbt_jobs.add(key)
+            else:
+                # Placeholder item (nothing known locally yet) — look up the
+                # distinct_id(s) core already resolved for this (iso, canon)
+                # in the batch itself, one DBT fetch per matching job.
+                matching_jobs = batch_jobs_by_iso_canon.get((iso, canon), [])
+                if not matching_jobs:
+                    log(f"  Skipping {iso}/{canon.upper()}: no distinct_id "
+                        "resolved locally or in the batch", "WARN")
+                for job in matching_jobs:
+                    job_distinct_id = job["distinct_id"]
+                    key = (iso, canon, job_distinct_id)
+                    if key in downloaded_dbt_jobs:
+                        continue
+                    job_chapters = {
+                        b: set(chs) for b, chs in job.get("chapters", {}).items()
+                    } or canon_refs
+                    download_audio_for_chapters(
+                        iso, canon, job_distinct_id, job_chapters,
+                        audio_fileset=job.get("audio_fileset"),
+                        text_fileset=job.get("text_fileset"),
+                        text_source=job.get("text_source"),
+                    )
+                    downloaded_dbt_jobs.add(key)
 
         # Re-resolve placeholder work items (distinct_id=None) now that downloads exist
         # (Version-exclusion is handled upstream by core — batch jobs are pre-filtered.)
@@ -642,6 +741,8 @@ Examples:
         "total_audio_duration": 0,
         "total_time": 0,
     }
+    run_results = []  # Contract B run-manifest entries: one per chapter that
+    # either finished fusion or failed at any step (download, whisper, mms, fusion)
 
     pipeline_start = time.time()
 
@@ -744,6 +845,12 @@ Examples:
                     if not ensure_chapter_audio(chapter["audio_path"], chapter["book"], chapter["chapter"]):
                         log(f"{label} Audio missing and could not be fetched, skipping", "WARN")
                         total_stats["chapters_failed"] += 1
+                        run_results.append({
+                            "iso": iso, "canon": canon, "distinct_id": distinct_id,
+                            "book": book, "chapter": ch_num,
+                            "status": "failed",
+                            "error": "audio download failed (404/403 — possibly copyright-restricted)",
+                        })
                         continue
                     else:
                         log(f"{label} Audio fetched on demand")
@@ -840,6 +947,11 @@ Examples:
                             stats = run_fusion_chapter(fusion_item, config, mms_components=fusion_mms)
                             if "error" in stats:
                                 log(f"{label} Fusion: {stats['error']}", "ERROR")
+                                run_results.append({
+                                    "iso": iso, "canon": canon, "distinct_id": distinct_id,
+                                    "book": book, "chapter": ch_num,
+                                    "status": "error", "error": stats["error"],
+                                })
                             else:
                                 parts = [f"{stats['verses']} verses", f"source={stats['source']}"]
                                 if stats.get("fusion"):
@@ -856,6 +968,14 @@ Examples:
                                         )
                                 log(f"{label} Fusion: {', '.join(parts)}")
                                 total_stats["fusion_done"] += 1
+                                run_results.append({
+                                    "iso": iso, "canon": canon, "distinct_id": distinct_id,
+                                    "book": book, "chapter": ch_num,
+                                    "status": "ok",
+                                    "whisper": stats.get("whisper_score"),
+                                    "mms": stats.get("mms_score"),
+                                    "verses": stats.get("verses"),
+                                })
 
             except KeyboardInterrupt:
                 log("Interrupted by user — stopping pipeline", "WARN")
@@ -865,11 +985,25 @@ Examples:
             except Exception as e:
                 log(f"{label} Failed: {e}", "ERROR")
                 total_stats["chapters_failed"] += 1
+                run_results.append({
+                    "iso": iso, "canon": canon, "distinct_id": distinct_id,
+                    "book": book, "chapter": ch_num,
+                    "status": "failed", "error": str(e),
+                })
 
     # ── Summary ──
 
     total_time = time.time() - pipeline_start
     _print_summary(total_stats, total_time)
+
+    # ── Contract B: run manifest + publish ──
+    if not args.dry_run and not args.skip_fusion:
+        manifest_path = write_run_manifest(batch_id, run_results)
+        log(f"Run manifest written: {manifest_path} ({len(run_results)} result(s))")
+        if args.publish:
+            publish_run()
+        else:
+            log("Skipping publish (pass --publish, or run 'make publish-align' separately)")
 
 
 def _print_summary(total_stats: dict, total_time: float):
