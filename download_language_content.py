@@ -45,7 +45,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -293,6 +293,47 @@ def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> Optional[str]:
                 if i.startswith("h:"):
                     return i[2:]
     return None
+
+
+def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> Tuple[str, Optional[str]]:
+    """
+    Pick the best available text source for (iso, canon, distinct_id),
+    following the `bibles` repo's documented priority: pkf > helloao > dbt
+    (see bcv-commons/bibles doc/sources.md). PKF isn't implemented here
+    yet — its .pkf files are gzip-compressed Proskomma "succinct docSets"
+    that need bibles' Node.js decoder (tools/pkf-decode/), no practical
+    Python path — so this currently implements the helloao > dbt half.
+    The return shape leaves room for a "pkf" source to slot in later
+    without changing callers.
+
+    Follows the docs' own recommended flow: check catalog-index.json
+    first ("what exists, from whom") — most languages have exactly one
+    source, so this avoids an unnecessary catalog-overlap.json lookup in
+    the common case. Only when catalog-index shows more than one source
+    do we check catalog-overlap.json for a *verified* equivalence (a
+    second source existing doesn't by itself mean it's the same
+    translation).
+
+    Returns (source, source_id):
+      ("helloao", helloao_id)  — prefer helloAO's verified-equivalent text
+      ("dbt", None)            — use DBT's own text (default / only option)
+    """
+    index = _load_dbt_catalog("catalog-index")
+    canon_l = canon.lower()
+    sources_at_canon = {
+        row[2] for row in index.get("entries", [])
+        if row[0] == iso and row[1] in (canon_l, f"{canon_l}p")
+    }
+
+    if not sources_at_canon or sources_at_canon <= {"d"}:
+        return "dbt", None
+
+    if "h" in sources_at_canon:
+        hao_id = _find_helloao_id(iso, canon, distinct_id)
+        if hao_id:
+            return "helloao", hao_id
+
+    return "dbt", None
 
 
 def _fetch_helloao_chapter(helloao_id, book, chapter_num, dest_path):
@@ -1253,6 +1294,27 @@ def download_job(
         log(f"No fileset found for {iso}/{distinct_id}/{canon} in DBT catalog", "WARNING")
         return False
 
+    # Prefer a verified-equivalent higher-priority text source over DBT's
+    # own (see resolve_preferred_text_source's docstring — currently
+    # helloao > dbt; PKF not yet wired in). Only overrides the text
+    # side — DBT remains the only audio source per bibles' own docs.
+    #
+    # download_chapter() only consults text_source_override when its
+    # text_fileset arg is falsy — it treats a truthy text_fileset as "DBT
+    # has text, use it" unconditionally. So preferring helloAO even when
+    # DBT *does* have its own text (the common, and most important, case)
+    # means passing text_fileset=None here to route through the override
+    # path instead, not just passing the override alongside DBT's fileset.
+    text_source, preferred_source_id = resolve_preferred_text_source(iso, canon, distinct_id)
+    if text_source == "helloao":
+        text_fileset = None
+        text_fileset_candidates = None
+        text_source_override = f"helloao:{preferred_source_id}"
+    else:
+        text_fileset = fileset_info["text_fileset"]
+        text_fileset_candidates = fileset_info.get("text_fileset_candidates")
+        text_source_override = None
+
     overall_success = True
     for book, chapters in chapters_by_book.items():
         for chapter in chapters:
@@ -1263,17 +1325,64 @@ def download_job(
                 book,
                 chapter,
                 fileset_info["audio_fileset"],
-                fileset_info["text_fileset"],
+                text_fileset,
                 fileset_info["timing_available"],
                 force,
                 content_types,
                 alt_audio_fileset=fileset_info.get("alt_audio_fileset"),
-                text_fileset_candidates=fileset_info.get("text_fileset_candidates"),
+                text_fileset_candidates=text_fileset_candidates,
+                text_source_override=text_source_override,
             )
             if not chapter_ok:
                 overall_success = False
 
     return overall_success
+
+
+def ensure_chapter_ready(
+    iso: str,
+    canon: str,
+    distinct_id: str,
+    book: str,
+    chapter: int,
+    batch_job: Optional[Dict] = None,
+    force: bool = False,
+) -> bool:
+    """
+    Ensure one DBT chapter's audio+text are on disk, fetching if needed.
+
+    Single-chapter granularity — the building block for align_pipeline.py's
+    worklist-first processing loop and its one-chapter-ahead prefetch
+    (download chapter N+1 in the background while chapter N computes).
+    download_job() already loops over an arbitrary {book: [chapters]}
+    dict internally, so a 1-book/1-chapter job dict is all that's needed
+    here — no new fetch primitive, just a call-site that doesn't require
+    building a whole-book/whole-canon job to fetch one chapter.
+
+    batch_job, if given, is the matching enriched job from the batch
+    manifest (audio_fileset/text_fileset/text_source) — passing it skips
+    download_job()'s CDN-catalog fallback resolution entirely, same as
+    the bulk path already does.
+
+    Covers the DBT source only. contrib/ and helloAO sources already have
+    per-chapter on-demand fetching via remote_audio.ensure_chapter_audio(),
+    called separately from align_pipeline.py's main loop — no change
+    needed there, they already support this granularity.
+
+    Returns True if the chapter's audio+text are present (already were, or
+    were just fetched), False if fetching failed.
+    """
+    job = {
+        "iso": iso,
+        "canon": canon.upper(),
+        "distinct_id": distinct_id,
+        "chapters": {book: [chapter]},
+    }
+    if batch_job and batch_job.get("audio_fileset"):
+        job["audio_fileset"] = batch_job["audio_fileset"]
+        job["text_fileset"] = batch_job.get("text_fileset")
+        job["text_source"] = batch_job.get("text_source")
+    return download_job(job, content_types=["audio", "text"], force=force)
 
 
 def main():

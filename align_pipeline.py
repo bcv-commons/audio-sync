@@ -60,8 +60,10 @@ Prerequisites:
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -73,6 +75,7 @@ from text_processing import load_language_config
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
 
 from batch_manifest import load_batch, get_jobs
+from download_language_content import ensure_chapter_ready
 from whisper_transcribe import (
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
@@ -101,6 +104,42 @@ RUNS_DIR = Path("_runs")
 def log(message: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
+
+
+class Heartbeat:
+    """Background progress heartbeat for a long-running blocking call.
+
+    Whisper/MMS give no incremental feedback of their own on a single
+    chapter — without this, a genuinely slow chapter (e.g. a hard Psalm on
+    a weak CPU) is indistinguishable from a hung process from the log
+    output alone. Logs "<label> ... still running (Ns)" every `interval`
+    seconds until the wrapped call returns.
+
+    Usage:
+        with Heartbeat(f"{label} MMS"):
+            stats = run_mms_chapter(...)
+    """
+
+    def __init__(self, label: str, interval: float = 30.0):
+        self.label = label
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _run(self):
+        start = time.time()
+        while not self._stop.wait(self.interval):
+            log(f"{self.label} ... still running ({time.time() - start:.0f}s)")
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
 
 
 # ─── Book specification parser ────────────────────────────────────────────
@@ -268,6 +307,41 @@ def publish_run():
 
 
 # ─── MMS work item builder ──────────────────────────────────────────────
+
+def needs_run(output_path: Optional[Path], *input_paths: Optional[Path], force: bool = False) -> bool:
+    """True if a step should (re-)run: its output is missing, --force was
+    passed, or any given input is newer than the output (stale).
+
+    Replaces three near-duplicate exists/force/staleness checks (Whisper/
+    MMS/Fusion) that grew independently in the main loop — Whisper and
+    MMS only ever checked existence (call with no input_paths); Fusion
+    also checks staleness against its MMS/Whisper inputs.
+    """
+    if output_path is None or not output_path.exists():
+        return True
+    if force:
+        return True
+    out_mtime = output_path.stat().st_mtime
+    return any(p and p.exists() and p.stat().st_mtime > out_mtime for p in input_paths)
+
+
+def _source_type_for(canon: str, iso: str, distinct_id: str) -> str:
+    """'contrib' / 'helloao' / 'dbt' — which fetch path applies for this
+    (canon, iso, distinct_id).
+
+    contrib/helloao directories are pre-populated by a separate import
+    step (import_contrib.py / align_bsb.py) — this only determines
+    whether ensure_chapter_ready()'s DBT fetch should run at all. Audio
+    for contrib/helloao items is fetched lazily via
+    remote_audio.ensure_chapter_audio() from the per-chapter loop
+    further down, same as before this restructuring.
+    """
+    if (Path("downloads/contrib") / canon / iso / distinct_id).is_dir():
+        return "contrib"
+    if (Path("downloads/helloao/aligned") / canon / iso / distinct_id).is_dir():
+        return "helloao"
+    return "dbt"
+
 
 def build_mms_item(chapter: dict, canon: str, iso: str, distinct_id: str) -> dict:
     """Build an mms_align_words.py-compatible work item from a whisper chapter dict."""
@@ -530,11 +604,50 @@ Examples:
     for lang in languages:
         log(f"  {lang['iso']} ({lang['language']}) - tier {lang['tier']}")
 
+    # Batch jobs already carry a resolved distinct_id per (iso, canon) — core
+    # resolved it before publishing (Contract A). load_batch() hits the
+    # local cache here (already fetched above via load_all_template_refs),
+    # no extra network round trip. Built before generate_work_items() so
+    # it can also restrict which locally-known filesets get processed
+    # below, not just resolve placeholder items.
+    batch_jobs_by_iso_canon: Dict[Tuple[str, str], list] = defaultdict(list)
+    if os.environ.get("BATCH_ID"):
+        try:
+            for job in get_jobs(load_batch()):
+                batch_jobs_by_iso_canon[(job["iso"], job["canon"].lower())].append(job)
+        except (RuntimeError, FileNotFoundError):
+            pass
+
     # Generate work items
     work_items = generate_work_items(languages, args.testament, refs_by_canon)
     if not work_items:
         log("No syncable filesets found for the selected languages/testament", "WARN")
         sys.exit(0)
+
+    # A BATCH_ID run should process exactly the distinct_id(s) the batch
+    # asked for — not every locally-known version for that language.
+    # generate_work_items() has no batch awareness (it just enumerates
+    # what's known/discoverable for the given languages/testament), so
+    # without this filter a batch scoped to one version would sweep every
+    # other locally-downloaded version of the same language too. Only
+    # applies to "known" items (a pre-existing local distinct_id) —
+    # placeholder items (distinct_id=None) are unaffected, since those
+    # only ever resolve to whatever the batch's own jobs list already
+    # specifies (see the placeholder-resolution block below).
+    if os.environ.get("BATCH_ID") and batch_jobs_by_iso_canon:
+        batch_distinct_ids = {
+            (iso, canon, job["distinct_id"])
+            for (iso, canon), jobs in batch_jobs_by_iso_canon.items()
+            for job in jobs
+        }
+        work_items = [
+            w for w in work_items
+            if w["distinct_id"] is None
+            or (w["iso"], w["canon"], w["distinct_id"]) in batch_distinct_ids
+        ]
+        if not work_items:
+            log("No work items match the batch's distinct_id(s)", "WARN")
+            sys.exit(0)
 
     known = [w for w in work_items if w["distinct_id"] is not None]
     pending = [w for w in work_items if w["distinct_id"] is None]
@@ -546,139 +659,44 @@ Examples:
         check_and_report_audio(work_items, args.output_dir, refs_by_canon)
         return
 
-    # Batch jobs already carry a resolved distinct_id per (iso, canon) — core
-    # resolved it before publishing (Contract A). Look it up for placeholder
-    # work items (distinct_id=None) instead of downloading blind and
-    # discovering it from disk afterward, which requires a distinct_id
-    # up front. load_batch() hits the local cache here (already fetched
-    # above via load_all_template_refs), no extra network round trip.
-    batch_jobs_by_iso_canon: Dict[Tuple[str, str], list] = defaultdict(list)
-    if os.environ.get("BATCH_ID"):
-        try:
-            for job in get_jobs(load_batch()):
-                batch_jobs_by_iso_canon[(job["iso"], job["canon"].lower())].append(job)
-        except (RuntimeError, FileNotFoundError):
-            pass
-
-    # ── Auto-download missing audio+text ──
-
-    if not args.no_download and not args.dry_run:
-        log("Checking downloads...")
-        # Two channels:
-        #   - DBT: bulk-download per (iso) into downloads/BB/ via
-        #     download_language_content.py
-        #   - External (contrib sermon-online, helloAO BSB+reader):
-        #     bulk-download per (iso, distinct_id) into the matching
-        #     downloads/contrib/ or downloads/helloao/aligned/ tree via
-        #     remote_audio.bulk_download_external_audio
-        # Both channels write into the standard {canon}/{iso}/{distinct_id}/{BOOK}/
-        # layout so the cleanup script handles them uniformly.
-        from remote_audio import bulk_download_external_audio
-        # Dedup DBT downloads per (iso, canon, distinct_id) — download_job()
-        # fetches exactly the given version, so items sharing a version only
-        # need to trigger the fetch once.
-        downloaded_dbt_jobs = set()
-        for item in work_items:
-            iso = item["iso"]
-            canon = item["canon"]
-            canon_refs = refs_by_canon.get(canon, {})
-            if not canon_refs:
-                continue
-            distinct_id = item["distinct_id"]
-
-            contrib_dir = Path("downloads/contrib") / canon / iso / (distinct_id or "")
-            helloao_dir = Path("downloads/helloao/aligned") / canon / iso / (distinct_id or "")
-
-            if distinct_id is not None and contrib_dir.is_dir():
-                d, a, f = bulk_download_external_audio(
-                    canon, iso, distinct_id, Path("downloads/contrib"), canon_refs,
-                )
-                if d or f:
-                    log(f"  Contrib audio for {iso}/{distinct_id}: "
-                        f"{d} downloaded, {a} already present, {f} failed")
-            elif distinct_id is not None and helloao_dir.is_dir():
-                d, a, f = bulk_download_external_audio(
-                    canon, iso, distinct_id, Path("downloads/helloao/aligned"), canon_refs,
-                )
-                if d or f:
-                    log(f"  helloAO audio for {iso}/{distinct_id}: "
-                        f"{d} downloaded, {a} already present, {f} failed")
-            elif distinct_id is not None:
-                # DBT path: fetch the resolved (iso, canon, distinct_id) version.
-                key = (iso, canon, distinct_id)
-                if key in downloaded_dbt_jobs:
-                    continue
-                # Use the batch's own enriched fields if this exact
-                # (iso, canon, distinct_id) is one of its jobs — skips
-                # download_job()'s catalog resolution entirely.
-                batch_job = next(
-                    (j for j in batch_jobs_by_iso_canon.get((iso, canon), [])
-                     if j["distinct_id"] == distinct_id),
-                    None,
-                )
-                download_audio_for_chapters(
-                    iso, canon, distinct_id, canon_refs,
-                    audio_fileset=batch_job.get("audio_fileset") if batch_job else None,
-                    text_fileset=batch_job.get("text_fileset") if batch_job else None,
-                    text_source=batch_job.get("text_source") if batch_job else None,
-                )
-                downloaded_dbt_jobs.add(key)
-            else:
-                # Placeholder item (nothing known locally yet) — look up the
-                # distinct_id(s) core already resolved for this (iso, canon)
-                # in the batch itself, one DBT fetch per matching job.
-                matching_jobs = batch_jobs_by_iso_canon.get((iso, canon), [])
-                if not matching_jobs:
-                    log(f"  Skipping {iso}/{canon.upper()}: no distinct_id "
-                        "resolved locally or in the batch", "WARN")
-                for job in matching_jobs:
-                    job_distinct_id = job["distinct_id"]
-                    key = (iso, canon, job_distinct_id)
-                    if key in downloaded_dbt_jobs:
-                        continue
-                    job_chapters = {
-                        b: set(chs) for b, chs in job.get("chapters", {}).items()
-                    } or canon_refs
-                    download_audio_for_chapters(
-                        iso, canon, job_distinct_id, job_chapters,
-                        audio_fileset=job.get("audio_fileset"),
-                        text_fileset=job.get("text_fileset"),
-                        text_source=job.get("text_source"),
-                    )
-                    downloaded_dbt_jobs.add(key)
-
-        # Re-resolve placeholder work items (distinct_id=None) now that downloads exist
-        # (Version-exclusion is handled upstream by core — batch jobs are pre-filtered.)
+    # ── Resolve placeholder work items (no downloading yet) ──
+    #
+    # A batch job already carries everything needed to resolve a
+    # placeholder (distinct_id=None) work item — a pure in-memory lookup
+    # against the manifest already loaded above, no network or disk scan
+    # needed. Actual fetching now happens per-chapter, interleaved with
+    # compute, in the main processing loop below (see ensure_chapter_ready
+    # and _source_type_for) — this replaces the old two-pass "bulk-
+    # download everything, then rescan disk to see what showed up"
+    # approach, which is also why this runs even during --dry-run now
+    # (harmless — it's just a lookup) unlike the old bulk-download step.
+    if not args.no_download:
         resolved = []
         for item in work_items:
+            iso, canon = item["iso"], item["canon"]
+            matching_jobs = batch_jobs_by_iso_canon.get((iso, canon), [])
             if item["distinct_id"] is not None:
-                resolved.append(item)
-            else:
-                # Scan disk for what was downloaded across all source roots
-                seen = set()
-                any_dir = False
-                for base in (
-                    Path("downloads/BB"),
-                    Path("downloads/contrib"),
-                    Path("downloads/helloao/aligned"),
-                ):
-                    iso_dir = base / item["canon"] / item["iso"]
-                    if not iso_dir.is_dir():
-                        continue
-                    any_dir = True
-                    for distinct_dir in sorted(iso_dir.iterdir()):
-                        if not distinct_dir.is_dir() or distinct_dir.name in seen:
-                            continue
-                        seen.add(distinct_dir.name)
-                        resolved.append({
-                            **item,
-                            "distinct_id": distinct_dir.name,
-                            "has_downloads": True,
-                        })
-                        log(f"  Discovered fileset: {item['iso']}/{item['canon']}/{distinct_dir.name}")
-                if not any_dir:
-                    log(f"  No downloads found for {item['iso']}/{item['canon']}", "WARN")
+                batch_job = next(
+                    (j for j in matching_jobs if j["distinct_id"] == item["distinct_id"]),
+                    None,
+                )
+                resolved.append({**item, "_batch_job": batch_job})
+                continue
+            if not matching_jobs:
+                log(f"  Skipping {iso}/{canon.upper()}: no distinct_id "
+                    "resolved locally or in the batch", "WARN")
+                continue
+            for job in matching_jobs:
+                resolved.append({
+                    **item,
+                    "distinct_id": job["distinct_id"],
+                    "has_downloads": True,
+                    "_batch_job": job,
+                })
         work_items = resolved
+    else:
+        for item in work_items:
+            item["_batch_job"] = None
 
     # ── Verify dependencies and pre-load models (unless dry-run) ──
     #
@@ -784,39 +802,120 @@ Examples:
                 # No template refs but book/chapter filter — let discover_chapter_files handle it
                 pass
 
-        chapters, skipped = discover_chapter_files(
-            iso, canon, distinct_id, args.output_dir,
-            force=args.force,  # Only force-rediscover when user passes --force
-            required_chapters=filtered_refs,
-        )
-        total_stats["chapters_skipped"] += skipped
+        total_expected = None  # best-effort count for the progress label
 
-        if not chapters:
-            if skipped > 0:
-                log("All chapters already processed")
-            else:
+        if filtered_refs is None:
+            # No known chapter set for this item (e.g. --book/--chapter used
+            # without --books/--template to scope it) — can't build a
+            # from-refs worklist, so fall back to a bulk disk-scan for
+            # this item only. No prefetch benefit here, but this is an
+            # ad-hoc/unscoped edge case, not the batch-driven path
+            # prefetch is meant to help.
+            chapters, skipped = discover_chapter_files(
+                iso, canon, distinct_id, args.output_dir,
+                force=args.force,
+                required_chapters=None,
+            )
+            total_stats["chapters_skipped"] += skipped
+            if not chapters:
+                log("All chapters already processed" if skipped else "No audio+text pairs found",
+                    "INFO" if skipped else "WARN")
+                continue
+            log(f"Chapters found: {len(chapters)}")
+            chapter_iter = chapters
+            total_expected = len(chapters)
+        else:
+            source_type = _source_type_for(canon, iso, distinct_id)
+            wanted = sorted(
+                (book, ch) for book, chs in filtered_refs.items() for ch in sorted(chs)
+            )
+            if not wanted:
                 log("No audio+text pairs found", "WARN")
-            continue
+                continue
 
-        log(f"Chapters found: {len(chapters)}")
+            if args.dry_run:
+                # No fetching in dry-run — just report what's already there.
+                chapters = []
+                skipped = 0
+                for book, ch in wanted:
+                    ch_list, ch_skipped = discover_chapter_files(
+                        iso, canon, distinct_id, args.output_dir,
+                        force=args.force, required_chapters={book: {ch}},
+                    )
+                    skipped += ch_skipped
+                    chapters.extend(ch_list)
+                total_stats["chapters_skipped"] += skipped
+                if not chapters:
+                    log("All chapters already processed" if skipped else "No audio+text pairs found",
+                        "INFO" if skipped else "WARN")
+                    continue
+                log(f"Chapters found: {len(chapters)}")
+                for ch in chapters:
+                    whisper_path = ch["whisper_words_path"]
+                    mms_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / ch["book"]
+                    mms_path = mms_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_mms_words.json"
+                    out_book_dir = args.output_dir / canon / iso / distinct_id / ch["book"]
+                    timing_path = out_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_timing.json"
 
-        if args.dry_run:
-            for ch in chapters:
-                whisper_path = ch["whisper_words_path"]
-                mms_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / ch["book"]
-                mms_path = mms_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_mms_words.json"
-                out_book_dir = args.output_dir / canon / iso / distinct_id / ch["book"]
-                timing_path = out_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_timing.json"
+                    status_parts = []
+                    if not args.skip_whisper:
+                        status_parts.append(f"whisper={'exists' if whisper_path.exists() else 'TODO'}")
+                    if not args.skip_mms:
+                        status_parts.append(f"mms={'exists' if mms_path.exists() else 'TODO'}")
+                    if not args.skip_fusion:
+                        status_parts.append(f"fusion={'exists' if timing_path.exists() else 'TODO'}")
+                    log(f"  {ch['book']} {ch['chapter']} — {', '.join(status_parts)}")
+                continue
 
-                status_parts = []
-                if not args.skip_whisper:
-                    status_parts.append(f"whisper={'exists' if whisper_path.exists() else 'TODO'}")
-                if not args.skip_mms:
-                    status_parts.append(f"mms={'exists' if mms_path.exists() else 'TODO'}")
-                if not args.skip_fusion:
-                    status_parts.append(f"fusion={'exists' if timing_path.exists() else 'TODO'}")
-                log(f"  {ch['book']} {ch['chapter']} — {', '.join(status_parts)}")
-            continue
+            # Real run — fetch chapters via a background thread that stays
+            # one chapter ahead of what's consumed below. This is what
+            # actually overlaps download(i+1) with compute(i): a plain
+            # "fetch everything, then discover everything" loop (like the
+            # dry-run branch above) would still finish ALL fetching before
+            # ANY compute starts, even at per-chapter granularity. The
+            # queue's maxsize=2 caps how far ahead the fetch thread can
+            # get — fetch is far faster than Whisper/MMS/Fusion per
+            # chapter, so it doesn't need a deep buffer, just enough to
+            # never leave the compute side waiting after the first chapter.
+            log(f"Chapters found: {len(wanted)} (fetching in background, one ahead of processing)")
+
+            def _prefetching_chapters(wanted=wanted, source_type=source_type,
+                                       batch_job=item.get("_batch_job")):
+                q: "queue.Queue" = queue.Queue(maxsize=2)
+
+                def worker():
+                    for book, ch in wanted:
+                        if not args.no_download and source_type == "dbt":
+                            ensure_chapter_ready(
+                                iso, canon, distinct_id, book, ch,
+                                batch_job=batch_job, force=args.force,
+                            )
+                        # contrib/helloao: no upfront fetch call needed —
+                        # text is already imported by a separate step, and
+                        # audio is fetched lazily via ensure_chapter_audio()
+                        # in the compute loop below (unchanged from before).
+                        ch_list, ch_skipped = discover_chapter_files(
+                            iso, canon, distinct_id, args.output_dir,
+                            force=args.force, required_chapters={book: {ch}},
+                        )
+                        total_stats["chapters_skipped"] += ch_skipped
+                        for ch_dict in ch_list:
+                            q.put(ch_dict)
+                    q.put(None)  # sentinel: fetching done
+
+                t = threading.Thread(target=worker, daemon=True)
+                t.start()
+                while True:
+                    ch_dict = q.get()
+                    if ch_dict is None:
+                        break
+                    yield ch_dict
+                t.join()
+
+            chapter_iter = _prefetching_chapters()
+            total_expected = len(wanted)  # lower bound — a chapter with
+            # multiple audio filesets (e.g. drama + standard) yields more
+            # than one chapter dict, same as the pre-restructuring code.
 
         # Load language config
         config = load_language_config(iso)
@@ -832,10 +931,12 @@ Examples:
         total_stats["languages_processed"].add(iso)
 
         # Process each chapter through the pipeline
-        for ch_idx, chapter in enumerate(chapters):
+        chapters_seen = 0
+        for ch_idx, chapter in enumerate(chapter_iter):
+            chapters_seen += 1
             book = chapter["book"]
             ch_num = chapter["chapter"]
-            label = f"[{ch_idx + 1}/{len(chapters)}] {book} {ch_num}"
+            label = f"[{ch_idx + 1}/{total_expected}] {book} {ch_num}"
 
             try:
                 # Ensure local audio for external sources (sermon-online, helloAO).
@@ -861,13 +962,14 @@ Examples:
                     log(f"{label} Whisper: skipped (drama — prefer standard)")
                 elif not args.skip_whisper:
                     whisper_path = chapter["whisper_words_path"]
-                    if whisper_path.exists() and not args.force:
+                    if not needs_run(whisper_path, force=args.force):
                         log(f"{label} Whisper: skipped (exists)")
                     else:
                         log(f"{label} Whisper: transcribing...")
                         t0 = time.time()
-                        stats = run_whisper_chapter(chapter, args.model, whisper_lang,
-                                                    whisper_model=whisper_model_instance)
+                        with Heartbeat(f"{label} Whisper"):
+                            stats = run_whisper_chapter(chapter, args.model, whisper_lang,
+                                                        whisper_model=whisper_model_instance)
                         elapsed = time.time() - t0
                         duration_str = format_duration(stats["duration"])
                         speed = stats["duration"] / elapsed if elapsed > 0 else 0
@@ -891,15 +993,16 @@ Examples:
                 # ── Step 1b: MMS ──
                 if not args.skip_mms:
                     mms_item = build_mms_item(chapter, canon, iso, distinct_id)
-                    if mms_item["mms_path"].exists() and not args.force:
+                    if not needs_run(mms_item["mms_path"], force=args.force):
                         log(f"{label} MMS: skipped (exists)")
                     else:
                         log(f"{label} MMS: aligning...")
                         bundle, model, tokenizer, aligner, uroman = mms_loaded
-                        stats = run_mms_chapter(
-                            mms_item, bundle, model, tokenizer, aligner, uroman, config,
-                            header_skip_time=header_skip_time,
-                        )
+                        with Heartbeat(f"{label} MMS"):
+                            stats = run_mms_chapter(
+                                mms_item, bundle, model, tokenizer, aligner, uroman, config,
+                                header_skip_time=header_skip_time,
+                            )
                         if "error" in stats:
                             log(f"{label} MMS: {stats['error']}", "ERROR")
                         else:
@@ -920,16 +1023,13 @@ Examples:
                     )
 
                     # Check if fusion output is stale (inputs newer than output)
-                    fusion_stale = False
-                    if fusion_item["timing_path"].exists() and not args.force:
-                        out_mtime = fusion_item["timing_path"].stat().st_mtime
-                        for src_key in ("mms_path", "whisper_path"):
-                            src = fusion_item[src_key]
-                            if src and src.exists() and src.stat().st_mtime > out_mtime:
-                                fusion_stale = True
-                                break
+                    timing_path = fusion_item["timing_path"]
+                    timing_existed = timing_path.exists()
+                    fusion_stale = timing_existed and not args.force and needs_run(
+                        timing_path, fusion_item["mms_path"], fusion_item["whisper_path"],
+                    )
 
-                    if fusion_item["timing_path"].exists() and not args.force and not fusion_stale:
+                    if timing_existed and not args.force and not fusion_stale:
                         log(f"{label} Fusion: skipped (exists)")
                     else:
                         if fusion_stale:
@@ -944,7 +1044,8 @@ Examples:
                                 fusion_mms = mms_loaded
                             # Add audio path for segment re-alignment
                             fusion_item["audio_path"] = chapter.get("audio_path")
-                            stats = run_fusion_chapter(fusion_item, config, mms_components=fusion_mms)
+                            with Heartbeat(f"{label} Fusion"):
+                                stats = run_fusion_chapter(fusion_item, config, mms_components=fusion_mms)
                             if "error" in stats:
                                 log(f"{label} Fusion: {stats['error']}", "ERROR")
                                 run_results.append({
@@ -990,6 +1091,16 @@ Examples:
                     "book": book, "chapter": ch_num,
                     "status": "failed", "error": str(e),
                 })
+
+        if chapters_seen == 0:
+            # The other two branches (filtered_refs is None; --dry-run)
+            # already log this before ever reaching the compute loop, since
+            # they materialize a full chapters list upfront. The real/
+            # threaded branch doesn't know until the generator is drained,
+            # so it's checked here instead — otherwise a fully-up-to-date
+            # fileset just silently produces zero log lines, which reads
+            # like something went wrong rather than "nothing to do."
+            log("All chapters already processed")
 
     # ── Summary ──
 

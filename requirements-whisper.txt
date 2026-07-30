@@ -18,14 +18,14 @@ mlx-whisper>=0.4.0
 # CUDA / CPU backend (works on Linux, Windows, and non-Apple-Silicon macOS)
 faster-whisper>=1.0.0
 
-# CUDA 12 runtime libraries required by faster-whisper on NVIDIA GPU systems.
-# These install the shared libraries (.so/.dll) that CTranslate2 needs.
-# Safe to install on CPU-only Linux/Windows boxes (they are no-ops without a
-# GPU) but PyPI has no macOS build at all — placeholder-only package that
-# fails to install there, so it's gated to Linux via a platform marker.
-nvidia-cublas-cu12; sys_platform == "linux"
-nvidia-cudnn-cu12; sys_platform == "linux"
-nvidia-cuda-nvrtc-cu12; sys_platform == "linux"
+# CUDA 12 runtime libraries (~1.5GB combined) required by faster-whisper on
+# NVIDIA GPU systems — NOT installed by this file. pip has no marker for
+# "an NVIDIA GPU is actually present" (sys_platform == "linux" matches every
+# Linux box, GPU or not), so gating them here would waste ~1.5GB on any
+# CPU-only Linux install. `make install` checks for nvidia-smi and installs
+# requirements-cuda.txt only when it finds one; install it manually with
+# `pip install -r requirements-cuda.txt` if you know this box has an
+# NVIDIA GPU but nvidia-smi isn't on PATH for some reason.
 
 # MMS-FA (mms_align_words.py) — torch/torchaudio/uroman are still installed
 # separately (pip install torch torchaudio uroman, per align_pipeline.py's

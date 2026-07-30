@@ -1,0 +1,28 @@
+# Secrets — never let these into the build context/image layers.
+.env
+.env.*
+
+# This session's throwaway BSB-text-integrity work — not part of the
+# deployable pipeline.
+spotcheck/
+
+# Runtime/working data — fetched or generated fresh on every run, not
+# something the image should ship with (see README's "Rented GPU
+# deployment" section for what IS baked in: just the Whisper/MMS weights).
+downloads/
+sorted/
+export/
+word-timing-data/
+api-cache/
+download_log/
+_runs/
+_batches/
+contrib/
+josh/
+
+# Local dev cruft
+.git/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

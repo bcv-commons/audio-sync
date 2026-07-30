@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 
 .PHONY: all align align-whisper align-mms align-fuse \
         import-contrib prepare-cross-source \
-        publish-align publish-align-dry \
+        publish-align publish-align-dry fetch-remote-run \
         quality-check quality-compare quality-report \
         install check help
 
@@ -28,6 +28,9 @@ help: ## Show available targets
 	@echo "  ──────────"
 	@echo "  make publish-align      Publish timing-data + run manifest to cdn.bibel.wiki/align/"
 	@echo "  make publish-align-dry  Dry-run (no writes)"
+	@echo "  make fetch-remote-run HOST=user@host [PORT=22]"
+	@echo "                          Pull a rented-GPU run's output back here before publishing"
+	@echo "                          (see Dockerfile / README's 'Rented GPU deployment' section)"
 	@echo ""
 	@echo "  Quality tools"
 	@echo "  ─────────────"
@@ -37,7 +40,7 @@ help: ## Show available targets
 	@echo ""
 	@echo "  Setup"
 	@echo "  ─────"
-	@echo "  make install         Install Python dependencies"
+	@echo "  make install         Install Python dependencies (+ CUDA libs if an NVIDIA GPU is detected)"
 	@echo "  make check           Verify installation"
 	@echo ""
 	@echo "  Pass extra args via ARGS, e.g.:"
@@ -80,6 +83,10 @@ publish-align: ## Publish timing-data + run manifest to cdn.bibel.wiki/align/
 publish-align-dry: ## Dry-run publish-align (no writes)
 	DRY_RUN=1 scripts/publish-align.sh
 
+fetch-remote-run: ## Pull export/timing-data + _runs back from a rented GPU box (HOST=user@host)
+	@if [ -z "$(HOST)" ]; then echo "Usage: make fetch-remote-run HOST=user@host [PORT=22]"; exit 1; fi
+	scripts/fetch-remote-run.sh $(HOST) $(PORT)
+
 # ---------------------------------------------------------------------------
 # Quality tools
 # ---------------------------------------------------------------------------
@@ -99,11 +106,23 @@ quality-report: ## Generate detailed quality report
 
 install: ## Install Python dependencies
 	pip install -r requirements-whisper.txt
+	@if command -v nvidia-smi >/dev/null 2>&1; then \
+		echo "NVIDIA GPU detected — installing requirements-cuda.txt"; \
+		pip install -r requirements-cuda.txt; \
+	else \
+		echo "No NVIDIA GPU detected (nvidia-smi not found) — skipping requirements-cuda.txt"; \
+	fi
 
 check: ## Verify installation
 	$(PYTHON) --version
 	@$(PYTHON) -c "import torch; print('torch:', torch.__version__)" 2>/dev/null || echo "torch: not installed"
 	@$(PYTHON) -c "import torchaudio; print('torchaudio:', torchaudio.__version__)" 2>/dev/null || echo "torchaudio: not installed"
+	@$(PYTHON) -c "\
+import torch; \
+has_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(); \
+device = 'cuda' if torch.cuda.is_available() else 'mps' if has_mps else 'cpu'; \
+print('compute device:', device, '(no GPU found — alignment will run on CPU, slower)' if device == 'cpu' else '')" \
+2>/dev/null || echo "compute device: unknown (torch not installed)"
 
 # ---------------------------------------------------------------------------
 # Housekeeping

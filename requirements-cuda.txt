@@ -1,0 +1,13 @@
+# CUDA 12 runtime libraries required by faster-whisper (CTranslate2) on
+# NVIDIA GPU systems. Split out from requirements-whisper.txt because pip
+# has no environment marker for "an NVIDIA GPU is present" — only for
+# platform/OS — so this file is installed conditionally (see `make install`
+# in the Makefile, which checks for nvidia-smi) rather than unconditionally
+# on every Linux box. ~1.5GB combined; installing this without an NVIDIA
+# GPU/driver is harmless but pointless.
+#
+# PyPI has no macOS build at all for these, so they're still gated to Linux
+# even when installed explicitly.
+nvidia-cublas-cu12; sys_platform == "linux"
+nvidia-cudnn-cu12; sys_platform == "linux"
+nvidia-cuda-nvrtc-cu12; sys_platform == "linux"

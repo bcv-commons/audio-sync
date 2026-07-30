@@ -147,8 +147,17 @@ def _enough_vram_for_whisper(model_name: str) -> bool:
 
 
 # Default models per backend
+#
+# faster-whisper defaults to 'small' (not large-v3): in this pipeline
+# Whisper is only a validation/fallback layer for MMS-FA's forced
+# alignment (see align_words.py's docstring — "MMS-FA is used as primary
+# ... Whisper is used for validation/adjustment"), not the primary
+# transcription source, so large-v3's extra accuracy on noisy/multilingual
+# audio buys little here while costing ~40x the compute. 'small' keeps
+# meaningfully better rare-word/proper-noun accuracy than 'tiny'/'base'
+# (relevant for genealogies/place names) at a fraction of large-v3's cost.
 DEFAULT_MODEL_MLX = "mlx-community/whisper-large-v3-mlx"
-DEFAULT_MODEL_FASTER = "large-v3"
+DEFAULT_MODEL_FASTER = "small"
 DEFAULT_MODEL = DEFAULT_MODEL_MLX if _USE_MLX else DEFAULT_MODEL_FASTER
 DEFAULT_MATCH_THRESHOLD = 0.5
 ANCHOR_WORD_COUNT = 8
