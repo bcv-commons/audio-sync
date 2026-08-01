@@ -68,8 +68,6 @@ import sys as _sys
 
 PRIORITY_LANGUAGES_FILE = Path("whisper-priority-languages.json")
 DOWNLOADS_DIR = Path("downloads/BB")
-HELLOAO_DOWNLOADS = Path("downloads/helloao")
-HELLOAO_API = "https://bible.helloao.org/api"
 DEFAULT_OUTPUT_DIR = Path("export/timing-data")
 WORD_TIMING_DIR = Path("word-timing-data")
 TEMPLATE_DIR = Path("templates")
@@ -443,68 +441,45 @@ def _find_base_dir(canon: str, iso: str, distinct_id: str) -> Optional[Path]:
     return None
 
 
-def _find_helloao_id(iso: str, distinct_id: str) -> Optional[str]:
+def _text_tag(txt_path: Path) -> str:
+    """Extract the fileset tag from a discovered text filename.
+
+    E.g. "1TI_003_SPNBDAN_ET.txt" -> "SPNBDAN_ET". Used both to pick the
+    preferred candidate and to validate a found file against current
+    catalog resolution (see _expected_text_tags()).
     """
-    Find a helloAO translation ID that pairs with a DBT audio-only distinct_id.
+    parts = txt_path.stem.split("_", 2)
+    return parts[2] if len(parts) >= 3 else ""
 
-    Convention: helloAO uses lowercase+underscore IDs (e.g., gaz_bib),
-    DBT uses uppercase IDs (e.g., GAZBIB).
+
+def _expected_text_tags(iso: str, canon: str, distinct_id: str) -> Tuple[Set[str], bool]:
+    """Fileset tags a genuinely valid text file for (iso, canon, distinct_id)
+    can have right now, per the current DBT-catalog + verified-helloAO
+    resolution (download_language_content.get_best_fileset_from_catalog() /
+    resolve_preferred_text_source()) — NOT a coincidental-naming guess.
+
+    Returns (tags, catalog_available). catalog_available is False only when
+    the CDN catalog fetch itself failed (network down, etc.) — callers
+    should trust whatever's on disk in that case rather than reject
+    everything just because resolution couldn't run.
     """
-    if "_" in distinct_id or not distinct_id.isupper():
-        return None
-    if not HELLOAO_DOWNLOADS.is_dir():
-        return None
+    from download_language_content import (
+        _load_dbt_catalog,
+        get_best_fileset_from_catalog,
+        resolve_preferred_text_source,
+    )
 
-    for candidate in HELLOAO_DOWNLOADS.iterdir():
-        if not candidate.is_dir() or "_" not in candidate.name:
-            continue
-        if candidate.name.replace("_", "").upper() == distinct_id:
-            helloao_iso = candidate.name.split("_")[0]
-            if helloao_iso == iso:
-                return candidate.name
-    return None
-
-
-def _fetch_helloao_text(helloao_id: str, book: str, chapter_num: int, dest_dir: Path) -> Optional[Path]:
-    """
-    Fetch a chapter's text from helloAO API and write as ET-format .txt file.
-    Returns the path to the written file, or None on failure.
-    """
-    import urllib.request
-
-    chapter_str = f"{chapter_num:03d}"
-    txt_filename = f"{book}_{chapter_str}_{helloao_id.replace('_', '').upper()}_ET.txt"
-    txt_path = dest_dir / txt_filename
-
-    if txt_path.exists():
-        return txt_path
-
-    url = f"{HELLOAO_API}/{helloao_id}/{book}/{chapter_num}.json"
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        log(f"    Failed to fetch helloAO text {book} {chapter_num}: {e}", "WARN")
-        return None
-
-    content = data.get("chapter", {}).get("content", [])
-    verses = []
-    for item in content:
-        if item.get("type") == "verse":
-            text_parts = []
-            for part in item.get("content", []):
-                if isinstance(part, dict) and "text" in part:
-                    text_parts.append(part["text"])
-                elif isinstance(part, str):
-                    text_parts.append(part)
-            verses.append(" ".join(text_parts))
-
-    if not verses:
-        return None
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    txt_path.write_text("\n".join(verses) + "\n", encoding="utf-8")
-    return txt_path
+    catalog_available = bool(_load_dbt_catalog("catalog-text").get("entries"))
+    tags: Set[str] = set()
+    info = get_best_fileset_from_catalog(iso, canon, distinct_id)
+    if info:
+        tags.update(info.get("text_fileset_candidates") or [])
+        if info.get("text_fileset"):
+            tags.add(info["text_fileset"])
+    text_source, source_id = resolve_preferred_text_source(iso, canon, distinct_id)
+    if text_source == "helloao" and source_id:
+        tags.add(f"{source_id.replace('_', '').upper()}_ET")
+    return tags, catalog_available
 
 
 def discover_chapter_files(
@@ -527,6 +502,12 @@ def discover_chapter_files(
 
     chapters = []
     skipped = 0
+
+    # Computed once per (iso, canon, distinct_id) — used below to reject any
+    # .txt already on disk that doesn't match current catalog-verified
+    # resolution (stale/orphaned text left over from an older or unverified
+    # fetch attempt), not just to fetch missing text.
+    expected_text_tags, catalog_available = _expected_text_tags(iso, canon, distinct_id)
 
     # If this version dir uses an external audio source (sermon-online via
     # audio.json, or a helloao/aligned/ subtree), the mp3 may be fetched on
@@ -610,26 +591,53 @@ def discover_chapter_files(
 
             # Find matching text file (prefer _ET plain text over other formats)
             txt_candidates = list(book_dir.glob(f"{file_book}_{chapter_str}_*.txt"))
+
+            # Reject anything on disk that isn't a catalog-verified source
+            # for this distinct_id — catches stale/orphaned text left over
+            # from an older or unverified resolution attempt (only when the
+            # catalog itself is reachable; if it's down, trust what's on
+            # disk rather than discard everything).
+            if txt_candidates and catalog_available:
+                valid = [p for p in txt_candidates if _text_tag(p) in expected_text_tags]
+                if valid:
+                    txt_candidates = valid
+                else:
+                    log(f"  Ignoring text on disk for {file_book} {chapter_num} in "
+                        f"{distinct_id} — not a catalog-verified source "
+                        f"({', '.join(p.name for p in txt_candidates)})", "WARN")
+                    txt_candidates = []
+
             if not txt_candidates:
-                helloao_id = _find_helloao_id(iso, distinct_id)
-                if helloao_id:
-                    fetched = _fetch_helloao_text(helloao_id, file_book, chapter_num, book_dir)
-                    if fetched:
-                        txt_candidates = [fetched]
+                from download_language_content import (
+                    _fetch_helloao_chapter,
+                    resolve_preferred_text_source,
+                )
+                text_source, source_id = resolve_preferred_text_source(iso, canon, distinct_id)
+                if text_source == "helloao" and source_id:
+                    hao_tag = f"{source_id.replace('_', '').upper()}_ET"
+                    dest_path = book_dir / f"{file_book}_{chapter_str}_{hao_tag}.txt"
+                    if _fetch_helloao_chapter(source_id, file_book, chapter_num, dest_path):
+                        txt_candidates = [dest_path]
                 if not txt_candidates:
                     log(f"  No text file for {file_book} {chapter_num} in {distinct_id}", "WARN")
                     continue
             txt_candidates.sort(key=lambda p: (0 if "_ET" in p.stem else 1, p.name))
             txt_path = txt_candidates[0]
-            text_fileset = txt_path.stem.split("_", 2)[2] if len(txt_path.stem.split("_", 2)) >= 3 else ""
+            text_fileset = _text_tag(txt_path)
 
-            # Create entries for ALL audio filesets (MMS runs on all)
-            # Mark which one Whisper should prefer (standard over drama)
+            # Strategic decision: dramatized audio (background music, sound
+            # effects, multiple/overlapping voices) measurably hurts both
+            # Whisper and MMS alignment quality compared to a plain reading.
+            # It's only worth aligning when it's the ONLY recording available
+            # for this chapter — never alongside a standard one. So: align
+            # every standard fileset found; only fall back to dramatized
+            # filesets when no standard one exists at all.
             standard = [m for m in mp3_list if not m[2]]
             drama = [m for m in mp3_list if m[2]]
+            filesets_to_align = standard if standard else drama
             whisper_fileset = standard[0][0] if standard else mp3_list[0][0]
 
-            for audio_fileset, mp3_path, is_drama, _ in mp3_list:
+            for audio_fileset, mp3_path, is_drama, _ in filesets_to_align:
                 out_book_dir = output_dir / canon / iso / distinct_id / file_book
                 whisper_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / file_book
                 whisper_words_filename = f"{file_book}_{chapter_str}_{audio_fileset}_whisper_words.json"

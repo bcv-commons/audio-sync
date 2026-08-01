@@ -824,6 +824,7 @@ Examples:
             log(f"Chapters found: {len(chapters)}")
             chapter_iter = chapters
             total_expected = len(chapters)
+            total_is_exact = True  # fully discovered up front, no prefetch guessing
         else:
             source_type = _source_type_for(canon, iso, distinct_id)
             wanted = sorted(
@@ -916,6 +917,11 @@ Examples:
             total_expected = len(wanted)  # lower bound — a chapter with
             # multiple audio filesets (e.g. drama + standard) yields more
             # than one chapter dict, same as the pre-restructuring code.
+            # Not knowable exactly without fetching everything up front
+            # first, which would defeat the one-ahead prefetch pipeline —
+            # so the progress label below marks it "~" instead of pretending
+            # to be precise.
+            total_is_exact = False
 
         # Load language config
         config = load_language_config(iso)
@@ -936,7 +942,8 @@ Examples:
             chapters_seen += 1
             book = chapter["book"]
             ch_num = chapter["chapter"]
-            label = f"[{ch_idx + 1}/{total_expected}] {book} {ch_num}"
+            total_label = str(total_expected) if total_is_exact else f"~{max(total_expected, ch_idx + 1)}"
+            label = f"[{ch_idx + 1}/{total_label}] {book} {ch_num}"
 
             try:
                 # Ensure local audio for external sources (sermon-online, helloAO).

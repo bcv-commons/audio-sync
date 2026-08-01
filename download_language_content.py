@@ -673,6 +673,30 @@ def _classify_api_failure() -> str:
     return "http_error"
 
 
+def _get_with_retry(url: str, *, attempts: int = 3, backoff: float = 2.0, **kwargs):
+    """requests.get() with retry-with-backoff on transient network errors.
+
+    Only retries Timeout/ConnectionError — the class of failure a long
+    unattended run actually hits against DBT's CDN (e.g. a CloudFront read
+    timeout that clears up moments later). Does NOT retry HTTPError
+    (4xx/5xx from raise_for_status()) — those are real answers ("fileset
+    doesn't exist", "unauthorized"), not blips, and retrying them just
+    wastes time hammering a request that will fail the same way again.
+    """
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return requests.get(url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            if attempt < attempts:
+                wait = backoff * attempt
+                log(f"  Request timed out (attempt {attempt}/{attempts}), "
+                    f"retrying in {wait:.0f}s: {e}", "WARNING")
+                time.sleep(wait)
+    raise last_exc
+
+
 def make_api_request(
     endpoint: str, params: Optional[Dict] = None, use_key_param: bool = False
 ) -> Optional[Dict]:
@@ -702,7 +726,7 @@ def make_api_request(
     global _LAST_API_ERROR
     _LAST_API_ERROR = None
     try:
-        response = requests.get(
+        response = _get_with_retry(
             url, headers=headers, params=request_params, timeout=API_TIMEOUT
         )
         response.raise_for_status()
@@ -887,7 +911,7 @@ def download_audio(
             return False
 
     try:
-        response = requests.get(audio_path, timeout=DOWNLOAD_TIMEOUT)
+        response = _get_with_retry(audio_path, timeout=DOWNLOAD_TIMEOUT)
         response.raise_for_status()
 
         with open(output_path, "wb") as f:
@@ -954,7 +978,7 @@ def download_text(
 
         if text_content["type"] == "path":
             # Download file from path (JSON/USX format)
-            response = requests.get(text_content["data"], timeout=DOWNLOAD_TIMEOUT)
+            response = _get_with_retry(text_content["data"], timeout=DOWNLOAD_TIMEOUT)
             response.raise_for_status()
 
             with open(output_path, "w", encoding="utf-8") as f:
