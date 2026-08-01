@@ -189,17 +189,33 @@ def _catalog_entries(iso: str, canon: str, distinct_id: str, catalog_name: str) 
     return []
 
 
+def _resolve_catalog_fileset_id(distinct_id: str, raw_id: str) -> str:
+    """Turn a catalog entry's raw "id" field into a real DBT fileset id.
+
+    raw_id is "{type}:{value}" where type's case decides how value is used:
+    lowercase -> value is a suffix, concatenate with distinct_id; uppercase
+    -> value is already the complete fileset id, use as-is.
+    """
+    type_char, _, value = raw_id.partition(":")
+    if type_char.isupper():
+        return value
+    return f"{distinct_id}{value}"
+
+
 def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Optional[Dict]:
     """
     Resolve the best audio/text fileset for (iso, canon, distinct_id) from
     the `bibles` repo's catalog-text.json/catalog-audio.json — the CDN
     replacement for the old local sorted/BB scan.
 
-    Each catalog entry stores only the *suffix* after distinct_id (e.g.
-    "id": "a:N2DA" under distinct_id "ENGKJV" reconstructs to fileset id
-    "ENGKJVN2DA"); the bibles team validated this reconstruction against
-    the live DBT API at publish time, and it round-tripped independently
-    against a couple of samples used here too (e.g. AAIWBT, AAAMLTN_ET).
+    Each catalog entry's "id" is "{a|A|t|T}:{value}". Lowercase (a:/t:)
+    means value is a *suffix* to append to distinct_id (e.g. "a:N2DA" under
+    "ENGKJV" -> "ENGKJVN2DA"). Uppercase (A:/T:) means value is already the
+    *complete* fileset id — some DBT distinct_ids don't prefix their own
+    filesets (e.g. "SPABDA"'s audio filesets are "SPNBDAN1DA" etc., not
+    "SPABDA..."); concatenating in that case produces a nonexistent id like
+    "SPABDASPNBDAN1DA" (404s against the DBT API). See
+    _resolve_catalog_fileset_id().
 
     Canon-level only — catalog entries don't carry DBT's per-book size/
     coverage field the way sorted/BB metadata did, so a fileset picked
@@ -223,8 +239,7 @@ def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Opt
     alt_audio_fileset = None
     audio_candidates = []
     for e in audio_entries:
-        suffix = e["id"][2:]  # strip "a:" prefix
-        fid = f"{distinct_id}{suffix}"
+        fid = _resolve_catalog_fileset_id(distinct_id, e["id"])
         is_dramatized = "2DA" in fid or "2SA" in fid
         is_stream = fid.endswith("SA")
         is_opus = e.get("c") == "opus"
@@ -247,8 +262,7 @@ def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Opt
         fmt = e.get("fmt", [])
         if fmt == ["u"]:
             continue
-        suffix = e["id"][2:]  # strip "t:" prefix
-        fid = f"{distinct_id}{suffix}"
+        fid = _resolve_catalog_fileset_id(distinct_id, e["id"])
         base = 0 if "pl" in fmt else 1 if "j" in fmt else 2
         text_candidates.append(((base, fid), fid))
     text_candidates.sort()
