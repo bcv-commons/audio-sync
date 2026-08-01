@@ -36,6 +36,7 @@ download_log/
 contrib
 josh
 spotcheck
+hays_audio/
 
 # Bulk source-audio downloads staged at repo root (e.g. openbible.com's
 # BSB_00_Chapters_Hays.zip) — working data, not source.
