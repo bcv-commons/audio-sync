@@ -61,6 +61,7 @@ import argparse
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -98,6 +99,45 @@ from whisper_transcribe import (
 )
 
 RUNS_DIR = Path("_runs")
+
+# Hard wall-clock cap on a single Whisper/MMS/Fusion call, in seconds.
+# Safety net against a pathological chapter hanging the whole batch —
+# observed directly: a genealogy-heavy chapter (1CH 23) ran MMS for over
+# 16 hours before the box was reset, blocking every chapter after it.
+# 1200s (20 min) is ~4x the slowest legitimately-observed chapter so far
+# (~5 min) — generous enough not to trip on real work, far below "hangs
+# for hours." Uses signal.alarm, so it only works from the main thread
+# (true here) and can't safely interrupt every possible C/torch call
+# mid-instruction, but it bounds a hang instead of leaving it unbounded.
+STEP_TIMEOUT_SECONDS = 1200
+
+
+class StepTimeout(Exception):
+    """Raised when a Whisper/MMS/Fusion call exceeds STEP_TIMEOUT_SECONDS."""
+
+
+class TimeLimit:
+    """Context manager enforcing STEP_TIMEOUT_SECONDS via SIGALRM.
+
+    On expiry, raises StepTimeout — caught by the same per-chapter
+    try/except that already handles any other step failure, so the
+    chapter gets logged as failed and the batch moves on to the next one
+    instead of blocking indefinitely.
+    """
+
+    def __enter__(self):
+        if STEP_TIMEOUT_SECONDS:
+            signal.signal(signal.SIGALRM, self._handler)
+            signal.alarm(STEP_TIMEOUT_SECONDS)
+        return self
+
+    def _handler(self, signum, frame):
+        raise StepTimeout(f"exceeded {STEP_TIMEOUT_SECONDS}s wall-clock limit")
+
+    def __exit__(self, *exc_info):
+        if STEP_TIMEOUT_SECONDS:
+            signal.alarm(0)
+
 
 # ─── Logging ─────────────────────────────────────────────────────────────
 
@@ -967,7 +1007,7 @@ Examples:
                     else:
                         log(f"{label} Whisper: transcribing...")
                         t0 = time.time()
-                        with Heartbeat(f"{label} Whisper"):
+                        with Heartbeat(f"{label} Whisper"), TimeLimit():
                             stats = run_whisper_chapter(chapter, args.model, whisper_lang,
                                                         whisper_model=whisper_model_instance)
                         elapsed = time.time() - t0
@@ -998,7 +1038,7 @@ Examples:
                     else:
                         log(f"{label} MMS: aligning...")
                         bundle, model, tokenizer, aligner, uroman = mms_loaded
-                        with Heartbeat(f"{label} MMS"):
+                        with Heartbeat(f"{label} MMS"), TimeLimit():
                             stats = run_mms_chapter(
                                 mms_item, bundle, model, tokenizer, aligner, uroman, config,
                                 header_skip_time=header_skip_time,
@@ -1044,7 +1084,7 @@ Examples:
                                 fusion_mms = mms_loaded
                             # Add audio path for segment re-alignment
                             fusion_item["audio_path"] = chapter.get("audio_path")
-                            with Heartbeat(f"{label} Fusion"):
+                            with Heartbeat(f"{label} Fusion"), TimeLimit():
                                 stats = run_fusion_chapter(fusion_item, config, mms_components=fusion_mms)
                             if "error" in stats:
                                 log(f"{label} Fusion: {stats['error']}", "ERROR")
