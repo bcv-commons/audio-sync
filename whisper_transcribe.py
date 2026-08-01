@@ -148,15 +148,17 @@ def _enough_vram_for_whisper(model_name: str) -> bool:
 
 # Default models per backend
 #
-# faster-whisper defaults to 'small' (not large-v3): in this pipeline
-# Whisper is only a validation/fallback layer for MMS-FA's forced
-# alignment (see align_words.py's docstring — "MMS-FA is used as primary
-# ... Whisper is used for validation/adjustment"), not the primary
-# transcription source, so large-v3's extra accuracy on noisy/multilingual
-# audio buys little here while costing ~40x the compute. 'small' keeps
-# meaningfully better rare-word/proper-noun accuracy than 'tiny'/'base'
-# (relevant for genealogies/place names) at a fraction of large-v3's cost.
-DEFAULT_MODEL_MLX = "mlx-community/whisper-large-v3-mlx"
+# Both backends default to 'small' (not large-v3): in this pipeline Whisper
+# is only a validation/fallback layer for MMS-FA's forced alignment (see
+# align_words.py's docstring — "MMS-FA is used as primary ... Whisper is
+# used for validation/adjustment"), not the primary transcription source,
+# so large-v3's extra accuracy on noisy/multilingual audio buys little here
+# while costing ~40x the compute — and, on Apple Silicon, holding a large
+# model in unified memory alongside MMS is a real OOM risk on long runs.
+# 'small' keeps meaningfully better rare-word/proper-noun accuracy than
+# 'tiny'/'base' (relevant for genealogies/place names) at a fraction of
+# large-v3's cost.
+DEFAULT_MODEL_MLX = "mlx-community/whisper-small-mlx"
 DEFAULT_MODEL_FASTER = "small"
 DEFAULT_MODEL = DEFAULT_MODEL_MLX if _USE_MLX else DEFAULT_MODEL_FASTER
 DEFAULT_MATCH_THRESHOLD = 0.5
@@ -817,7 +819,18 @@ def transcribe_audio(
         }
         if language:
             kwargs["language"] = language
-        return mlx_whisper.transcribe(str(audio_path), **kwargs)
+        result = mlx_whisper.transcribe(str(audio_path), **kwargs)
+        # MLX caches Metal buffers across calls and never releases them on
+        # its own; on a long multi-chapter run (unified memory, shared with
+        # everything else the process holds — MMS's model included) that
+        # cache grows unbounded and is a real OOM cause. Mirrors the
+        # torch.cuda.empty_cache() call below for the CUDA path.
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:
+            pass
+        return result
 
     # ── faster-whisper path (CUDA or CPU) ──────────────────────────────────
     model = _model if _model is not None else load_whisper_model(model_name)

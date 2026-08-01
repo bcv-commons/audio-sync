@@ -727,6 +727,18 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
     if restarted:
         result["restarted"] = True
         result["restart_verse"] = verse_idx
+
+    # Release cached-but-unused MPS memory after each chapter — same
+    # rationale as torch.cuda.empty_cache() elsewhere: on Apple Silicon this
+    # is unified memory shared with everything else the process holds
+    # (including Whisper's model), so an unbounded cache here is a real OOM
+    # contributor on a long multi-chapter run.
+    if next(model.parameters()).device.type == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
     return result
 
 
