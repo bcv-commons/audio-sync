@@ -6,6 +6,7 @@ Usage:
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import torch
 import torchaudio
 from uroman import Uroman
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline"))
 from text_processing import load_language_config, strip_markers, clean_for_alignment
 
 # ─── Config ──────────────────────────────────────────────────────────────

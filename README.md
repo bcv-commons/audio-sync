@@ -162,15 +162,24 @@ ever looks at what's on disk.
 make install
 ```
 
-This runs `pip install -r requirements-whisper.txt`, then installs the ~1.5GB
-`requirements-cuda.txt` (CUDA 12 runtime libs for `faster-whisper`) only if
-`nvidia-smi` is found on the machine — so a CPU-only box like this one
-doesn't waste bandwidth/disk on CUDA libraries it can never use. If you're
-setting up manually instead of via `make install`, mirror the same logic:
-`pip install -r requirements-whisper.txt`, and only add
-`pip install -r requirements-cuda.txt` if you know the box has an NVIDIA
-GPU. Alignment dependencies (torch/torchaudio/uroman) still need to be
-installed separately — see the module docstring in `align_pipeline.py`.
+This runs `pip install -r conf/requirements-whisper.txt`, then installs the
+~1.5GB `conf/requirements-cuda.txt` (CUDA 12 runtime libs for
+`faster-whisper`) only if `nvidia-smi` is found on the machine — so a
+CPU-only box like this one doesn't waste bandwidth/disk on CUDA libraries
+it can never use. If you're setting up manually instead of via
+`make install`, mirror the same logic: `pip install -r
+conf/requirements-whisper.txt`, and only add `pip install -r
+conf/requirements-cuda.txt` if you know the box has an NVIDIA GPU.
+Alignment dependencies (torch/torchaudio/uroman) still need to be
+installed separately — see the module docstring in `pipeline/align_pipeline.py`.
+
+Every machine tends to need different GPU/CPU tuning (Whisper model size,
+MMS chunk size, forcing CPU when VRAM is tight, ...). Rather than passing
+those as flags on every invocation, copy `conf/hw.local.json.example` to
+`conf/hw.local.json` (gitignored, machine-specific) and set them there —
+`make align`/`align-whisper`/`align-mms` all pick it up automatically, and
+any CLI flag you do pass still overrides it for that one run. See the
+`_notes` block in the example file for what each setting does.
 
 Create a `.env` file with:
 
@@ -194,6 +203,17 @@ make check      # confirms python/torch/torchaudio are importable,
 
 ## Where things live
 
+- `pipeline/` — all pipeline code (`align_pipeline.py`, `whisper_transcribe.py`,
+  `mms_align_words.py`, `batch_manifest.py`, etc.). Invoked via `make`, not
+  directly — see `make help`.
+- `conf/` — dependency + machine tuning files: `requirements-whisper.txt`,
+  `requirements-cuda.txt`, `hw.local.json.example` (and your own gitignored
+  `hw.local.json`, see Setup above)
+- `tests/` — standalone diagnostic scripts (`python tests/test_mms_fa.py`,
+  not a pytest suite)
+- `scripts/` — shell scripts (`publish-align.sh`, `fetch-remote-run.sh`)
+- `scripts-bak/` — older/specialized one-off scripts kept locally for
+  reference, gitignored, not part of the maintained pipeline
 - `export/timing-data/` — final output, mirrors the CDN layout
   (`<canon>/<iso>/<version>/<BOOK>/`)
 - `_runs/<batch_id>.json` — one run manifest per batch (status + scores)

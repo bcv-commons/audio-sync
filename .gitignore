@@ -18,6 +18,14 @@ env/
 .env
 .env.*
 
+# Per-machine hardware tuning (Whisper/MMS device, chunk size, etc.) —
+# see conf/hw.local.json.example for the documented template.
+conf/hw.local.json
+
+# Legacy/specialized scripts kept locally for reference, not maintained
+# as part of the current pipeline.
+scripts-bak/
+
 # Batch manifests (fetched/hand-crafted locally)
 _batches/
 _obs_batches/

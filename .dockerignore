@@ -2,6 +2,14 @@
 .env
 .env.*
 
+# Per-machine hardware tuning — the build host's GPU/VRAM tuning has no
+# bearing on whatever box the resulting image actually runs on.
+conf/hw.local.json
+
+# Legacy/specialized scripts kept locally for reference, not part of the
+# deployable pipeline.
+scripts-bak/
+
 # This session's throwaway BSB-text-integrity work — not part of the
 # deployable pipeline.
 spotcheck/

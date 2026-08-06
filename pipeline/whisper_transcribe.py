@@ -60,6 +60,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from batch_manifest import load_batch, get_book_chapters
 from download_language_content import download_job
 from text_processing import LanguageConfig, load_language_config, normalize_text
+from hw_config import load_hw_config
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -1388,6 +1389,8 @@ def format_duration(seconds: float) -> str:
 
 
 def main():
+    hw = load_hw_config()
+
     parser = argparse.ArgumentParser(
         description="Generate verse timing from Bible audio using Whisper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1434,14 +1437,16 @@ Examples:
     # Whisper options
     whisper_group = parser.add_argument_group("Whisper options")
     whisper_group.add_argument(
-        "--model", type=str, default=DEFAULT_MODEL,
-        help=f"Whisper model (default: {DEFAULT_MODEL})",
+        "--model", type=str, default=hw["whisper_model"] or DEFAULT_MODEL,
+        help=f"Whisper model (default: {DEFAULT_MODEL}, or conf/hw.local.json's whisper_model)",
     )
     whisper_group.add_argument(
-        "--whisper-cpu", action="store_true",
+        "--whisper-cpu", action=argparse.BooleanOptionalAction, default=hw["whisper_cpu"],
         help="Force faster-whisper to run on CPU even when a CUDA GPU is available "
              "(useful when GPU RAM is needed by another model). "
-             "No effect on Apple Silicon (mlx-whisper always uses Metal).",
+             "No effect on Apple Silicon (mlx-whisper always uses Metal). "
+             "Default comes from conf/hw.local.json's whisper_cpu; use --no-whisper-cpu to "
+             "override a config that sets it true.",
     )
 
     # Processing options

@@ -58,6 +58,7 @@ from uroman import Uroman
 from text_processing import load_language_config, strip_markers, clean_for_alignment
 from align_words import detect_audio_header
 from batch_manifest import load_batch, get_template_chapters_from_batch
+from hw_config import load_hw_config
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -757,6 +758,8 @@ def _load_whisper_words(whisper_path: Path) -> Optional[list]:
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 def main():
+    hw = load_hw_config()
+
     parser = argparse.ArgumentParser(
         description="MMS forced alignment for Bible audio",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -772,20 +775,24 @@ def main():
                         help="Re-align only chapters whose existing output has collapsed null regions")
     parser.add_argument("--template", type=str, nargs="+", default=None,
                         help="Only process chapters used by these templates (e.g. John OBS)")
-    parser.add_argument("--device", type=str, default=None,
+    parser.add_argument("--device", type=str, default=hw["mms_device"],
                         choices=["cpu", "mps", "cuda"],
-                        help="Device for MMS model forward pass (default: auto — mps on Apple Silicon, cuda if available, else cpu)")
+                        help="Device for MMS model forward pass (default: auto — mps on Apple Silicon, "
+                             "cuda if available, else cpu; or conf/hw.local.json's mms_device)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     parser.add_argument(
-        "--mms-cpu", action="store_true",
+        "--mms-cpu", action=argparse.BooleanOptionalAction, default=hw["mms_cpu"],
         help="Force MMS to run on CPU even when a CUDA GPU is available. "
-             "Useful on GPUs with limited VRAM shared with a desktop environment.",
+             "Useful on GPUs with limited VRAM shared with a desktop environment. "
+             "Default comes from conf/hw.local.json's mms_cpu; use --no-mms-cpu to override "
+             "a config that sets it true.",
     )
     parser.add_argument(
-        "--mms-chunk-minutes", type=float, default=None,
+        "--mms-chunk-minutes", type=float, default=hw["mms_chunk_minutes"],
         help="Maximum audio chunk size (in minutes) for MMS inference. "
              "Smaller values use less VRAM but may reduce alignment accuracy at chunk boundaries. "
-             "Default: per-device (CPU=5 min, CUDA=2 min, MPS=1 min). Try 2 on a 6 GB GPU.",
+             "Default: per-device (CPU=5 min, CUDA=2 min, MPS=1 min), or conf/hw.local.json's "
+             "mms_chunk_minutes.",
     )
 
     args = parser.parse_args()

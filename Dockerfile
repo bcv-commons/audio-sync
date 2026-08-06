@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # torchaudio isn't bundled in the pytorch/pytorch base image (only torch
 # is) and needs a CUDA-matched wheel — installed with --no-deps so pip
 # doesn't try to re-resolve/reinstall the base image's pinned torch build.
-COPY requirements-whisper.txt requirements-cuda.txt ./
+COPY conf/requirements-whisper.txt conf/requirements-cuda.txt ./
 RUN pip install --no-cache-dir \
         requests python-dotenv faster-whisper torchcodec uroman \
     && pip install --no-cache-dir --no-deps torchaudio \
@@ -70,5 +70,5 @@ ENV HF_TOKEN=""
 # just means download_language_content.py logs an error until it's
 # provided at `docker run`/pod-launch time.)
 
-ENTRYPOINT ["python", "align_pipeline.py"]
+ENTRYPOINT ["python", "pipeline/align_pipeline.py"]
 CMD ["--help"]

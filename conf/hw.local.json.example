@@ -1,0 +1,16 @@
+{
+  "_notes": {
+    "_general": "Copy this file to conf/hw.local.json (gitignored, machine-specific — never committed). Every field is optional; omit or set to null to keep the script's built-in default. CLI flags (--model, --whisper-cpu, --mms-cpu, --mms-chunk-minutes, --device) always override whatever's set here for that one run.",
+    "whisper_model": "faster-whisper/mlx-whisper model size. Built-in default: 'small' (deliberate — Whisper is only a validation layer for MMS-FA's forced alignment here, not the primary transcriber, see whisper_transcribe.py). Bump to 'medium' or 'large-v3' only if you specifically want more transcription accuracy and have GPU time to spare — it will NOT make alignment run faster.",
+    "whisper_cpu": "true forces faster-whisper to run on CPU even when CUDA is available. Useful if VRAM is tight and shared with MMS. No effect on Apple Silicon (mlx-whisper always uses Metal).",
+    "mms_cpu": "true forces MMS forced-alignment to run on CPU even when CUDA is available.",
+    "mms_chunk_minutes": "Max audio chunk size (minutes) MMS processes per forward pass. Built-in default is conservative (CPU=5, CUDA=2, MPS=1 — the CUDA default assumes a ~6GB desktop GPU also driving a display). On a dedicated/higher-VRAM GPU, raise this so most chapters run as a single forward pass instead of being split — e.g. 10 on an 8GB card with nothing else using VRAM, more on 16GB+.",
+    "mms_device": "Explicit device override for MMS ('cuda', 'mps', or 'cpu'). Leave null for auto-detect (cuda > mps > cpu)."
+  },
+
+  "whisper_model": null,
+  "whisper_cpu": false,
+  "mms_cpu": false,
+  "mms_chunk_minutes": null,
+  "mms_device": null
+}

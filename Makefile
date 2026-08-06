@@ -1,4 +1,6 @@
 PYTHON := .venv/bin/python
+PIPELINE := pipeline
+CONF := conf
 
 .PHONY: all align align-whisper align-mms align-fuse \
         import-contrib prepare-cross-source \
@@ -52,26 +54,26 @@ help: ## Show available targets
 # ---------------------------------------------------------------------------
 
 align: ## Full alignment pipeline (whisper → mms → fuse)
-	$(PYTHON) align_pipeline.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/align_pipeline.py $(ARGS)
 
 align-whisper: ## Step 1a: Whisper transcription
-	$(PYTHON) whisper_transcribe.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/whisper_transcribe.py $(ARGS)
 
 align-mms: ## Step 1b: MMS forced alignment
-	$(PYTHON) mms_align_words.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/mms_align_words.py $(ARGS)
 
 align-fuse: ## Step 2: Fuse Whisper + MMS into final timing
-	$(PYTHON) align_words.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/align_words.py $(ARGS)
 
 # ---------------------------------------------------------------------------
 # Content preparation
 # ---------------------------------------------------------------------------
 
 import-contrib: ## Import contrib/ into downloads/contrib/
-	$(PYTHON) import_contrib.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/import_contrib.py $(ARGS)
 
 prepare-cross-source: ## Fetch helloAO text for DBT audio-only filesets
-	$(PYTHON) prepare_cross_source.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/prepare_cross_source.py $(ARGS)
 
 # ---------------------------------------------------------------------------
 # Publishing
@@ -92,25 +94,25 @@ fetch-remote-run: ## Pull export/timing-data + _runs back from a rented GPU box 
 # ---------------------------------------------------------------------------
 
 quality-check: ## Check timing for structural issues
-	$(PYTHON) check_timing_quality.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/check_timing_quality.py $(ARGS)
 
 quality-compare: ## Compare pipeline vs downloaded timecode
-	$(PYTHON) compare_timing.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/compare_timing.py $(ARGS)
 
 quality-report: ## Generate detailed quality report
-	$(PYTHON) quality_report.py $(ARGS)
+	$(PYTHON) $(PIPELINE)/quality_report.py $(ARGS)
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
 install: ## Install Python dependencies
-	pip install -r requirements-whisper.txt
+	$(PYTHON) -m pip install -r $(CONF)/requirements-whisper.txt
 	@if command -v nvidia-smi >/dev/null 2>&1; then \
-		echo "NVIDIA GPU detected — installing requirements-cuda.txt"; \
-		pip install -r requirements-cuda.txt; \
+		echo "NVIDIA GPU detected — installing $(CONF)/requirements-cuda.txt"; \
+		$(PYTHON) -m pip install -r $(CONF)/requirements-cuda.txt; \
 	else \
-		echo "No NVIDIA GPU detected (nvidia-smi not found) — skipping requirements-cuda.txt"; \
+		echo "No NVIDIA GPU detected (nvidia-smi not found) — skipping $(CONF)/requirements-cuda.txt"; \
 	fi
 
 check: ## Verify installation

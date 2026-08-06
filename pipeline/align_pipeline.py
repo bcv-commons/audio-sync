@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
 from text_processing import load_language_config
+from hw_config import load_hw_config
 
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
 
@@ -462,6 +463,8 @@ def build_fusion_item(
 # ─── Main Pipeline ───────────────────────────────────────────────────────
 
 def main():
+    hw = load_hw_config()
+
     parser = argparse.ArgumentParser(
         description="Unified Bible audio alignment pipeline (Whisper + MMS + Fusion)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -505,28 +508,33 @@ Examples:
     # Whisper options
     whisper_group = parser.add_argument_group("Whisper options")
     whisper_group.add_argument(
-        "--model", type=str, default=DEFAULT_MODEL,
-        help=f"Whisper model (default: {DEFAULT_MODEL})",
+        "--model", type=str, default=hw["whisper_model"] or DEFAULT_MODEL,
+        help=f"Whisper model (default: {DEFAULT_MODEL}, or conf/hw.local.json's whisper_model)",
     )
     whisper_group.add_argument(
-        "--whisper-cpu", action="store_true",
+        "--whisper-cpu", action=argparse.BooleanOptionalAction, default=hw["whisper_cpu"],
         help="Force faster-whisper to run on CPU even when a CUDA GPU is available "
              "(useful when GPU RAM is needed by the MMS model). "
-             "No effect on Apple Silicon (mlx-whisper always uses Metal).",
+             "No effect on Apple Silicon (mlx-whisper always uses Metal). "
+             "Default comes from conf/hw.local.json's whisper_cpu; use --no-whisper-cpu to "
+             "override a config that sets it true.",
     )
 
     # MMS options
     mms_group = parser.add_argument_group("MMS options")
     mms_group.add_argument(
-        "--mms-cpu", action="store_true",
+        "--mms-cpu", action=argparse.BooleanOptionalAction, default=hw["mms_cpu"],
         help="Force MMS to run on CPU even when a CUDA GPU is available. "
-             "Useful on GPUs with limited VRAM shared with a desktop environment.",
+             "Useful on GPUs with limited VRAM shared with a desktop environment. "
+             "Default comes from conf/hw.local.json's mms_cpu; use --no-mms-cpu to override "
+             "a config that sets it true.",
     )
     mms_group.add_argument(
-        "--mms-chunk-minutes", type=float, default=None,
+        "--mms-chunk-minutes", type=float, default=hw["mms_chunk_minutes"],
         help="Maximum audio chunk size (in minutes) for MMS inference. "
              "Smaller values use less VRAM but may reduce alignment accuracy at chunk boundaries. "
-             "Default: per-device (CPU=5 min, CUDA=2 min, MPS=1 min). Try 2 on a 6 GB GPU.",
+             "Default: per-device (CPU=5 min, CUDA=2 min, MPS=1 min), or conf/hw.local.json's "
+             "mms_chunk_minutes.",
     )
 
     # Processing options
@@ -548,9 +556,10 @@ Examples:
     skip_group.add_argument("--skip-mms", action="store_true", help="Skip MMS forced alignment (Step 1b)")
     skip_group.add_argument("--skip-fusion", action="store_true", help="Skip fusion alignment (Step 2)")
 
-    proc_group.add_argument("--device", type=str, default=None,
+    proc_group.add_argument("--device", type=str, default=hw["mms_device"],
                             choices=["cpu", "mps", "cuda"],
-                            help="Device for MMS model (default: auto — mps on Apple Silicon, cuda if available, else cpu)")
+                            help="Device for MMS model (default: auto — mps on Apple Silicon, cuda if "
+                                 "available, else cpu; or conf/hw.local.json's mms_device)")
 
     # Output
     parser.add_argument(
