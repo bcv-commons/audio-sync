@@ -288,6 +288,54 @@ def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Opt
     return result
 
 
+_book_coverage_cache: Dict[str, Optional[Dict[str, list]]] = {}
+DBT_BOOK_COVERAGE_CACHE_DIR = Path("api-cache/dbt-book-coverage")
+
+
+def get_dbt_book_coverage(distinct_id: str) -> Optional[Dict[str, list]]:
+    """Fetch (and cache) one DBT distinct_id's real per-book/chapter
+    coverage, straight from DBT's own bibles/{id} endpoint.
+
+    Fills the gap get_best_fileset_from_catalog() documents: the CDN
+    catalogs are canon-level only, so a fileset is assumed to cover every
+    book in its canon. For a partial-coverage translation (e.g. PORALM —
+    11 books total, missing most of the NT) that assumption means every
+    chapter of every book it doesn't have gets tried and 404s. One cheap,
+    cached API call per distinct_id fixes that.
+
+    Returns {book_id: [chapter_numbers]}, or None if the fetch failed —
+    callers should fail open (treat as "coverage unknown, don't filter")
+    rather than silently dropping every book over a network blip.
+    """
+    if distinct_id in _book_coverage_cache:
+        return _book_coverage_cache[distinct_id]
+
+    cache_path = DBT_BOOK_COVERAGE_CACHE_DIR / f"{distinct_id}.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                coverage = json.load(f)
+            _book_coverage_cache[distinct_id] = coverage
+            return coverage
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    data = make_api_request(f"bibles/{distinct_id}", use_key_param=True)
+    if not data:
+        _book_coverage_cache[distinct_id] = None
+        return None
+
+    books = data.get("data", {}).get("books", [])
+    coverage = {b["book_id"]: b.get("chapters", []) for b in books if b.get("book_id")}
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(coverage, f)
+
+    _book_coverage_cache[distinct_id] = coverage
+    return coverage
+
+
 def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> Optional[str]:
     """Find a *verified* helloAO translation match via catalog-overlap.json.
 

@@ -76,7 +76,7 @@ from text_processing import load_language_config
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
 
 from batch_manifest import load_batch, get_jobs
-from download_language_content import ensure_chapter_ready
+from download_language_content import ensure_chapter_ready, get_dbt_book_coverage
 from whisper_transcribe import (
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
@@ -870,6 +870,21 @@ Examples:
             wanted = sorted(
                 (book, ch) for book, chs in filtered_refs.items() for ch in sorted(chs)
             )
+
+            # DBT catalog resolution is canon-level only (assumes a fileset
+            # covers every book in canon) — a partial-coverage translation
+            # would otherwise get every book/chapter it doesn't have tried
+            # and 404 individually. Filter against DBT's own real per-book
+            # listing (cheap, cached) before fetching anything.
+            if source_type == "dbt":
+                coverage = get_dbt_book_coverage(distinct_id)
+                if coverage is not None:
+                    before = len(wanted)
+                    wanted = [(b, c) for b, c in wanted if c in coverage.get(b, [])]
+                    if before - len(wanted) > 0:
+                        log(f"  {before - len(wanted)} chapter(s) not covered by "
+                            f"{distinct_id} (per DBT's book listing), skipping", "INFO")
+
             if not wanted:
                 log("No audio+text pairs found", "WARN")
                 continue

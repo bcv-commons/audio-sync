@@ -20,7 +20,9 @@ env/
 
 # Batch manifests (fetched/hand-crafted locally)
 _batches/
+_obs_batches/
 _runs/
+_obs_runs/
 
 # Downloaded/generated audio, text, and alignment output (runtime data)
 downloads/
