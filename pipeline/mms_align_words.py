@@ -729,12 +729,24 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
         result["restarted"] = True
         result["restart_verse"] = verse_idx
 
-    # Release cached-but-unused MPS memory after each chapter — same
-    # rationale as torch.cuda.empty_cache() elsewhere: on Apple Silicon this
-    # is unified memory shared with everything else the process holds
-    # (including Whisper's model), so an unbounded cache here is a real OOM
-    # contributor on a long multi-chapter run.
-    if next(model.parameters()).device.type == "mps":
+    # Release cached-but-unused device memory after each chapter. Chapters
+    # vary widely in length, so each one's chunked forward pass allocates
+    # differently-sized tensors — without freeing back to the allocator
+    # between chapters, PyTorch's CUDA caching allocator accumulates
+    # fragmented free blocks that don't coalesce for a later chapter's
+    # larger allocation, even when nvidia-smi shows free VRAM (this is
+    # exactly what PyTorch's own "reserved but unallocated" OOM hint
+    # points at). Same rationale on MPS: unified memory shared with
+    # everything else the process holds (including Whisper's model), so
+    # an unbounded cache here is a real OOM contributor on a long
+    # multi-chapter run either way.
+    device_type = next(model.parameters()).device.type
+    if device_type == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    elif device_type == "mps":
         try:
             torch.mps.empty_cache()
         except Exception:

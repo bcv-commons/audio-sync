@@ -204,6 +204,9 @@ ISO639_3_TO_WHISPER = {
     "npi": "ne",
     "tat": "tt",
     "yue": "yue",
+    "hin": "hi",
+    "ben": "bn",
+    "uzn": "uz",
 }
 
 # Book definitions (from download_language_content.py)

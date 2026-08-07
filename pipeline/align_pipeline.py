@@ -77,7 +77,7 @@ from hw_config import load_hw_config
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
 
 from batch_manifest import load_batch, get_jobs
-from download_language_content import ensure_chapter_ready, get_dbt_book_coverage
+from download_language_content import ensure_chapter_ready, get_dbt_book_coverage, has_usable_text_source
 from whisper_transcribe import (
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
@@ -310,6 +310,17 @@ def run_fusion_chapter(item: dict, config, mms_components=None) -> dict:
     return fusion_process(item, config, mms_components=mms_components)
 
 
+def run_verse_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, config) -> dict:
+    """Run verse-anchored MMS-only alignment for a single chapter
+    (config.verse_only_mode languages — Whisper skipped entirely).
+
+    Returns stats dict: {"verses": N, "avg_score": F, "fallbacks": N,
+    "elapsed": F} or {"error": msg}.
+    """
+    from align_verse_words import process_chapter_verse_only
+    return process_chapter_verse_only(item, bundle, model, tokenizer, aligner, uroman, config)
+
+
 # ─── Contract B — run manifest + publish ────────────────────────────────
 
 def write_run_manifest(batch_id: str, results: list) -> Path:
@@ -450,6 +461,40 @@ def build_fusion_item(
         "timing_path": timing_path,
         "words_path": words_path,
         "preserve_existing_timing": preserve_existing_timing,
+        "book": book,
+        "chapter": chapter["chapter"],
+        "chapter_str": chapter_str,
+        "canon": canon,
+        "iso": iso,
+        "distinct_id": distinct_id,
+        "audio_fileset": audio_fileset,
+    }
+
+
+# ─── Verse-only work item builder ───────────────────────────────────────
+
+def build_verse_item(chapter: dict, canon: str, iso: str, distinct_id: str, output_dir: Path) -> dict:
+    """Build an align_verse_words.py-compatible work item.
+
+    Simpler than build_fusion_item — no mms_path/whisper_path, since
+    verse-only mode is the whole pipeline for this chapter, not a step
+    that consumes another step's cached output.
+    """
+    book = chapter["book"]
+    chapter_str = chapter["chapter_str"]
+    audio_fileset = chapter["audio_fileset"]
+
+    out_book_dir = output_dir / canon / iso / distinct_id / book
+    timing_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_timing.json"
+    words_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_words.json"
+    quality_path = Path(str(words_path).replace("_words.json", "_words_quality.json"))
+
+    return {
+        "audio_path": chapter["audio_path"],
+        "text_path": chapter["text_path"],
+        "timing_path": timing_path,
+        "words_path": words_path,
+        "quality_path": quality_path,
         "book": book,
         "chapter": chapter["chapter"],
         "chapter_str": chapter_str,
@@ -830,6 +875,18 @@ Examples:
             log("No audio downloaded", "WARN")
             continue
 
+        # Cheap upfront check: does this edition have ANY usable text
+        # source at all (DBT catalog fileset or a verified helloAO
+        # match)? If not, every chapter would fail identically — skip the
+        # whole edition now instead of grinding through each chapter's
+        # download+reject cycle one at a time (real example: fra's
+        # FRALSN/FRAPDV have full audio but no usable text anywhere).
+        if not has_usable_text_source(iso, canon, distinct_id):
+            log(f"No usable text source for {iso}/{canon}/{distinct_id} "
+                f"(no DBT fileset, no verified helloAO match) — skipping "
+                f"entire edition", "WARN")
+            continue
+
         # Discover chapters (filtered to template refs and optional book/chapter)
         # For the discovery, we build chapter refs incorporating --book/--chapter filters
         filtered_refs = canon_refs if canon_refs else None
@@ -850,6 +907,10 @@ Examples:
             else:
                 # No template refs but book/chapter filter — let discover_chapter_files handle it
                 pass
+
+        # Load language config early — needed by the dry-run reporting
+        # block below (verse_only_mode arm), not just the real compute loop.
+        config = load_language_config(iso)
 
         total_expected = None  # best-effort count for the progress label
 
@@ -916,19 +977,23 @@ Examples:
                     continue
                 log(f"Chapters found: {len(chapters)}")
                 for ch in chapters:
-                    whisper_path = ch["whisper_words_path"]
-                    mms_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / ch["book"]
-                    mms_path = mms_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_mms_words.json"
                     out_book_dir = args.output_dir / canon / iso / distinct_id / ch["book"]
                     timing_path = out_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_timing.json"
 
-                    status_parts = []
-                    if not args.skip_whisper:
-                        status_parts.append(f"whisper={'exists' if whisper_path.exists() else 'TODO'}")
-                    if not args.skip_mms:
-                        status_parts.append(f"mms={'exists' if mms_path.exists() else 'TODO'}")
-                    if not args.skip_fusion:
-                        status_parts.append(f"fusion={'exists' if timing_path.exists() else 'TODO'}")
+                    if config.verse_only_mode:
+                        status_parts = [f"verse-mms={'exists' if timing_path.exists() else 'TODO'}"]
+                    else:
+                        whisper_path = ch["whisper_words_path"]
+                        mms_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / ch["book"]
+                        mms_path = mms_book_dir / f"{ch['book']}_{ch['chapter_str']}_{ch['audio_fileset']}_mms_words.json"
+
+                        status_parts = []
+                        if not args.skip_whisper:
+                            status_parts.append(f"whisper={'exists' if whisper_path.exists() else 'TODO'}")
+                        if not args.skip_mms:
+                            status_parts.append(f"mms={'exists' if mms_path.exists() else 'TODO'}")
+                        if not args.skip_fusion:
+                            status_parts.append(f"fusion={'exists' if timing_path.exists() else 'TODO'}")
                     log(f"  {ch['book']} {ch['chapter']} — {', '.join(status_parts)}")
                 continue
 
@@ -987,12 +1052,18 @@ Examples:
             # to be precise.
             total_is_exact = False
 
-        # Load language config
-        config = load_language_config(iso)
-
         # Get Whisper language hint
         whisper_lang = get_whisper_language(iso)
-        if not args.skip_whisper:
+        if config.verse_only_mode:
+            log(f"  {iso}: verse_only_mode — Whisper skipped, verse-windowed MMS-only alignment")
+            if not args.skip_whisper:
+                log("  --skip-whisper is a no-op here (Whisper never runs in verse_only_mode)")
+            if not args.skip_fusion:
+                log("  --skip-fusion is a no-op here (no separate fusion step in verse_only_mode)")
+            if args.skip_mms:
+                log("  --skip-mms set — MMS is the entire pipeline in verse_only_mode, "
+                    "nothing will be produced for this item", "WARN")
+        elif not args.skip_whisper:
             if whisper_lang:
                 log(f"Whisper language: {whisper_lang}")
             else:
@@ -1026,6 +1097,41 @@ Examples:
                         continue
                     else:
                         log(f"{label} Audio fetched on demand")
+
+                # ── verse_only_mode: single MMS-only step, no Whisper/Fusion ──
+                if config.verse_only_mode:
+                    if args.skip_mms:
+                        continue
+                    verse_item = build_verse_item(chapter, canon, iso, distinct_id, args.output_dir)
+                    if not needs_run(verse_item["timing_path"], force=args.force):
+                        log(f"{label} verse-mms: skipped (exists)")
+                        continue
+                    log(f"{label} verse-mms: aligning...")
+                    bundle, model, tokenizer, aligner, uroman = mms_loaded
+                    with Heartbeat(f"{label} verse-mms"), TimeLimit():
+                        stats = run_verse_chapter(
+                            verse_item, bundle, model, tokenizer, aligner, uroman, config,
+                        )
+                    if "error" in stats:
+                        log(f"{label} verse-mms: {stats['error']}", "ERROR")
+                        total_stats["chapters_failed"] += 1
+                        run_results.append({
+                            "iso": iso, "canon": canon, "distinct_id": distinct_id,
+                            "book": book, "chapter": ch_num,
+                            "status": "error", "error": stats["error"],
+                        })
+                    else:
+                        log(f"{label} verse-mms: {stats['verses']} verses, "
+                            f"avg_score={stats['avg_score']}, fallbacks={stats['fallbacks']}, "
+                            f"{stats['elapsed']}s")
+                        total_stats["mms_done"] += 1
+                        total_stats["fusion_done"] += 1
+                        run_results.append({
+                            "iso": iso, "canon": canon, "distinct_id": distinct_id,
+                            "book": book, "chapter": ch_num,
+                            "status": "ok", "verses": stats.get("verses"),
+                        })
+                    continue
 
                 # ── Step 1a: Whisper ──
                 # Prefer standard (non-drama) audio for Whisper transcription

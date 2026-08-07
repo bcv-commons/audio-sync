@@ -1,0 +1,14 @@
+# Hindi's Whisper support is a documented model-capability gap, not
+# something fixable in our code: real (if imperfect) Hindi transcription,
+# but low per-word confidence, 3-9x realtime instead of French/Arabic's
+# 20-50x, and average alignment quality 0.68 vs 0.93-0.94 elsewhere
+# (measured 2026-08-07 against HINBIB). That degrades two mechanisms that
+# lean on Whisper as a cross-check for MMS (align_words.py's
+# detect_audio_header() text-matching signal, and the gap-fill fallback
+# that can pull word timestamps directly from Whisper) — an unreliable
+# guide there does more harm than no guide at all.
+#
+# verse_only_mode skips Whisper entirely for this language and uses
+# align_verse_words.py's windowed, verse-anchored MMS-only alignment
+# instead (see pipeline/align_verse_words.py's module docstring).
+verse_only_mode = true

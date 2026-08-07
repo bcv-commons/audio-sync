@@ -17,6 +17,8 @@ help: ## Show available targets
 	@echo "  Alignment pipeline"
 	@echo "  ──────────────────"
 	@echo "  make align          Full pipeline (whisper → mms → fuse)"
+	@echo "  make align-parallel Full pipeline, sharded across N workers by chapter count"
+	@echo "                      (N = conf/hw.local.json's parallel_workers, default 1)"
 	@echo "  make align-whisper  Step 1a: Whisper transcription"
 	@echo "  make align-mms      Step 1b: MMS forced alignment"
 	@echo "  make align-fuse     Step 2:  Fuse Whisper + MMS into final timing"
@@ -55,6 +57,9 @@ help: ## Show available targets
 
 align: ## Full alignment pipeline (whisper → mms → fuse)
 	$(PYTHON) $(PIPELINE)/align_pipeline.py $(ARGS)
+
+align-parallel: ## Full pipeline, sharded across N workers (see conf/hw.local.json's parallel_workers)
+	$(PYTHON) $(PIPELINE)/shard_align.py $(ARGS)
 
 align-whisper: ## Step 1a: Whisper transcription
 	$(PYTHON) $(PIPELINE)/whisper_transcribe.py $(ARGS)

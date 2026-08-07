@@ -4,13 +4,15 @@
     "whisper_model": "faster-whisper/mlx-whisper model size. Built-in default: 'small' (deliberate — Whisper is only a validation layer for MMS-FA's forced alignment here, not the primary transcriber, see whisper_transcribe.py). Bump to 'medium' or 'large-v3' only if you specifically want more transcription accuracy and have GPU time to spare — it will NOT make alignment run faster.",
     "whisper_cpu": "true forces faster-whisper to run on CPU even when CUDA is available. Useful if VRAM is tight and shared with MMS. No effect on Apple Silicon (mlx-whisper always uses Metal).",
     "mms_cpu": "true forces MMS forced-alignment to run on CPU even when CUDA is available.",
-    "mms_chunk_minutes": "Max audio chunk size (minutes) MMS processes per forward pass. Built-in default is conservative (CPU=5, CUDA=2, MPS=1 — the CUDA default assumes a ~6GB desktop GPU also driving a display). On a dedicated/higher-VRAM GPU, raise this so most chapters run as a single forward pass instead of being split — e.g. 10 on an 8GB card with nothing else using VRAM, more on 16GB+.",
-    "mms_device": "Explicit device override for MMS ('cuda', 'mps', or 'cpu'). Leave null for auto-detect (cuda > mps > cpu)."
+    "mms_chunk_minutes": "Max audio chunk size (minutes) MMS processes per forward pass. Built-in default is conservative (CPU=5, CUDA=2, MPS=1 — the CUDA default assumes a ~6GB desktop GPU also driving a display). Memory use per chunk scales with chunk length, and MMS's forward pass is notably more VRAM-hungry than it looks from Whisper's footprint alone — on a dedicated 8GB card (RTX 3060 Ti, nothing else using VRAM) 8 minutes reliably OOM'd on real ~7-9 minute chapters (JHN 1) with Whisper's model still resident, while 3 minutes ran the same chapters cleanly. Raise gradually and actually test against a long real chapter (not a dry run) before trusting a value — don't extrapolate from VRAM headroom alone. More room on 16GB+ cards, but verify empirically rather than assuming linear scaling.",
+    "mms_device": "Explicit device override for MMS ('cuda', 'mps', or 'cpu'). Leave null for auto-detect (cuda > mps > cpu).",
+    "parallel_workers": "Default worker count for pipeline/shard_align.py (shards one language's book/chapter scope across N concurrent align_pipeline.py processes, balanced by chapter count). Built-in default: 1 (sequential — identical to running align_pipeline.py directly; safe on every machine, including Mac/CPU-only/shared boxes). Each worker loads its own full copy of the Whisper+MMS models, so this is VRAM/CPU-bound, not just core-count-bound — raise gradually and test against a real multi-chapter run before trusting a value, same rule as mms_chunk_minutes above (an 8GB card OOM'd at a 'reasonable-looking' mms_chunk_minutes guess; the same kind of surprise is possible here with too many concurrent workers)."
   },
 
   "whisper_model": null,
   "whisper_cpu": false,
   "mms_cpu": false,
   "mms_chunk_minutes": null,
-  "mms_device": null
+  "mms_device": null,
+  "parallel_workers": 1
 }

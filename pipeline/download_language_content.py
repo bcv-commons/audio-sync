@@ -398,6 +398,41 @@ def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> Tup
     return "dbt", None
 
 
+def has_usable_text_source(iso: str, canon: str, distinct_id: str) -> bool:
+    """
+    Cheap upfront check: does ANY text source (DBT's own catalog fileset,
+    or a verified helloAO overlap match) exist for (iso, canon,
+    distinct_id)? Catalogs are cached after first load, so this is cheap
+    to call once per edition.
+
+    Lets a caller skip an entire edition in one line instead of
+    discovering "no text anywhere" one chapter at a time — every chapter
+    would otherwise repeat the same catalog lookups and log its own "no
+    text file" warning. Real example: fra's FRALSN and FRAPDV have full
+    audio downloaded but no DBT text fileset and no verified helloAO
+    overlap match — every one of their chapters fails identically, so
+    there's no point starting.
+
+    Not a perfect substitute for the per-chapter check (which also trusts
+    catalog-verified text files already on disk), just a fast pre-filter —
+    an edition that fails this check will fail every one of its chapters
+    the same way, so skipping early only saves wasted work, it never
+    causes a false skip of real work — EXCEPT if the catalog itself is
+    unreachable (CDN down), in which case the per-chapter code falls back
+    to trusting whatever text is already on disk (see whisper_transcribe.py
+    _expected_text_tags()'s catalog_available). This mirrors that same
+    escape hatch: if catalog-text.json failed to load at all, assume
+    usable rather than risk a false skip of real, already-downloaded work.
+    """
+    if not _load_dbt_catalog("catalog-text").get("entries"):
+        return True
+    text_source, source_id = resolve_preferred_text_source(iso, canon, distinct_id)
+    if text_source == "helloao" and source_id:
+        return True
+    catalog_fs = get_best_fileset_from_catalog(iso, canon, distinct_id)
+    return bool(catalog_fs and catalog_fs.get("text_fileset"))
+
+
 def _fetch_helloao_chapter(helloao_id, book, chapter_num, dest_path):
     """Fetch a chapter's text from helloAO API and write as ET-format .txt file."""
     import urllib.request

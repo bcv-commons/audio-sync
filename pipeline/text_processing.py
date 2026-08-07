@@ -29,6 +29,7 @@ class LanguageConfig:
     strip_unicode_categories: List[str] = field(default_factory=lambda: ["Mn"])
     mms_fallback_threshold: float = 0.3
     aramaic_passages: List[str] = field(default_factory=list)
+    verse_only_mode: bool = False
 
 
 _config_cache: Dict[str, LanguageConfig] = {}
@@ -58,6 +59,7 @@ def load_language_config(iso: str) -> LanguageConfig:
             strip_unicode_categories=data.get("strip_unicode_categories", ["Mn"]),
             mms_fallback_threshold=data.get("mms_fallback_threshold", 0.3),
             aramaic_passages=data.get("aramaic_passages", []),
+            verse_only_mode=data.get("verse_only_mode", False),
         )
     else:
         config = LanguageConfig(iso=iso)

@@ -37,6 +37,11 @@ _DEFAULTS: Dict[str, Any] = {
     "mms_cpu": False,
     "mms_chunk_minutes": None,    # None -> mms_align_words.py's per-device default
     "mms_device": None,           # None -> auto (cuda > mps > cpu)
+    "parallel_workers": 1,        # shard_align.py's default worker count — 1 = sequential,
+                                   # identical to running align_pipeline.py directly. Only
+                                   # raise this after testing (see mms_chunk_minutes' note
+                                   # in hw.local.json.example for why guessing from VRAM
+                                   # headroom alone isn't reliable).
 }
 
 _cache: Optional[Dict[str, Any]] = None
