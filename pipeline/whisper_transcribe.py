@@ -203,7 +203,10 @@ ISO639_3_TO_WHISPER = {
     "mar": "mr",
     "npi": "ne",
     "tat": "tt",
-    "yue": "yue",
+    "yue": "zh",  # faster-whisper's "yue" language tag produces 0 segments
+                  # (confirmed 2026-08-07 against real Cantonese audio) — "zh"
+                  # decodes fine since Whisper's Chinese output is Han-script
+                  # text regardless of Mandarin/Cantonese pronunciation.
     "hin": "hi",
     "ben": "bn",
     "uzn": "uz",

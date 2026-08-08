@@ -18,13 +18,28 @@ env/
 .env
 .env.*
 
-# Per-machine hardware tuning (Whisper/MMS device, chunk size, etc.) —
-# see conf/hw.local.json.example for the documented template.
-conf/hw.local.json
+# Per-machine config with real local values (hw tuning, device/chunk-size
+# settings, etc.) that's genuinely useful as a documented template for
+# anyone deploying this pipeline elsewhere — see conf/hw.local.json.example.
+# Glob-based so a *new* file following this naming convention is
+# automatically excluded without needing a new .gitignore line each time.
+conf/*.local.*
+
+# Local scratch/investigation notes (crash forensics, capacity planning) —
+# MONO owns the canonical internal-docs/ convention for this project;
+# this repo's copy is working notes for this machine, not for the repo's
+# committed history.
+internal-docs/
 
 # Legacy/specialized scripts kept locally for reference, not maintained
 # as part of the current pipeline.
 scripts-bak/
+
+# Linux/CUDA/systemd-specific operational scripts (nvidia-smi, journalctl,
+# SysRq, sudoers-dependent GPU-wedge recovery) — this box's own tooling,
+# not portable across the macOS/Linux split the rest of the pipeline
+# supports. Keep scripts/ cross-platform (ssh/rsync/rclone only).
+internal-scripts/
 
 # Batch manifests (fetched/hand-crafted locally)
 _batches/

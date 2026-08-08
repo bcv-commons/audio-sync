@@ -858,11 +858,29 @@ def fuse_words_per_word(
                 f"for {len(gap_words)} words around gap")
 
             waveform, sample_rate = load_audio(audio_path, bundle)
-            new_results = realign_from_point(
-                waveform, sample_rate, restart_time, gap_text,
-                bundle, model, tokenizer, aligner_obj, uroman_obj,
-                end_time=segment_end_time,
-            )
+            try:
+                new_results = realign_from_point(
+                    waveform, sample_rate, restart_time, gap_text,
+                    bundle, model, tokenizer, aligner_obj, uroman_obj,
+                    end_time=segment_end_time,
+                )
+            except RuntimeError as e:
+                # CTC forced-align raises (not returns a low score) when this
+                # narrow, timestamp-derived window is too short for
+                # gap_text's token count — the window's duration comes from
+                # OTHER words' (possibly already-drifted) timestamps, which
+                # has no guaranteed relationship to how much audio gap_text
+                # actually needs. align_obs_words.py hit the identical CTC
+                # constraint and solved it with a pre-expanded window; this
+                # call site can't cheaply pre-validate the same way (the
+                # window is anchored to detected timestamps, not a
+                # proportional pace estimate), so instead: catch it and keep
+                # the chapter's existing alignment for these words rather
+                # than losing the ENTIRE chapter's output to one bad
+                # gap-fill attempt (confirmed real: 35+ chapters lost this
+                # way in a single run before this fix, 2026-08-08).
+                log(f"  Gap-fill re-alignment failed (CTC: {e}), keeping existing alignment")
+                new_results = []
 
             if new_results and len(new_results) == len(gap_words):
                 improved = 0
