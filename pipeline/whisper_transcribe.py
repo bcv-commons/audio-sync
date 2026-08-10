@@ -49,23 +49,18 @@ Prerequisites:
 import argparse
 import difflib
 import json
-import re
-import sys
-import time
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-
-from batch_manifest import load_batch, get_book_chapters
-from download_language_content import download_job
-from text_processing import LanguageConfig, load_language_config, normalize_text
-from hw_config import load_hw_config
 
 # ─── Constants ──────────────────────────────────────────────────────────────
-
 import platform
-import sys as _sys
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from batch_manifest import get_book_chapters, load_batch
+from download_language_content import download_job
+from hw_config import load_hw_config
+from text_processing import LanguageConfig, load_language_config, normalize_text
 
 PRIORITY_LANGUAGES_FILE = Path("whisper-priority-languages.json")
 DOWNLOADS_DIR = Path("downloads/BB")
@@ -108,7 +103,7 @@ def set_whisper_cpu(force: bool) -> None:
 # Minimum free VRAM (in bytes) required to load each Whisper model in float16.
 # Used by _enough_vram_for_whisper() to decide whether to use CUDA or fall back
 # to CPU (int8) automatically when VRAM is tight (e.g. MMS already loaded).
-_WHISPER_VRAM_REQUIRED: Dict[str, int] = {
+_WHISPER_VRAM_REQUIRED: dict[str, int] = {
     "tiny":               500 * 1024 * 1024,
     "base":               500 * 1024 * 1024,
     "small":            1_100 * 1024 * 1024,
@@ -243,7 +238,7 @@ def log(message: str, level: str = "INFO"):
 
 # ─── Template Scanning ─────────────────────────────────────────────────────
 
-def load_all_template_refs(template_filter: Optional[str] = None) -> Dict[str, Set[int]]:
+def load_all_template_refs(template_filter: str | None = None) -> dict[str, set[int]]:
     """
     Load Bible book/chapter scope from the current batch manifest.
     Returns {BOOK: {chapter_numbers}}.
@@ -252,7 +247,7 @@ def load_all_template_refs(template_filter: Optional[str] = None) -> Dict[str, S
     return {book: set(chapters) for book, chapters in get_book_chapters(batch, template_filter).items()}
 
 
-def classify_template_refs(refs: Dict[str, Set[int]]) -> Dict[str, Dict[str, Set[int]]]:
+def classify_template_refs(refs: dict[str, set[int]]) -> dict[str, dict[str, set[int]]]:
     """
     Split template references into NT and OT groups.
     Returns {"nt": {BOOK: {chapters}}, "ot": {BOOK: {chapters}}}.
@@ -268,7 +263,7 @@ def classify_template_refs(refs: Dict[str, Set[int]]) -> Dict[str, Dict[str, Set
 
 # ─── Language Resolution ────────────────────────────────────────────────────
 
-def load_priority_languages() -> List[dict]:
+def load_priority_languages() -> list[dict]:
     """Load the priority languages JSON file.
 
     Returns an empty list if the file does not exist, allowing --iso / --iso-list
@@ -282,7 +277,7 @@ def load_priority_languages() -> List[dict]:
     return data["languages"]
 
 
-def resolve_languages(args, all_languages: List[dict]) -> List[dict]:
+def resolve_languages(args, all_languages: list[dict]) -> list[dict]:
     """Resolve CLI arguments into a filtered list of language entries."""
     selected = []
 
@@ -329,7 +324,7 @@ def _build_custom_language_entry(iso: str) -> dict:
     }
 
 
-def get_whisper_language(iso: str) -> Optional[str]:
+def get_whisper_language(iso: str) -> str | None:
     """Map ISO 639-3 code to Whisper language code."""
     return ISO639_3_TO_WHISPER.get(iso)
 
@@ -337,10 +332,10 @@ def get_whisper_language(iso: str) -> Optional[str]:
 # ─── Work Item Generation ──────────────────────────────────────────────────
 
 def generate_work_items(
-    languages: List[dict],
+    languages: list[dict],
     testament: str,
-    template_refs_by_canon: Optional[Dict[str, Dict[str, Set[int]]]] = None,
-) -> List[dict]:
+    template_refs_by_canon: dict[str, dict[str, set[int]]] | None = None,
+) -> list[dict]:
     """
     Generate work items from language entries.
     Each work item = one (iso, canon, distinct_id) combination to process.
@@ -433,7 +428,7 @@ def generate_work_items(
 
 # ─── File Discovery ─────────────────────────────────────────────────────────
 
-def _find_base_dir(canon: str, iso: str, distinct_id: str) -> Optional[Path]:
+def _find_base_dir(canon: str, iso: str, distinct_id: str) -> Path | None:
     """
     Find the download directory for a fileset.
     Searches in priority order:
@@ -459,7 +454,7 @@ def _text_tag(txt_path: Path) -> str:
     return parts[2] if len(parts) >= 3 else ""
 
 
-def _expected_text_tags(iso: str, canon: str, distinct_id: str) -> Tuple[Set[str], bool]:
+def _expected_text_tags(iso: str, canon: str, distinct_id: str) -> tuple[set[str], bool]:
     """Fileset tags a genuinely valid text file for (iso, canon, distinct_id)
     can have right now, per the current DBT-catalog + verified-helloAO
     resolution (download_language_content.get_best_fileset_from_catalog() /
@@ -477,7 +472,7 @@ def _expected_text_tags(iso: str, canon: str, distinct_id: str) -> Tuple[Set[str
     )
 
     catalog_available = bool(_load_dbt_catalog("catalog-text").get("entries"))
-    tags: Set[str] = set()
+    tags: set[str] = set()
     info = get_best_fileset_from_catalog(iso, canon, distinct_id)
     if info:
         tags.update(info.get("text_fileset_candidates") or [])
@@ -495,8 +490,8 @@ def discover_chapter_files(
     distinct_id: str,
     output_dir: Path,
     force: bool = False,
-    required_chapters: Optional[Dict[str, Set[int]]] = None,
-) -> Tuple[List[dict], int]:
+    required_chapters: dict[str, set[int]] | None = None,
+) -> tuple[list[dict], int]:
     """
     Discover audio+text file pairs for a given language/canon/fileset.
     Searches across all category directories (syncable, with-timecode, etc.).
@@ -526,7 +521,7 @@ def discover_chapter_files(
     if audio_json_path.exists() or "helloao" in base_dir.parts:
         has_external_audio = True
         # Convention: contributed audio for canon=nt → {DISTINCT_ID}N2DA, OT → {DISTINCT_ID}O2DA
-        # Matches what import_contrib.py / align_bsb.py write.
+        # Matches what tools/import_contrib.py / align_bsb.py write.
         suffix = "O2DA" if canon == "ot" else "N2DA"
         external_audio_fileset = f"{distinct_id}{suffix}"
 
@@ -691,9 +686,9 @@ def count_expected_chapters(canon: str) -> int:
 # ─── Audio Availability ─────────────────────────────────────────────────────
 
 def check_and_report_audio(
-    work_items: List[dict],
+    work_items: list[dict],
     output_dir: Path,
-    required_chapters: Optional[Dict[str, Dict[str, Set[int]]]] = None,
+    required_chapters: dict[str, dict[str, set[int]]] | None = None,
 ):
     """Report audio availability for all work items."""
     log("Audio availability report:")
@@ -713,7 +708,7 @@ def check_and_report_audio(
             iso, canon, distinct_id, output_dir, force=True, required_chapters=canon_refs
         )
         total_available = len(chapters) + skipped
-        books_found = sorted(set(c["book"] for c in chapters))
+        books_found = sorted({c["book"] for c in chapters})
 
         if total_available == 0:
             log(f"  {iso}/{canon.upper()}/{distinct_id}: 0/{expected} chapters (no audio+text pairs)")
@@ -727,11 +722,11 @@ def check_and_report_audio(
 def download_audio_for_chapters(
     iso: str,
     canon: str,
-    distinct_id: Optional[str],
-    chapters_by_book: Dict[str, Set[int]],
-    audio_fileset: Optional[str] = None,
-    text_fileset: Optional[str] = None,
-    text_source: Optional[str] = None,
+    distinct_id: str | None,
+    chapters_by_book: dict[str, set[int]],
+    audio_fileset: str | None = None,
+    text_fileset: str | None = None,
+    text_source: str | None = None,
 ) -> bool:
     """Fetch audio+text for specific chapters via download_language_content.download_job().
 
@@ -810,7 +805,7 @@ def load_whisper_model(model_name: str):
 def transcribe_audio(
     audio_path: Path,
     model_name: str,
-    language: Optional[str] = None,
+    language: str | None = None,
     _model=None,
 ) -> dict:
     """Transcribe a single audio file with word timestamps.
@@ -865,30 +860,51 @@ def transcribe_audio(
         word_timestamps=True,
     )
 
-    # Convert faster-whisper output to openai-whisper-compatible dict
-    segments = []
-    for seg in fw_segments:
-        words = []
-        for w in (seg.words or []):
-            words.append({
-                "word": w.word,
-                "start": w.start,
-                "end": w.end,
-                "probability": w.probability,
+    # Convert faster-whisper output to openai-whisper-compatible dict.
+    # faster-whisper's word-alignment step (find_alignment) has a known bug
+    # (IndexError: boolean index did not match indexed array) when a segment
+    # yields zero alignment pairs — confirmed 2026-08-10 against real
+    # Indonesian audio (INDTSI 1JN 1, COL 3). It's a bug in the vendored
+    # library itself (time_indices ends up empty while the padded `jumps`
+    # mask is length 1), not fixable here, and the generator has already
+    # started emitting segments by the time it fires, so a retry must
+    # restart transcription without word timestamps rather than resume.
+    try:
+        segments = []
+        for seg in fw_segments:
+            words = []
+            for w in (seg.words or []):
+                words.append({
+                    "word": w.word,
+                    "start": w.start,
+                    "end": w.end,
+                    "probability": w.probability,
+                })
+            segments.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text,
+                "words": words,
             })
-        segments.append({
-            "start": seg.start,
-            "end": seg.end,
-            "text": seg.text,
-            "words": words,
-        })
+    except IndexError as e:
+        log(f"  faster-whisper word-alignment failed ({e}), "
+            f"retrying without word timestamps", "WARNING")
+        fw_segments, _info = model.transcribe(
+            str(audio_path),
+            language=language,
+            word_timestamps=False,
+        )
+        segments = [
+            {"start": seg.start, "end": seg.end, "text": seg.text, "words": []}
+            for seg in fw_segments
+        ]
 
     return {"segments": segments}
 
 
 # ─── Verse Alignment ────────────────────────────────────────────────────────
 
-def build_word_timeline(segments: List[dict]) -> List[dict]:
+def build_word_timeline(segments: list[dict]) -> list[dict]:
     """
     Build a word-level timeline from Whisper segments.
 
@@ -900,7 +916,7 @@ def build_word_timeline(segments: List[dict]) -> List[dict]:
     timeline = []
 
     for seg in segments:
-        if "words" in seg and seg["words"]:
+        if seg.get("words"):
             for w in seg["words"]:
                 entry = {
                     "text": w.get("word", w.get("text", "")),
@@ -931,7 +947,7 @@ def build_word_timeline(segments: List[dict]) -> List[dict]:
     return timeline
 
 
-def _word_similarity(ref_words: List[str], whisper_window: List[str]) -> float:
+def _word_similarity(ref_words: list[str], whisper_window: list[str]) -> float:
     """Compute word-level similarity between reference words and a Whisper window.
 
     Returns fraction of reference words that have a close match (>=0.6 char similarity)
@@ -958,12 +974,12 @@ def _word_similarity(ref_words: List[str], whisper_window: List[str]) -> float:
 
 
 def align_to_verses(
-    segments: List[dict],
-    verse_texts: List[str],
+    segments: list[dict],
+    verse_texts: list[str],
     book: str,
     chapter_str: str,
-    config: Optional[LanguageConfig] = None,
-) -> Tuple[List[dict], dict, int, List[dict]]:
+    config: LanguageConfig | None = None,
+) -> tuple[list[dict], dict, int, list[dict]]:
     """
     Align Whisper segments to verse boundaries using the text file.
 
@@ -1099,9 +1115,9 @@ def align_to_verses(
 
 def _interpolate_verse_time(
     verse_idx: int,
-    verse_texts: List[str],
-    anchors: Dict[int, int],
-    word_timeline: List[dict],
+    verse_texts: list[str],
+    anchors: dict[int, int],
+    word_timeline: list[dict],
     total_duration: float,
     prev_timestamp: float,
 ) -> float:
@@ -1150,10 +1166,10 @@ def _interpolate_verse_time(
 
 
 def _align_verse_words(
-    verse_words: List[str],
-    timeline: List[dict],
+    verse_words: list[str],
+    timeline: list[dict],
     timeline_start: int,
-    config: Optional[LanguageConfig] = None,
+    config: LanguageConfig | None = None,
 ) -> list:
     """
     Align individual verse words against the Whisper word timeline.
@@ -1220,8 +1236,8 @@ def _align_verse_words(
 
 
 def _interpolated_timing(
-    verse_texts: List[str], segments: List[dict], book: str, chapter_str: str
-) -> List[dict]:
+    verse_texts: list[str], segments: list[dict], book: str, chapter_str: str
+) -> list[dict]:
     """Generate purely interpolated timing when Whisper produces no output."""
     total_duration = segments[-1]["end"] if segments else 0
     total_words = sum(len(v.split()) for v in verse_texts)
@@ -1261,7 +1277,7 @@ def write_word_timing_json(word_timing: dict, output_path: Path):
 
 
 def write_whisper_words_json(
-    word_timeline: List[dict], book: str, chapter: str, output_path: Path
+    word_timeline: list[dict], book: str, chapter: str, output_path: Path
 ):
     """Write raw Whisper word-level timeline as intermediate file for alignment."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1289,11 +1305,11 @@ def format_srt_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
+    ms = round((seconds - int(seconds)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def segments_to_srt(segments: List[dict]) -> str:
+def segments_to_srt(segments: list[dict]) -> str:
     """Convert Whisper segments to SRT subtitle format."""
     lines = []
     for i, seg in enumerate(segments, start=1):
@@ -1309,7 +1325,7 @@ def segments_to_srt(segments: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def write_srt(segments: List[dict], output_path: Path):
+def write_srt(segments: list[dict], output_path: Path):
     """Write Whisper segments as an SRT subtitle file."""
     srt_content = segments_to_srt(segments)
     if not srt_content:
@@ -1321,7 +1337,7 @@ def write_srt(segments: List[dict], output_path: Path):
 
 # ─── Output ─────────────────────────────────────────────────────────────────
 
-def write_timing_json(entries: List[dict], output_path: Path):
+def write_timing_json(entries: list[dict], output_path: Path):
     """Write verse timing data in the standard format."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -1333,7 +1349,7 @@ def write_timing_json(entries: List[dict], output_path: Path):
 def process_chapter(
     chapter: dict,
     model_name: str,
-    whisper_language: Optional[str],
+    whisper_language: str | None,
     _whisper_model=None,
 ) -> dict:
     """

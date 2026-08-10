@@ -67,36 +67,36 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
-
-from text_processing import load_language_config
-from hw_config import load_hw_config
 
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
-
-from batch_manifest import load_batch, get_jobs
-from download_language_content import ensure_chapter_ready, get_dbt_book_coverage, has_usable_text_source
+from batch_manifest import get_jobs, load_batch
+from download_language_content import (
+    ensure_chapter_ready,
+    get_dbt_book_coverage,
+    has_usable_text_source,
+)
+from hw_config import load_hw_config
+from text_processing import load_language_config
 from whisper_transcribe import (
+    _USE_CUDA,
+    _USE_MLX,
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
     NT_BOOKS,
     OT_BOOKS,
     WORD_TIMING_DIR,
-    _USE_MLX,
-    _USE_CUDA,
     classify_template_refs,
-    load_whisper_model,
-    set_whisper_cpu,
     discover_chapter_files,
-    download_audio_for_chapters,
     format_duration,
     generate_work_items,
     get_whisper_language,
     load_all_template_refs,
     load_priority_languages,
+    load_whisper_model,
     resolve_languages,
+    set_whisper_cpu,
 )
 
 RUNS_DIR = Path("_runs")
@@ -165,7 +165,7 @@ class Heartbeat:
         self.label = label
         self.interval = interval
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     def _run(self):
         start = time.time()
@@ -185,7 +185,7 @@ class Heartbeat:
 
 # ─── Book specification parser ────────────────────────────────────────────
 
-def build_refs_from_books(books_spec: str) -> Dict[str, Set[int]]:
+def build_refs_from_books(books_spec: str) -> dict[str, set[int]]:
     """Build chapter refs from --books specification.
 
     Supports:
@@ -209,7 +209,7 @@ def build_refs_from_books(books_spec: str) -> Dict[str, Set[int]]:
     if spec_upper == "ALL":
         return {b: set(range(1, c + 1)) for b, c in all_books.items()}
 
-    refs: Dict[str, Set[int]] = defaultdict(set)
+    refs: dict[str, set[int]] = defaultdict(set)
     current_book = None
 
     for part in books_spec.split(","):
@@ -246,7 +246,7 @@ def build_refs_from_books(books_spec: str) -> Dict[str, Set[int]]:
 
 # ─── Step runners ────────────────────────────────────────────────────────
 
-def run_whisper_chapter(chapter: dict, model_name: str, whisper_lang: Optional[str],
+def run_whisper_chapter(chapter: dict, model_name: str, whisper_lang: str | None,
                         whisper_model=None) -> dict:
     """Run Whisper transcription for a single chapter (Step 1a).
 
@@ -261,7 +261,7 @@ def run_whisper_chapter(chapter: dict, model_name: str, whisper_lang: Optional[s
 
 def run_mms_chapter(
     item: dict, bundle, model, tokenizer, aligner, uroman, config,
-    header_skip_time: Optional[float] = None,
+    header_skip_time: float | None = None,
 ) -> dict:
     """Run MMS forced alignment for a single chapter (Step 1b).
 
@@ -273,12 +273,13 @@ def run_mms_chapter(
                        whisper_path=item.get("whisper_path"))
 
 
-def detect_whisper_header(whisper_path: Path, text_path: Path, config) -> Tuple[Optional[float], Optional[str]]:
+def detect_whisper_header(whisper_path: Path, text_path: Path, config) -> tuple[float | None, str | None]:
     """Check Whisper output for a spoken audio header before verse text.
 
     Returns (verse_start_time, header_text) if header detected, else (None, None).
     """
     import json
+
     from align_words import detect_audio_header
     from text_processing import strip_markers
 
@@ -292,7 +293,7 @@ def detect_whisper_header(whisper_path: Path, text_path: Path, config) -> Tuple[
         return None, None
 
     with open(text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f.readlines()]
+        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
 
     return detect_audio_header(whisper_words, verse_texts, config)
 
@@ -330,7 +331,7 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
     """
     manifest = {
         "batch_id": batch_id,
-        "completed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "results": results,
     }
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -360,7 +361,7 @@ def publish_run():
 
 # ─── MMS work item builder ──────────────────────────────────────────────
 
-def needs_run(output_path: Optional[Path], *input_paths: Optional[Path], force: bool = False) -> bool:
+def needs_run(output_path: Path | None, *input_paths: Path | None, force: bool = False) -> bool:
     """True if a step should (re-)run: its output is missing, --force was
     passed, or any given input is newer than the output (stale).
 
@@ -382,7 +383,7 @@ def _source_type_for(canon: str, iso: str, distinct_id: str) -> str:
     (canon, iso, distinct_id).
 
     contrib/helloao directories are pre-populated by a separate import
-    step (import_contrib.py / align_bsb.py) — this only determines
+    step (tools/import_contrib.py / align_bsb.py) — this only determines
     whether ensure_chapter_ready()'s DBT fetch should run at all. Audio
     for contrib/helloao items is fetched lazily via
     remote_audio.ensure_chapter_audio() from the per-chapter loop
@@ -650,7 +651,7 @@ Examples:
     # Batch id for the Contract B run manifest (see internal-docs/
     # audio-sync-interface.md §3 in MONO). Falls back to a local id when run
     # ad hoc via --books, outside a fetched batch.
-    batch_id = os.environ.get("BATCH_ID") or f"local-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+    batch_id = os.environ.get("BATCH_ID") or f"local-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
     # ── Step 1: Determine required chapters ──
 
@@ -704,7 +705,7 @@ Examples:
     # no extra network round trip. Built before generate_work_items() so
     # it can also restrict which locally-known filesets get processed
     # below, not just resolve placeholder items.
-    batch_jobs_by_iso_canon: Dict[Tuple[str, str], list] = defaultdict(list)
+    batch_jobs_by_iso_canon: dict[tuple[str, str], list] = defaultdict(list)
     if os.environ.get("BATCH_ID"):
         try:
             for job in get_jobs(load_batch()):
@@ -1009,9 +1010,16 @@ Examples:
             # never leave the compute side waiting after the first chapter.
             log(f"Chapters found: {len(wanted)} (fetching in background, one ahead of processing)")
 
+            # Default-argument snapshot, not a real default value — this def
+            # runs fresh each iteration of the outer work_items loop, so each
+            # of these captures the CURRENT loop values at call time rather
+            # than letting the nested worker() closure over them late-bind
+            # (which could otherwise pick up a later iteration's iso/canon/
+            # distinct_id once the background thread actually runs them).
             def _prefetching_chapters(wanted=wanted, source_type=source_type,
-                                       batch_job=item.get("_batch_job")):
-                q: "queue.Queue" = queue.Queue(maxsize=2)
+                                       batch_job=item.get("_batch_job"),  # noqa: B008
+                                       iso=iso, canon=canon, distinct_id=distinct_id):
+                q: queue.Queue = queue.Queue(maxsize=2)
 
                 def worker():
                     for book, ch in wanted:

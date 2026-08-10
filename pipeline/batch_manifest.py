@@ -44,7 +44,6 @@ import json
 import os
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 _BATCH_DIRS = [Path("_batches"), Path("data/_batches")]
 
@@ -52,7 +51,7 @@ BATCH_CDN_QUEUE_BASE = "https://cdn.bibel.wiki/_batches/queue/"
 _QUEUE_TIERS = ("high", "normal", "low")
 
 
-def load_batch(batch_id: Optional[str] = None) -> dict:
+def load_batch(batch_id: str | None = None) -> dict:
     """Load a batch manifest by ID (env BATCH_ID or explicit arg).
 
     Checks local dirs first (for hand-crafted test manifests), then falls
@@ -96,7 +95,7 @@ def load_batch(batch_id: Optional[str] = None) -> dict:
 
 
 def get_book_chapters(
-    batch: dict, template_filter: Optional[str] = None
+    batch: dict, template_filter: str | None = None
 ) -> dict[str, set[int]]:
     """
     Return {BOOK: {chapter_ints}} merged across all jobs in the batch.
@@ -113,7 +112,7 @@ def get_book_chapters(
 
 
 def get_template_chapters_from_batch(
-    batch: dict, template_ids: Optional[list[str]] = None
+    batch: dict, template_ids: list[str] | None = None
 ) -> set[tuple[str, int]]:
     """
     Return set of (BOOK, chapter_int) pairs covered by the batch.

@@ -7,16 +7,16 @@ exist, compares verse timestamps, and reports quality per language.
 
 Usage:
     # Auto-discover all languages and show summary
-    python compare_timing.py
+    python tools/compare_timing.py
 
     # Single language with per-chapter detail
-    python compare_timing.py --iso fra
+    python tools/compare_timing.py --iso fra
 
     # Multiple specific languages
-    python compare_timing.py --iso-list fra,swe,por
+    python tools/compare_timing.py --iso-list fra,swe,por
 
     # Filter to NT only
-    python compare_timing.py --testament nt
+    python tools/compare_timing.py --testament nt
 """
 
 import argparse

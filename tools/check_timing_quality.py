@@ -8,16 +8,16 @@ timecodes to flag chapters where the original is better.
 
 Usage:
     # All languages with pipeline data
-    python check_timing_quality.py
+    python tools/check_timing_quality.py
 
     # Single language with per-chapter detail
-    python check_timing_quality.py --iso fra
+    python tools/check_timing_quality.py --iso fra
 
     # Multiple languages
-    python check_timing_quality.py --iso-list fra,swe,por
+    python tools/check_timing_quality.py --iso-list fra,swe,por
 
     # Filter to NT only
-    python check_timing_quality.py --testament nt
+    python tools/check_timing_quality.py --testament nt
 """
 
 import argparse
@@ -41,7 +41,17 @@ from quality_report import (
 def analyze_chapter_timing(path):
     """Check a timing.json for verse-level issues.
 
-    Returns dict with {verses, dupes, backwards, tiny, gaps} or None.
+    Returns dict with {verses, dupes, backwards, tiny, gaps, dupe_verses} or
+    None. dupe_verses is the list of verse_start strings that are the LATER
+    verse in each zero-delta transition — lets a caller cross-reference
+    with per-word confidence scores to tell apart two genuinely different
+    causes that both show up as "consecutive verses share a timestamp":
+    a real alignment failure (0.0-score fallback, several verses in a row)
+    vs. two verses genuinely spoken back-to-back with no perceptible gap
+    (high-confidence, an isolated single pair) — confirmed as distinct,
+    real cases 2026-08-10 (see internal-docs/gpu-wedge-forensics.md-
+    adjacent session history around the mms_align_words.py CTC-infeasible
+    fallback fix). See check_language()'s DUPES vs DUPES-OK split.
     """
     with open(path) as f:
         data = json.load(f)
@@ -54,10 +64,12 @@ def analyze_chapter_timing(path):
         return None
 
     dupes = backwards = tiny = gaps = 0
+    dupe_verses = []
     for i in range(1, len(verses)):
         delta = verses[i][1] - verses[i - 1][1]
         if delta == 0:
             dupes += 1
+            dupe_verses.append(verses[i][0])
         elif delta < 0:
             backwards += 1
         elif delta < 0.1:
@@ -71,6 +83,7 @@ def analyze_chapter_timing(path):
         "backwards": backwards,
         "tiny": tiny,
         "gaps": gaps,
+        "dupe_verses": dupe_verses,
     }
 
 
@@ -175,7 +188,21 @@ def check_language(iso, testament=None):
         # Build flags
         flags = []
         if gen_timing["dupes"] > 0:
-            flags.append("DUPES")
+            # Cross-reference the specific dupe verses' word scores to tell
+            # a real alignment failure (0.0-score fallback) apart from two
+            # verses genuinely spoken back-to-back with no gap (high-
+            # confidence). Only the former is an actual issue — see
+            # analyze_chapter_timing()'s docstring for how this was found.
+            dupe_scores = []
+            if q_data:
+                for vnum in gen_timing["dupe_verses"]:
+                    for w in q_data["verses"].get(vnum, []):
+                        dupe_scores.append(w["score"])
+            dupe_avg = sum(dupe_scores) / len(dupe_scores) if dupe_scores else None
+            if dupe_avg is not None and dupe_avg >= 0.5:
+                flags.append("DUPES-OK")
+            else:
+                flags.append("DUPES")
         if gen_timing["backwards"] > 0:
             flags.append("BACKWARDS")
         if gen_timing["tiny"] >= 3:
@@ -208,12 +235,21 @@ def check_language(iso, testament=None):
     if not chapters:
         return None
 
-    has_issues = sum(1 for c in chapters if c["flags"])
+    # DUPES-OK is informational, not an issue (see check_language()'s
+    # DUPES/DUPES-OK split above) — a chapter flagged with ONLY that
+    # shouldn't count toward has_issues, and its dupe count shouldn't
+    # inflate total_dupes (which "how many chapters actually need
+    # attention" tooling, e.g. tools/requeue_dupes_chapters.py, reads).
+    has_issues = sum(
+        1 for c in chapters
+        if any(f != "DUPES-OK" for f in c["flags"])
+    )
     return {
         "iso": iso,
         "chapters": len(chapters),
         "has_issues": has_issues,
-        "total_dupes": sum(c["dupes"] for c in chapters),
+        "total_dupes": sum(c["dupes"] for c in chapters if "DUPES" in c["flags"]),
+        "total_dupes_ok": sum(c["dupes"] for c in chapters if "DUPES-OK" in c["flags"]),
         "total_backwards": sum(c["backwards"] for c in chapters),
         "total_nulls": sum(c["nulls"] for c in chapters),
         "total_low_q": sum(c["low_q"] for c in chapters),
@@ -261,12 +297,14 @@ def print_detail(result):
     if not details:
         return
 
-    # Show all chapters or only flagged ones
+    # Show all chapters or only flagged ones. Listing includes DUPES-OK
+    # chapters too (still informative to see), but the "with issues" count
+    # matches has_issues (DUPES-OK isn't a real issue — see check_language()).
     flagged = [d for d in details if d["flags"]]
     clean = len(details) - len(flagged)
 
     print(f"  Detail: {result['iso']} ({result['chapters']} chapters, "
-          f"{len(flagged)} with issues)\n")
+          f"{result['has_issues']} with issues)\n")
 
     if not flagged:
         print("    All chapters clean.\n")

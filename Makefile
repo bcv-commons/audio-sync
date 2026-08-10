@@ -1,6 +1,7 @@
 PYTHON := .venv/bin/python
 PIPELINE := pipeline
 CONF := conf
+TOOLS := tools
 
 .PHONY: all align align-whisper align-mms align-fuse \
         import-contrib prepare-cross-source \
@@ -75,10 +76,10 @@ align-fuse: ## Step 2: Fuse Whisper + MMS into final timing
 # ---------------------------------------------------------------------------
 
 import-contrib: ## Import contrib/ into downloads/contrib/
-	$(PYTHON) $(PIPELINE)/import_contrib.py $(ARGS)
+	$(PYTHON) $(TOOLS)/import_contrib.py $(ARGS)
 
 prepare-cross-source: ## Fetch helloAO text for DBT audio-only filesets
-	$(PYTHON) $(PIPELINE)/prepare_cross_source.py $(ARGS)
+	$(PYTHON) $(TOOLS)/prepare_cross_source.py $(ARGS)
 
 # ---------------------------------------------------------------------------
 # Publishing
@@ -99,13 +100,13 @@ fetch-remote-run: ## Pull export/timing-data + _runs back from a rented GPU box 
 # ---------------------------------------------------------------------------
 
 quality-check: ## Check timing for structural issues
-	$(PYTHON) $(PIPELINE)/check_timing_quality.py $(ARGS)
+	$(PYTHON) $(TOOLS)/check_timing_quality.py $(ARGS)
 
 quality-compare: ## Compare pipeline vs downloaded timecode
-	$(PYTHON) $(PIPELINE)/compare_timing.py $(ARGS)
+	$(PYTHON) $(TOOLS)/compare_timing.py $(ARGS)
 
 quality-report: ## Generate detailed quality report
-	$(PYTHON) $(PIPELINE)/quality_report.py $(ARGS)
+	$(PYTHON) $(TOOLS)/quality_report.py $(ARGS)
 
 # ---------------------------------------------------------------------------
 # Setup

@@ -5,10 +5,10 @@ Scans all chapters in export/timing-data/ for verse-1 gaps > threshold,
 then re-runs the fusion step with MMS segment re-alignment to fix them.
 
 Usage:
-    python fix_timing_gaps.py                    # scan and report only
-    python fix_timing_gaps.py --fix              # scan and fix
-    python fix_timing_gaps.py --fix --iso fra    # fix specific language
-    python fix_timing_gaps.py --threshold 2.0    # custom gap threshold
+    python tools/fix_timing_gaps.py                    # scan and report only
+    python tools/fix_timing_gaps.py --fix              # scan and fix
+    python tools/fix_timing_gaps.py --fix --iso fra    # fix specific language
+    python tools/fix_timing_gaps.py --threshold 2.0    # custom gap threshold
 """
 
 import argparse
@@ -16,6 +16,8 @@ import json
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 TIMING_DIR = Path("export/timing-data")
 WORD_TIMING_DIR = Path("word-timing-data")

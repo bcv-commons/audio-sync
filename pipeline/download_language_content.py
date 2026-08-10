@@ -45,7 +45,6 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -56,7 +55,7 @@ except ImportError as e:
     print(f"Missing module: {e.name}")
     sys.exit(1)
 
-from batch_manifest import load_batch, get_jobs
+from batch_manifest import get_jobs, load_batch
 
 # Load environment variables
 load_dotenv()
@@ -85,7 +84,7 @@ HELLOAO_API = "https://bible.helloao.org/api"
 # helloAO matching. See get_best_fileset_from_catalog() / _find_helloao_id().
 DBT_CATALOG_CDN_BASE = "https://cdn.bibel.wiki/dbt/_app/"
 DBT_CATALOG_CACHE_DIR = Path("api-cache/dbt-catalog")
-_dbt_catalog_cache: Dict[str, dict] = {}
+_dbt_catalog_cache: dict[str, dict] = {}
 
 _crossref_cache = None
 
@@ -151,7 +150,7 @@ def _load_dbt_catalog(name: str) -> dict:
                 data = json.load(f)
             _dbt_catalog_cache[name] = data
             return data
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     import urllib.request
@@ -202,7 +201,7 @@ def _resolve_catalog_fileset_id(distinct_id: str, raw_id: str) -> str:
     return f"{distinct_id}{value}"
 
 
-def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Optional[Dict]:
+def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> dict | None:
     """
     Resolve the best audio/text fileset for (iso, canon, distinct_id) from
     the `bibles` repo's catalog-text.json/catalog-audio.json — the CDN
@@ -288,11 +287,11 @@ def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> Opt
     return result
 
 
-_book_coverage_cache: Dict[str, Optional[Dict[str, list]]] = {}
+_book_coverage_cache: dict[str, dict[str, list] | None] = {}
 DBT_BOOK_COVERAGE_CACHE_DIR = Path("api-cache/dbt-book-coverage")
 
 
-def get_dbt_book_coverage(distinct_id: str) -> Optional[Dict[str, list]]:
+def get_dbt_book_coverage(distinct_id: str) -> dict[str, list] | None:
     """Fetch (and cache) one DBT distinct_id's real per-book/chapter
     coverage, straight from DBT's own bibles/{id} endpoint.
 
@@ -317,7 +316,7 @@ def get_dbt_book_coverage(distinct_id: str) -> Optional[Dict[str, list]]:
                 coverage = json.load(f)
             _book_coverage_cache[distinct_id] = coverage
             return coverage
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     data = make_api_request(f"bibles/{distinct_id}", use_key_param=True)
@@ -336,7 +335,7 @@ def get_dbt_book_coverage(distinct_id: str) -> Optional[Dict[str, list]]:
     return coverage
 
 
-def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> Optional[str]:
+def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> str | None:
     """Find a *verified* helloAO translation match via catalog-overlap.json.
 
     This is real text comparison done by the `bibles` repo, not naming-
@@ -357,7 +356,7 @@ def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> Optional[str]:
     return None
 
 
-def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> Tuple[str, Optional[str]]:
+def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> tuple[str, str | None]:
     """
     Pick the best available text source for (iso, canon, distinct_id),
     following the `bibles` repo's documented priority: pkf > helloao > dbt
@@ -489,7 +488,7 @@ def _get_external_text_source(iso, distinct_id):
                     # Derive from crossref
                     crossref = _load_crossref()
                     lang_xref = crossref.get(iso, {})
-                    for xvid, info in lang_xref.items():
+                    for info in lang_xref.values():
                         if info.get("ebible"):
                             ebible_id = info["ebible"]
                             break
@@ -506,7 +505,7 @@ def _write_source_json(base_dir, audio_source, text_source):
         try:
             with open(source_path) as f:
                 source_data = json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     if audio_source:
@@ -734,7 +733,7 @@ def determine_book_canon(book: str) -> str:
 # Module-level record of the most recent API failure, exposed so callers
 # (like download_text) can classify "no data" results into 403 vs 404 vs
 # empty-response instead of lumping them all into "no_text_available".
-_LAST_API_ERROR: Optional[Dict[str, object]] = None
+_LAST_API_ERROR: dict[str, object] | None = None
 
 
 def _classify_api_failure() -> str:
@@ -781,8 +780,8 @@ def _get_with_retry(url: str, *, attempts: int = 3, backoff: float = 2.0, **kwar
 
 
 def make_api_request(
-    endpoint: str, params: Optional[Dict] = None, use_key_param: bool = False
-) -> Optional[Dict]:
+    endpoint: str, params: dict | None = None, use_key_param: bool = False
+) -> dict | None:
     """Make API request with error handling.
 
     Args:
@@ -825,7 +824,7 @@ def make_api_request(
         return None
 
 
-def get_audio_path(fileset_id: str, book: str, chapter: int) -> Optional[str]:
+def get_audio_path(fileset_id: str, book: str, chapter: int) -> str | None:
     """Get audio file path from API."""
     # Use the correct endpoint format: /bibles/filesets/{fileset_id}/{book}/{chapter}
     endpoint = f"bibles/filesets/{fileset_id}/{book}/{chapter}"
@@ -839,7 +838,7 @@ def get_audio_path(fileset_id: str, book: str, chapter: int) -> Optional[str]:
     return data["data"][0].get("path")
 
 
-def get_text_content(fileset_id: str, book: str, chapter: int) -> Optional[dict]:
+def get_text_content(fileset_id: str, book: str, chapter: int) -> dict | None:
     """Get text content from API.
 
     Returns dict with either:
@@ -868,7 +867,7 @@ def get_text_content(fileset_id: str, book: str, chapter: int) -> Optional[dict]
     return None
 
 
-def get_timing_data(fileset_id: str, book: str, chapter: int) -> Optional[Dict]:
+def get_timing_data(fileset_id: str, book: str, chapter: int) -> dict | None:
     """Get timing data from API for a specific chapter."""
     # Normalize fileset ID - timing API doesn't work with suffixes like -opus16
     base_fileset_id = normalize_fileset_id(fileset_id)
@@ -966,7 +965,7 @@ def download_audio(
             result = subprocess.run(
                 ["ffmpeg", "-y", "-i", hls_url, "-c:a", "libmp3lame", "-q:a", "2",
                  str(output_path)],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=300, check=False,
             )
             if result.returncode != 0:
                 log(f"  ✗ ffmpeg failed for HLS stream: {result.stderr[-200:]}", "ERROR")
@@ -989,7 +988,7 @@ def download_audio(
             stats.failed += 1
             return False
         except subprocess.TimeoutExpired:
-            log(f"  ✗ ffmpeg timed out downloading HLS stream", "ERROR")
+            log("  ✗ ffmpeg timed out downloading HLS stream", "ERROR")
             stats.failed += 1
             return False
 
@@ -1015,7 +1014,7 @@ def download_audio(
             content_type="audio",
             fileset=fileset_id,
             distinct_id=distinct_id,
-            details=f"Audio download failed for fileset_id={fileset_id}: {str(e)}",
+            details=f"Audio download failed for fileset_id={fileset_id}: {e!s}",
         )
         stats.failed += 1
         return False
@@ -1093,7 +1092,7 @@ def download_text(
             content_type="text",
             fileset=fileset_id,
             distinct_id=distinct_id,
-            details=f"Text download failed for fileset_id={fileset_id}: {str(e)}",
+            details=f"Text download failed for fileset_id={fileset_id}: {e!s}",
         )
         stats.failed += 1
         return False
@@ -1109,7 +1108,7 @@ def download_text(
             content_type="text",
             fileset=fileset_id,
             distinct_id=distinct_id,
-            details=f"Text save failed for fileset_id={fileset_id}: {str(e)}",
+            details=f"Text save failed for fileset_id={fileset_id}: {e!s}",
         )
         stats.failed += 1
         return False
@@ -1170,7 +1169,7 @@ def download_timing(
             content_type="timing",
             fileset=fileset_id,
             distinct_id=distinct_id,
-            details=f"Failed to save timing data: {str(e)}",
+            details=f"Failed to save timing data: {e!s}",
         )
         stats.failed += 1
         return False
@@ -1182,14 +1181,14 @@ def download_chapter(
     canon: str,
     book: str,
     chapter: int,
-    audio_fileset: Optional[str],
-    text_fileset: Optional[str],
+    audio_fileset: str | None,
+    text_fileset: str | None,
     timing_available: bool,
     force: bool = False,
-    content_types: Optional[List[str]] = None,
-    alt_audio_fileset: Optional[str] = None,
-    text_fileset_candidates: Optional[List[str]] = None,
-    text_source_override: Optional[str] = None,
+    content_types: list[str] | None = None,
+    alt_audio_fileset: str | None = None,
+    text_fileset_candidates: list[str] | None = None,
+    text_source_override: str | None = None,
 ) -> bool:
     """
     Download content for a specific chapter based on requested content types.
@@ -1347,8 +1346,8 @@ def download_chapter(
 
 
 def download_job(
-    job: Dict,
-    content_types: Optional[List[str]] = None,
+    job: dict,
+    content_types: list[str] | None = None,
     force: bool = False,
 ) -> bool:
     """
@@ -1466,7 +1465,7 @@ def ensure_chapter_ready(
     distinct_id: str,
     book: str,
     chapter: int,
-    batch_job: Optional[Dict] = None,
+    batch_job: dict | None = None,
     force: bool = False,
 ) -> bool:
     """
@@ -1536,7 +1535,7 @@ def main():
         API_RATE_DELAY = args.rate_delay
         log(f"Rate limiting: {API_RATE_DELAY}s delay between API calls", "INFO")
 
-    content_types: Optional[List[str]] = None
+    content_types: list[str] | None = None
     if args.content_types:
         content_types = [ct.strip().lower() for ct in args.content_types.split(",")]
         valid_types = {"audio", "text", "timing"}

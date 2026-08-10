@@ -45,7 +45,6 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 # Allow MPS to fall back to CPU for ops not yet implemented on Metal.
 # Must be set before importing torch.
@@ -53,12 +52,11 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 import torchaudio
-from uroman import Uroman
-
-from text_processing import load_language_config, strip_markers, clean_for_alignment
 from align_words import detect_audio_header
-from batch_manifest import load_batch, get_template_chapters_from_batch
+from batch_manifest import get_template_chapters_from_batch, load_batch
 from hw_config import load_hw_config
+from text_processing import clean_for_alignment, load_language_config, strip_markers
+from uroman import Uroman
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -83,7 +81,7 @@ def log(message: str, level: str = "INFO"):
 _MMS_FORCE_CPU: bool = False
 
 
-def select_device(requested: Optional[str] = None) -> torch.device:
+def select_device(requested: str | None = None) -> torch.device:
     """Pick the best available torch device.
 
     Priority: explicit request > CUDA > MPS (Apple Silicon) > CPU.
@@ -98,7 +96,7 @@ def select_device(requested: Optional[str] = None) -> torch.device:
     return torch.device("cpu")
 
 
-def load_mms_model(device: Optional[torch.device] = None):
+def load_mms_model(device: torch.device | None = None):
     """Load MMS_FA model, tokenizer, aligner on the chosen device, init Uroman.
 
     The wav2vec2 model runs on the requested device (CUDA/MPS/CPU). The model's
@@ -121,7 +119,7 @@ def load_mms_model(device: Optional[torch.device] = None):
     return bundle, model, tokenizer, aligner, uroman
 
 
-def _prepare_words(text: str, uroman: Uroman, tokenizer) -> Tuple[List[str], List[str]]:
+def _prepare_words(text: str, uroman: Uroman, tokenizer) -> tuple[list[str], list[str]]:
     """Romanize text and filter to tokenizer dictionary.
 
     Returns (orig_words, clean_rom_words).
@@ -155,7 +153,7 @@ _CHUNK_SAMPLES_BY_DEVICE = {
 # takes precedence over _CHUNK_SAMPLES_BY_DEVICE for all devices.
 # Override at runtime via --mms-chunk-minutes (e.g. 2 for 6 GB desktop GPUs
 # that also run a desktop environment consuming ~600 MB VRAM).
-_MAX_CHUNK_SAMPLES: Optional[int] = None
+_MAX_CHUNK_SAMPLES: int | None = None
 
 # Overlap between chunks (in samples) to avoid boundary artifacts.
 # 0.5 seconds at 16 kHz.
@@ -222,6 +220,46 @@ def _compute_emission_chunked(waveform, model):
     return torch.cat(emissions, dim=1)
 
 
+# MMS_FA's wav2vec2 architecture has a fixed 20ms/320-sample stride @16kHz —
+# confirmed empirically 2026-08-10 (measured emission.shape[1] against real
+# audio duration: 49.9989 fps, not a heuristic).
+FRAMES_PER_SECOND = 50.0
+
+# DP-table-cell estimate (frames x total_tokens) above which torchaudio's
+# forced_align_impl is at risk of SEGFAULTING — not raising a catchable
+# exception — confirmed directly 2026-08-10 (PYTHONFAULTHANDLER=1, 3/3
+# reproductions) against Indonesian edition INDASV's Psalm 119 (the
+# longest chapter in the Bible): 106,035 frames x 12,294 tokens ~= 1.30
+# billion cells crashed; the same chapter succeeded elsewhere at 62,613 x
+# 8,896 ~= 557 million cells. 300M leaves ~1.9x margin below the known-good
+# point (not just below the crash point) since we only have one confirmed-
+# safe data point and don't know how close to the true boundary it sits.
+# Typical chapters are several orders of magnitude below this — this is a
+# rare fallback path (a handful of unusually long chapters across the
+# whole corpus), not a change to normal-case behavior. See
+# _align_or_chunk()/_align_chapter_chunked() below.
+_CTC_CHUNK_THRESHOLD_CELLS = 300_000_000
+
+
+def _ctc_min_frames_required(tokens: list[list[int]]) -> int:
+    """Minimum emission frames CTC needs to align this token sequence.
+
+    CTC requires one frame per target token, plus one extra frame between
+    any two consecutive identical tokens (a blank is mandatory there, or
+    they'd collapse into a single emission during decoding). This mirrors
+    exactly what torchaudio's forced_align_impl checks internally — its
+    own error message reports these same two terms ("targets length" and
+    "number of repeats"), which is how this formula was reverse-derived
+    (confirmed 2026-08-08 against real failures: e.g. targets length 245,
+    repeats 2, required 247, available only 149).
+    """
+    flat = [t for word_tokens in tokens for t in word_tokens]
+    if not flat:
+        return 0
+    repeats = sum(1 for i in range(1, len(flat)) if flat[i] == flat[i - 1])
+    return len(flat) + repeats
+
+
 def _align_waveform(
     waveform,
     text: str,
@@ -230,7 +268,7 @@ def _align_waveform(
     tokenizer,
     aligner,
     uroman: Uroman,
-) -> List[dict]:
+) -> list[dict]:
     """Core MMS_FA alignment on a pre-loaded waveform.
 
     For long audio (>5 min), the model forward pass is chunked to avoid
@@ -246,6 +284,27 @@ def _align_waveform(
 
     emission = _compute_emission_chunked(waveform, model)
 
+    # Proactive CTC feasibility check — compute whether this call CAN
+    # succeed before attempting it, instead of attempting it and catching
+    # the RuntimeError forced_align_impl would raise. Same outcome (no
+    # crash), but this way we never call into a configuration we already
+    # know is impossible, and the audio genuinely doesn't have enough
+    # frames for this much text (e.g. an audio/text length mismatch, or
+    # unusually fast speech) — not a bug to work around per call site.
+    available_frames = emission.shape[1]
+    required_frames = _ctc_min_frames_required(tokens)
+    if required_frames > available_frames:
+        log(
+            f"CTC alignment infeasible: {available_frames} frames available, "
+            f"{required_frames} required (text too long for this audio's "
+            f"duration) — returning unaligned words instead of attempting it.",
+            "WARNING",
+        )
+        return [
+            {"text": w, "start": None, "end": None, "score": 0.0}
+            for w in orig_words
+        ]
+
     token_spans = aligner(emission[0], tokens)
     ratio = waveform.shape[1] / emission.shape[1] / bundle.sample_rate
 
@@ -255,8 +314,8 @@ def _align_waveform(
         if not word_spans:
             results.append({
                 "text": orig_word,
-                "start": 0.0,
-                "end": 0.0,
+                "start": None,
+                "end": None,
                 "score": 0.0,
             })
             continue
@@ -292,7 +351,7 @@ def run_forced_alignment(
     tokenizer,
     aligner,
     uroman: Uroman,
-) -> List[dict]:
+) -> list[dict]:
     """Run MMS_FA forced alignment on full audio (no chunking).
 
     Returns list of dicts with keys: text, start, end, score.
@@ -311,8 +370,8 @@ def realign_from_point(
     tokenizer,
     aligner,
     uroman,
-    end_time: float = None,
-) -> List[dict]:
+    end_time: float | None = None,
+) -> list[dict]:
     """Re-run MMS_FA on audio from restart_time onwards (or to end_time).
 
     Shared by collapse recovery, gap-fill, and drift correction.
@@ -332,11 +391,216 @@ def realign_from_point(
 
     results = _align_waveform(segment, text, bundle, model, tokenizer, aligner, uroman)
 
+    # None-safe: _align_waveform's fallback path (word/clip unalignable)
+    # returns start/end=None, not a real timestamp — offsetting by
+    # restart_time must preserve that "no timestamp" meaning rather than
+    # crash (None + float) or silently turn it into a fake real value.
     for r in results:
-        r["start"] = round(r["start"] + restart_time, 2)
-        r["end"] = round(r["end"] + restart_time, 2)
+        r["start"] = round(r["start"] + restart_time, 2) if r["start"] is not None else None
+        r["end"] = round(r["end"] + restart_time, 2) if r["end"] is not None else None
 
     return results
+
+
+# Verses of forward context given to each non-last chunk in
+# _align_chapter_chunked() — aligned along with the chunk's own core
+# verses for CTC trailing context, then discarded (that content gets its
+# own full/proper alignment as the PRIMARY content of the next chunk).
+LOOKAHEAD_VERSES = 2
+
+
+def _align_chapter_chunked(
+    waveform,
+    sample_rate: int,
+    non_empty_verses: list[str],
+    bundle,
+    model,
+    tokenizer,
+    aligner,
+    uroman: Uroman,
+    start_time: float = 0.0,
+) -> tuple[list[dict], int]:
+    """Align an oversized chapter by adaptively grouping verses into the
+    largest chunks that stay safely under _CTC_CHUNK_THRESHOLD_CELLS, with
+    forward lookahead overlap at each chunk boundary for CTC trailing
+    context.
+
+    Only reached via _align_or_chunk() when a whole-chapter alignment call
+    would risk torchaudio's forced_align_impl segfault — a rare path for
+    unusually long chapters, confirmed 2026-08-10 against Indonesian
+    edition INDASV's Psalm 119 (see _CTC_CHUNK_THRESHOLD_CELLS's comment).
+
+    start_time anchors the whole chapter's start (e.g. header_skip_time, or
+    a collapse-recovery restart_time) — all internal chunk-boundary math is
+    relative to the audio from start_time onward, and returned timestamps
+    are shifted back to the original (start_time=0) timeframe, same
+    convention as realign_from_point().
+
+    Returns (word_results, chunk_count). word_results is a flat list of
+    per-word dicts (text, start, end, score), one entry per word across
+    ALL non_empty_verses in order — same shape _align_waveform()/
+    realign_from_point() return, so callers (collapse detection,
+    _map_word_idx_to_verse(), the JSON writer) need no changes.
+    """
+    total_duration = waveform.shape[1] / sample_rate - start_time
+    word_counts = [len(v.split()) for v in non_empty_verses]
+    total_words = sum(word_counts) or 1
+
+    # Proportional-pace estimate of each verse's expected position — same
+    # technique align_obs_words.py's segment_anchored_align() uses for its
+    # own windowing, reused here for chunk-membership decisions instead.
+    expected_starts = []
+    cum_words = 0
+    for wc in word_counts:
+        expected_starts.append(total_duration * cum_words / total_words)
+        cum_words += wc
+    expected_ends = expected_starts[1:] + [total_duration]
+
+    # Per-verse token counts (cheap — tokenizer lookups only, no model
+    # forward pass) — needed for both the chunk-grouping loop below and
+    # the min-window-duration guard per chunk.
+    verse_token_counts = []
+    for v in non_empty_verses:
+        _, clean_rom = _prepare_words(v, uroman, tokenizer)
+        verse_token_counts.append(_ctc_min_frames_required(tokenizer(clean_rom)))
+
+    # ── Adaptive grouping: greedily pack consecutive verses into the
+    # largest chunk that stays under the threshold. Larger chunks are
+    # preferred over small fixed-size ones — more CTC context, fewer
+    # boundary-transition points — since crossing the threshold at all is
+    # rare enough that maximizing chunk size while staying safe is worth
+    # the extra bookkeeping. ──
+    chunks = []  # list of (start_idx, end_idx_exclusive)
+    cur_start = 0
+    cur_tokens = 0
+    cur_frames_est = 0.0
+    for i, wc in enumerate(word_counts):
+        v_tokens = verse_token_counts[i]
+        v_frames_est = (expected_ends[i] - expected_starts[i]) * FRAMES_PER_SECOND
+        cand_tokens = cur_tokens + v_tokens
+        cand_frames = cur_frames_est + v_frames_est
+        if cur_tokens > 0 and cand_frames * cand_tokens > _CTC_CHUNK_THRESHOLD_CELLS:
+            chunks.append((cur_start, i))
+            cur_start = i
+            cur_tokens = v_tokens
+            cur_frames_est = v_frames_est
+        else:
+            cur_tokens = cand_tokens
+            cur_frames_est = cand_frames
+    chunks.append((cur_start, len(non_empty_verses)))
+    # A single verse whose own token x frame estimate alone exceeds the
+    # threshold would still risk the crash — the cur_tokens > 0 guard above
+    # means the grouping loop can't split BELOW one verse. No real Bible
+    # verse is anywhere near this scale (worst case a few dozen words), so
+    # this is a theoretical residual, not an observed one.
+
+    log(f"    Chapter exceeds CTC size threshold — splitting into "
+        f"{len(chunks)} chunk(s) of {[e - s for s, e in chunks]} verse(s)")
+
+    all_words: list[dict] = []
+    for chunk_i, (v_start, v_end) in enumerate(chunks):
+        is_last = chunk_i == len(chunks) - 1
+        lookahead_end = v_end if is_last else min(v_end + LOOKAHEAD_VERSES, len(non_empty_verses))
+        extended_verses = non_empty_verses[v_start:lookahead_end]
+        extended_text = " ".join(extended_verses)
+        core_word_count = sum(word_counts[v_start:v_end])
+
+        chunk_start_time = start_time + expected_starts[v_start]
+        chunk_end_time = start_time + expected_ends[lookahead_end - 1]
+
+        # Same min-window-duration guard segment_anchored_align() uses
+        # (align_obs_words.py), to keep the window from being too tight
+        # for CTC on this chunk specifically.
+        exp_dur = chunk_end_time - chunk_start_time
+        min_required_dur = exp_dur * 1.3 + 2.0
+        if exp_dur < min_required_dur:
+            chunk_end_time = min(start_time + total_duration, chunk_start_time + min_required_dur)
+
+        try:
+            chunk_words = realign_from_point(
+                waveform, sample_rate, chunk_start_time, extended_text,
+                bundle, model, tokenizer, aligner, uroman, end_time=chunk_end_time,
+            )
+        except RuntimeError as e:
+            log(f"    Chunk {chunk_i + 1}/{len(chunks)} alignment failed ({e}), "
+                f"using unaligned fallback for this chunk", "WARNING")
+            chunk_words = [
+                {"text": w, "start": None, "end": None, "score": 0.0}
+                for v in extended_verses for w in v.split()
+            ]
+
+        # Keep only the core chunk's own words — the lookahead-only words
+        # get their own full/proper alignment as the PRIMARY content of
+        # the next chunk's own call.
+        all_words.extend(chunk_words[:core_word_count])
+
+        # Same per-window cache-release rationale as segment_anchored_align()
+        # — this loop runs once per chunk per oversized chapter (rare, but
+        # can still be dozens of chunks for something Psalm-119-scale).
+        device_type = next(model.parameters()).device.type
+        if device_type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        elif device_type == "mps":
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+
+    return all_words, len(chunks)
+
+
+def _align_or_chunk(
+    waveform,
+    sample_rate: int,
+    non_empty_verses: list[str],
+    bundle,
+    model,
+    tokenizer,
+    aligner,
+    uroman: Uroman,
+    start_time: float = 0.0,
+) -> tuple[list[dict], int | None]:
+    """Dispatch to chunked or direct whole-text alignment based on a cheap
+    size estimate — the shared gate used by process_chapter()'s initial
+    alignment call AND its collapse-restart retry call, so both are
+    protected against the CTC segfault (see _CTC_CHUNK_THRESHOLD_CELLS).
+    Without this shared entry point, a collapse-triggered retry over a
+    large remaining suffix of an oversized chapter would hit the exact
+    same crash the chunking exists to prevent.
+
+    Avoids paying for a full-chapter acoustic forward pass just to
+    discover chunking is needed: available_frames is estimated from audio
+    duration x FRAMES_PER_SECOND (a fixed architecture constant, not a
+    heuristic — see its own comment), and required tokens via the
+    already-cheap tokenizer() + _ctc_min_frames_required() (no model
+    forward pass either).
+
+    Returns (word_results, chunk_count) — chunk_count is None when the
+    normal (non-chunked) path was used, purely for caller log/stats
+    visibility into how often the rare chunked path actually fires.
+    """
+    text = " ".join(non_empty_verses)
+    remaining_duration = waveform.shape[1] / sample_rate - start_time
+    available_frames_est = remaining_duration * FRAMES_PER_SECOND
+
+    _, clean_rom_words = _prepare_words(text, uroman, tokenizer)
+    tokens = tokenizer(clean_rom_words)
+    required_frames = _ctc_min_frames_required(tokens)
+
+    if available_frames_est * required_frames > _CTC_CHUNK_THRESHOLD_CELLS:
+        return _align_chapter_chunked(
+            waveform, sample_rate, non_empty_verses,
+            bundle, model, tokenizer, aligner, uroman, start_time=start_time,
+        )
+
+    word_results = realign_from_point(
+        waveform, sample_rate, start_time, text,
+        bundle, model, tokenizer, aligner, uroman,
+    )
+    return word_results, None
 
 
 def align_segment(
@@ -349,7 +613,7 @@ def align_segment(
     tokenizer,
     aligner,
     uroman,
-) -> List[dict]:
+) -> list[dict]:
     """Run MMS_FA on a segment of the audio between start_time and end_time.
 
     Convenience wrapper around realign_from_point that loads audio from a file.
@@ -445,7 +709,7 @@ def _find_whisper_restart_time(whisper_words, verse_texts, verse_idx, config):
 # ─── File I/O ───────────────────────────────────────────────────────────────
 
 def write_mms_words_json(
-    word_results: List[dict], book: str, chapter: str, output_path: Path,
+    word_results: list[dict], book: str, chapter: str, output_path: Path,
 ):
     """Write MMS word-level timeline in the same format as whisper_words.json."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,7 +732,7 @@ def write_mms_words_json(
 
 # ─── Template Helpers ─────────────────────────────────────────────────────
 
-def get_template_chapters(template_ids: List[str]) -> set:
+def get_template_chapters(template_ids: list[str]) -> set:
     """Return (BOOK, chapter_int) pairs from the current batch manifest."""
     batch = load_batch()
     return get_template_chapters_from_batch(batch, template_ids)
@@ -498,14 +762,14 @@ def has_null_collapse(mms_path: Path) -> bool:
 # ─── Work Item Discovery ───────────────────────────────────────────────────
 
 def discover_work_items(
-    iso: Optional[str] = None,
-    testament: Optional[str] = None,
+    iso: str | None = None,
+    testament: str | None = None,
     force: bool = False,
     redo_collapsed: bool = False,
-    book_filter: Optional[str] = None,
-    chapter_filter: Optional[int] = None,
-    template_chapters: Optional[set] = None,
-) -> List[dict]:
+    book_filter: str | None = None,
+    chapter_filter: int | None = None,
+    template_chapters: set | None = None,
+) -> list[dict]:
     """Find all audio+text pairs for a language (or all languages) and build work items.
 
     Scans downloads/BB/{canon}/{category}/{iso}/{distinct_id}/{book}/
@@ -532,10 +796,10 @@ def discover_work_items(
         if direct_dir.exists():
             if iso:
                 direct_iso = direct_dir / iso
-                if direct_iso.exists() and direct_iso.is_dir():
-                    # Only add if it's a language dir (not a category dir)
-                    if direct_iso.name not in AUDIO_TEXT_CATEGORIES:
-                        search_bases.append(direct_dir)
+                # Only add if it's a language dir (not a category dir)
+                if (direct_iso.exists() and direct_iso.is_dir()
+                        and direct_iso.name not in AUDIO_TEXT_CATEGORIES):
+                    search_bases.append(direct_dir)
             else:
                 search_bases.append(direct_dir)
 
@@ -619,8 +883,8 @@ def discover_work_items(
 # ─── Chapter Processing ────────────────────────────────────────────────────
 
 def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, config,
-                    header_skip_time: Optional[float] = None,
-                    whisper_path: Optional[Path] = None) -> dict:
+                    header_skip_time: float | None = None,
+                    whisper_path: Path | None = None) -> dict:
     """Align a single chapter using MMS forced alignment.
 
     If header_skip_time is provided (detected from Whisper), the audio is sliced
@@ -642,7 +906,7 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
 
     # Read verse texts, stripping non-spoken markers
     with open(text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f.readlines()]
+        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
 
     # Remove trailing empty lines
     while verse_texts and not verse_texts[-1].strip():
@@ -660,17 +924,16 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
     # Load audio once (reused for retry if needed)
     waveform, sample_rate = load_audio(audio_path, bundle)
 
-    # Skip header: slice audio to start at verse_start_time
+    # Skip header: slice audio to start at verse_start_time.
+    # _align_or_chunk() handles both the normal whole-chapter case and the
+    # rare oversized-chapter case (chunked alignment, see
+    # _CTC_CHUNK_THRESHOLD_CELLS) transparently — same call either way.
     t0 = time.time()
-    if header_skip_time and header_skip_time > 0:
-        word_results = realign_from_point(
-            waveform, sample_rate, header_skip_time, full_text,
-            bundle, model, tokenizer, aligner, uroman,
-        )
-    else:
-        word_results = _align_waveform(
-            waveform, full_text, bundle, model, tokenizer, aligner, uroman,
-        )
+    word_results, chunk_count = _align_or_chunk(
+        waveform, sample_rate, non_empty_verses,
+        bundle, model, tokenizer, aligner, uroman,
+        start_time=header_skip_time or 0.0,
+    )
     elapsed = time.time() - t0
 
     # ── Collapse detection & restart ──
@@ -697,11 +960,20 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
 
                     if remaining_text.strip():
                         t1 = time.time()
-                        retry_results = realign_from_point(
-                            waveform, sample_rate, restart_time, remaining_text,
+                        # _align_or_chunk(), not a direct realign_from_point()
+                        # call: the remaining suffix of an already-oversized
+                        # chapter can itself be large enough to risk the same
+                        # CTC segfault this whole mechanism exists to avoid —
+                        # without this, only the FIRST alignment attempt
+                        # would be protected, not a collapse-triggered retry.
+                        retry_results, retry_chunk_count = _align_or_chunk(
+                            waveform, sample_rate, non_empty_verses[verse_idx:],
                             bundle, model, tokenizer, aligner, uroman,
+                            start_time=restart_time,
                         )
                         elapsed += time.time() - t1
+                        if retry_chunk_count is not None:
+                            chunk_count = retry_chunk_count
 
                         # Stitch: keep words before collapse verse, use retry for the rest
                         pre_collapse_word_count = sum(
@@ -728,6 +1000,9 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
     if restarted:
         result["restarted"] = True
         result["restart_verse"] = verse_idx
+    if chunk_count is not None:
+        result["chunked"] = True
+        result["chunk_count"] = chunk_count
 
     # Release cached-but-unused device memory after each chapter. Chapters
     # vary widely in length, so each one's chunked forward pass allocates
@@ -755,7 +1030,7 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
     return result
 
 
-def _load_whisper_words(whisper_path: Path) -> Optional[list]:
+def _load_whisper_words(whisper_path: Path) -> list | None:
     """Load Whisper word-level data from a whisper_words.json file."""
     if not whisper_path or not whisper_path.exists():
         return None
@@ -885,7 +1160,7 @@ def main():
             whisper_words = _load_whisper_words(whisper_path)
             if whisper_words:
                 with open(item["text_path"], "r", encoding="utf-8") as f:
-                    verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f.readlines()]
+                    verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
                 verse_start, header_text = detect_audio_header(whisper_words, verse_texts, config)
                 if verse_start:
                     header_skip_time = verse_start

@@ -19,8 +19,6 @@ before Whisper. If the mp3 already exists locally, it's a no-op.
 import json
 import urllib.request
 from pathlib import Path
-from typing import Optional
-
 
 HELLOAO_API_BASE = "https://bible.helloao.org/api"
 HELLOAO_CONFIG_PATH = Path("config/helloao.toml")
@@ -89,7 +87,7 @@ def _load_helloao_config() -> dict:
 
 # ─── URL builders ──────────────────────────────────────────────────────────
 
-def sermon_online_url(audio_meta: dict, book: str, chapter_num: int) -> Optional[str]:
+def sermon_online_url(audio_meta: dict, book: str, chapter_num: int) -> str | None:
     """Build a sermon-online mp3 URL from the audio.json metadata.
 
     Pattern: {baseUrl}{code}{chapter:0Nd}-{title}_Kapitel-{chapter:03d}.mp3
@@ -106,7 +104,7 @@ def sermon_online_url(audio_meta: dict, book: str, chapter_num: int) -> Optional
     return f"{base}{prefix}-{title}_Kapitel-{chapter_num:03d}.mp3"
 
 
-def helloao_chapter_audio_url(translation: str, reader: str, book: str, chapter_num: int) -> Optional[str]:
+def helloao_chapter_audio_url(translation: str, reader: str, book: str, chapter_num: int) -> str | None:
     """Fetch helloAO chapter JSON (cached) and return the reader's mp3 URL."""
     canon_dir = "ot" if book in {
         "GEN","EXO","LEV","NUM","DEU","JOS","JDG","RUT","1SA","2SA","1KI","2KI",

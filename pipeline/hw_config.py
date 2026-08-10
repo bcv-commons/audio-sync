@@ -25,13 +25,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 HW_CONFIG_PATH = Path("conf/hw.local.json")
 
 # Keys this module understands. Anything else in hw.local.json (e.g. a
 # "_notes" documentation block, see hw.local.json.example) is ignored.
-_DEFAULTS: Dict[str, Any] = {
+_DEFAULTS: dict[str, Any] = {
     "whisper_model": None,        # None -> each script's own DEFAULT_MODEL
     "whisper_cpu": False,
     "mms_cpu": False,
@@ -44,10 +44,10 @@ _DEFAULTS: Dict[str, Any] = {
                                    # headroom alone isn't reliable).
 }
 
-_cache: Optional[Dict[str, Any]] = None
+_cache: dict[str, Any] | None = None
 
 
-def load_hw_config() -> Dict[str, Any]:
+def load_hw_config() -> dict[str, Any]:
     """Load hw.local.json (once per process) merged over the built-in defaults.
 
     Missing file, or a file missing some keys, is normal — falls back to

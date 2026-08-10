@@ -28,7 +28,7 @@ align_obs_words.py.
 
 Output: reuses align_words.py's write_timing_json/write_word_timing_json/
 write_quality_json as-is — same on-disk shape as fusion-mode output, so
-downstream consumers (quality_report.py, check_timing_quality.py) need no
+downstream consumers (tools/quality_report.py, tools/check_timing_quality.py) need no
 changes. No *_mms_words.json is written — there's no single continuous MMS
 run to represent in that shape.
 
@@ -42,10 +42,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
 
 from align_words import write_quality_json, write_timing_json, write_word_timing_json
-from mms_align_words import load_audio, load_mms_model, realign_from_point, select_device
+from mms_align_words import (
+    load_audio,
+    load_mms_model,
+    realign_from_point,
+    select_device,
+)
 from text_processing import clean_for_alignment, load_language_config, strip_markers
 
 DOWNLOADS_DIR = Path("downloads/BB")
@@ -73,12 +77,12 @@ def log(message: str, level: str = "INFO"):
 
 def verse_anchored_align(
     audio_path: Path,
-    non_empty_verses: List[str],
+    non_empty_verses: list[str],
     config, bundle, model, tokenizer, aligner, uroman,
     window_frac: float = WINDOW_FRAC,
     min_window_seconds: float = MIN_WINDOW_SECONDS,
     min_local_score: float = MIN_LOCAL_SCORE,
-) -> List[dict]:
+) -> list[dict]:
     """Align each verse independently within a window anchored to an
     expected-pace position. Adapted from align_obs_words.py's
     segment_anchored_align() — same window/floor/overshoot-cap logic, see
@@ -206,7 +210,7 @@ def process_chapter_verse_only(
     quality_path = item["quality_path"]
 
     with open(text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f.readlines()]
+        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
     while verse_texts and not verse_texts[-1].strip():
         verse_texts.pop()
 
@@ -331,7 +335,7 @@ def main():
     bundle, model, tokenizer, aligner, uroman = load_mms_model(select_device(args.device))
 
     required = {args.book: {args.chapter}} if args.chapter is not None else {args.book: set(range(1, 200))}
-    chapters, skipped = discover_chapter_files(
+    chapters, _skipped = discover_chapter_files(
         args.iso, args.canon, args.distinct_id, OUTPUT_DIR, force=args.force, required_chapters=required,
     )
     if not chapters:

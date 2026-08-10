@@ -1,0 +1,13 @@
+[lint]
+ignore = [
+    # Broad catch-and-log-and-continue is a deliberate, repeated pattern
+    # throughout the batch pipeline: one chapter's failure (of any kind —
+    # torch/CUDA errors, malformed source data, network issues) must never
+    # take down the rest of a multi-hour batch run. Narrowing these to
+    # specific exception types per site isn't practical given how many
+    # unrelated subsystems (torch, requests, file I/O, subprocess) each
+    # try/except spans.
+    "BLE001",  # blind-except (bare `except Exception`)
+    "S110",    # try-except-pass
+    "S112",    # try-except-continue
+]

@@ -51,11 +51,10 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Set
 
 from align_pipeline import build_refs_from_books
-from whisper_transcribe import NT_BOOKS, OT_BOOKS, load_all_template_refs
 from hw_config import load_hw_config
+from whisper_transcribe import NT_BOOKS, OT_BOOKS, load_all_template_refs
 
 ALL_BOOKS = {**OT_BOOKS, **NT_BOOKS}
 THIS_DIR = Path(__file__).resolve().parent
@@ -66,7 +65,7 @@ def log(message: str) -> None:
     print(f"[{timestamp}] [shard_align] {message}", flush=True)
 
 
-def compute_balanced_shards(book_chapters: Dict[str, Set[int]], n: int) -> List[List[str]]:
+def compute_balanced_shards(book_chapters: dict[str, set[int]], n: int) -> list[list[str]]:
     """Split books into n groups, balanced by summed chapter count.
 
     Greedy longest-processing-time-first (LPT) heuristic: place the
@@ -77,7 +76,7 @@ def compute_balanced_shards(book_chapters: Dict[str, Set[int]], n: int) -> List[
     book_chapters: {book: set_of_chapter_numbers}. Returns n lists of
     book codes (some may be empty if n exceeds the number of books).
     """
-    groups: List[List[str]] = [[] for _ in range(n)]
+    groups: list[list[str]] = [[] for _ in range(n)]
     totals = [0] * n
     by_size = sorted(book_chapters.items(), key=lambda kv: -len(kv[1]))
     for book, chapters in by_size:
@@ -87,7 +86,7 @@ def compute_balanced_shards(book_chapters: Dict[str, Set[int]], n: int) -> List[
     return groups
 
 
-def format_book_chapters(book: str, chapters: Set[int]) -> str:
+def format_book_chapters(book: str, chapters: set[int]) -> str:
     """Render a book + chapter set as an align_pipeline.py --books token.
 
     Full-book coverage collapses to the bare book code ("JHN"); a partial
@@ -98,7 +97,7 @@ def format_book_chapters(book: str, chapters: Set[int]) -> str:
     if full is not None and chapters == set(range(1, full + 1)):
         return book
 
-    ranges: List[str] = []
+    ranges: list[str] = []
     ordered = sorted(chapters)
     start = prev = ordered[0]
     for c in ordered[1:]:
@@ -111,7 +110,7 @@ def format_book_chapters(book: str, chapters: Set[int]) -> str:
     return f"{book}:{','.join(ranges)}"
 
 
-def shard_one_language(iso: str, refs: Dict[str, set], workers: int, passthrough: list) -> bool:
+def shard_one_language(iso: str, refs: dict[str, set], workers: int, passthrough: list) -> bool:
     """Shard one language's book/chapter refs across N workers, launch, wait.
 
     Returns True if every worker finished OK, False if any failed.
@@ -145,7 +144,10 @@ def shard_one_language(iso: str, refs: Dict[str, set], workers: int, passthrough
             *passthrough,
         ]
         log(f"[{iso}] worker {i} log: {log_path}")
-        log_file = open(log_path, "w")
+        # Kept open across the subprocess's lifetime, closed explicitly once
+        # it exits (below) — a `with` block would close it while the
+        # process is still writing to it.
+        log_file = open(log_path, "w")  # noqa: SIM115
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
         procs.append((i, proc, log_file, log_path))
 

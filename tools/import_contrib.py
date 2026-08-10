@@ -27,9 +27,9 @@ For EXTERNAL contributions:
     the alignment pipeline (whisper/MMS) does not need to run for those chapters.
 
 Usage:
-    python import_contrib.py              # Import all contributions
-    python import_contrib.py --iso deu    # Import one language
-    python import_contrib.py --dry-run    # Preview only
+    python tools/import_contrib.py              # Import all contributions
+    python tools/import_contrib.py --iso deu    # Import one language
+    python tools/import_contrib.py --dry-run    # Preview only
 """
 
 import argparse

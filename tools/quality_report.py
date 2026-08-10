@@ -8,19 +8,19 @@ timecode when available.
 
 Usage:
     # Overview for a language (sorted worst-first)
-    python quality_report.py --iso heb
+    python tools/quality_report.py --iso heb
 
     # Only NT or OT
-    python quality_report.py --iso heb --testament ot
+    python tools/quality_report.py --iso heb --testament ot
 
     # Drill down into a specific chapter
-    python quality_report.py --iso heb --chapter GEN_017
+    python tools/quality_report.py --iso heb --chapter GEN_017
 
     # Show all verses (not just low-quality ones) when drilling down
-    python quality_report.py --iso heb --chapter GEN_017 --all-verses
+    python tools/quality_report.py --iso heb --chapter GEN_017 --all-verses
 
     # Filter to low-quality chapters only
-    python quality_report.py --iso heb --min-low-q 1
+    python tools/quality_report.py --iso heb --min-low-q 1
 """
 
 import argparse

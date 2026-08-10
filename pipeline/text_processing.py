@@ -10,11 +10,11 @@ replacements) are loaded from TOML config files in config/languages/.
 """
 
 import re
-import tomllib
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+
+import tomllib
 
 CONFIG_DIR = Path(__file__).parent / "config" / "languages"
 
@@ -23,16 +23,16 @@ CONFIG_DIR = Path(__file__).parent / "config" / "languages"
 class LanguageConfig:
     """Language-specific text processing configuration."""
     iso: str
-    pronunciation_map: Dict[str, str] = field(default_factory=dict)
-    strip_marker_rules: List[Dict[str, str]] = field(default_factory=list)
-    char_replacements: Dict[str, str] = field(default_factory=dict)
-    strip_unicode_categories: List[str] = field(default_factory=lambda: ["Mn"])
+    pronunciation_map: dict[str, str] = field(default_factory=dict)
+    strip_marker_rules: list[dict[str, str]] = field(default_factory=list)
+    char_replacements: dict[str, str] = field(default_factory=dict)
+    strip_unicode_categories: list[str] = field(default_factory=lambda: ["Mn"])
     mms_fallback_threshold: float = 0.3
-    aramaic_passages: List[str] = field(default_factory=list)
+    aramaic_passages: list[str] = field(default_factory=list)
     verse_only_mode: bool = False
 
 
-_config_cache: Dict[str, LanguageConfig] = {}
+_config_cache: dict[str, LanguageConfig] = {}
 
 
 def load_language_config(iso: str) -> LanguageConfig:

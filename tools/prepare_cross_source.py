@@ -24,9 +24,9 @@ under api-cache/dbt-catalog/) the same way as the other DBT catalogs. See
 _find_helloao_id()'s docstring in download_language_content.py.
 
 Usage:
-    python prepare_cross_source.py --dry-run        # Preview what would be downloaded
-    python prepare_cross_source.py --iso gaz         # Prepare one language
-    python prepare_cross_source.py --all             # Prepare all detected pairs
+    python tools/prepare_cross_source.py --dry-run        # Preview what would be downloaded
+    python tools/prepare_cross_source.py --iso gaz         # Prepare one language
+    python tools/prepare_cross_source.py --all             # Prepare all detected pairs
 """
 
 import argparse
@@ -34,6 +34,8 @@ import json
 import sys
 import urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 from download_language_content import (
     HELLOAO_API,

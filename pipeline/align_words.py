@@ -38,7 +38,6 @@ import difflib
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 from text_processing import (
     LanguageConfig,
@@ -70,7 +69,7 @@ def log(message: str, level: str = "INFO"):
 
 # ─── File I/O ───────────────────────────────────────────────────────────────
 
-def load_word_timeline(path: Path) -> List[dict]:
+def load_word_timeline(path: Path) -> list[dict]:
     """Load a *_whisper_words.json or *_mms_words.json file.
 
     Returns list of word dicts with keys: text, start, end (optional), score (optional).
@@ -90,7 +89,7 @@ def load_word_timeline(path: Path) -> List[dict]:
     return words
 
 
-def write_timing_json(entries: List[dict], output_path: Path):
+def write_timing_json(entries: list[dict], output_path: Path):
     """Write verse timing data in the standard format."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -114,12 +113,12 @@ def write_quality_json(word_quality: dict, output_path: Path):
 # ─── MMS-FA Verse Mapping ──────────────────────────────────────────────────
 
 def _map_mms_to_verses(
-    mms_words: List[dict],
-    verse_texts: List[str],
+    mms_words: list[dict],
+    verse_texts: list[str],
     book: str,
     chapter_str: str,
     config: LanguageConfig,
-) -> Tuple[List[dict], dict, int]:
+) -> tuple[list[dict], dict, int]:
     """Map flat MMS word results to verse boundaries.
 
     The MMS words are aligned 1:1 with the cleaned reference text words
@@ -197,7 +196,7 @@ def _map_mms_to_verses(
 
 # ─── Whisper Verse Alignment ───────────────────────────────────────────────
 
-def _word_similarity(ref_words: List[str], whisper_window: List[str]) -> float:
+def _word_similarity(ref_words: list[str], whisper_window: list[str]) -> float:
     """Compute word-level similarity between reference words and a Whisper window."""
     if not ref_words or not whisper_window:
         return 0.0
@@ -220,12 +219,12 @@ def _word_similarity(ref_words: List[str], whisper_window: List[str]) -> float:
 
 
 def _align_whisper_to_verses(
-    whisper_words: List[dict],
-    verse_texts: List[str],
+    whisper_words: list[dict],
+    verse_texts: list[str],
     book: str,
     chapter_str: str,
     config: LanguageConfig,
-) -> Tuple[List[dict], dict, int]:
+) -> tuple[list[dict], dict, int]:
     """Align Whisper word timeline to verse boundaries using fuzzy matching.
 
     Returns (timing_entries, word_timing, matched_verse_count).
@@ -327,11 +326,11 @@ def _align_whisper_to_verses(
 
 
 def _align_verse_words_whisper(
-    verse_words: List[str],
-    timeline: List[dict],
+    verse_words: list[str],
+    timeline: list[dict],
     timeline_start: int,
     config: LanguageConfig,
-) -> Tuple[list, list]:
+) -> tuple[list, list]:
     """Align individual verse words against Whisper timeline using fuzzy matching.
 
     Returns (start_times, end_times) — parallel lists, one entry per verse word.
@@ -382,9 +381,9 @@ def _align_verse_words_whisper(
 
 def _interpolate_verse_time(
     verse_idx: int,
-    verse_texts: List[str],
-    anchors: Dict[int, int],
-    word_timeline: List[dict],
+    verse_texts: list[str],
+    anchors: dict[int, int],
+    word_timeline: list[dict],
     total_duration: float,
     prev_timestamp: float,
 ) -> float:
@@ -430,16 +429,49 @@ def _interpolate_verse_time(
 
 # ─── Header Detection ─────────────────────────────────────────────────────
 
+def _split_cjk(word: str) -> list[str]:
+    """Split a token into individual characters if it contains any CJK
+    Unified Ideograph. CJK languages don't delimit words with whitespace, so
+    a whitespace-split "word" can actually be an entire multi-character
+    clause — e.g. Chinese "因此你们既然是蒙爱的儿女就该效法" is one .split()
+    token but 17 separate words. Character granularity matches Whisper's own
+    per-character transcription tokens for these languages, so comparisons
+    become possible again.
+    """
+    if any("一" <= ch <= "鿿" for ch in word):
+        return list(word)
+    return [word]
+
+
 def detect_audio_header(
-    whisper_words: List[dict],
-    verse_texts: List[str],
+    whisper_words: list[dict],
+    verse_texts: list[str],
     config: LanguageConfig,
-) -> Tuple[Optional[float], Optional[str]]:
+    uroman=None,
+) -> tuple[float | None, str | None]:
     """Detect spoken audio header (e.g. book/chapter title, music) before verse text.
 
-    Uses two signals:
-    1. Gap detection: a silence/music gap > 2s in the first 80s of audio
-    2. Text matching: sliding-window match of verse 1 text against Whisper words
+    Deterministic, MMS-free: builds the known reference word sequence starting
+    at verse 1 (continuing into verse 2+ so short verse 1s still yield enough
+    words to be confident) and, for every candidate start position in the
+    Whisper transcript, measures how many consecutive reference words match in
+    order from there — anchor on word 1, confirm word 2, confirm word 3, ...
+    Real verse text keeps matching for many words in a row; a coincidental
+    partial overlap (e.g. a spoken chapter announcement that happens to share
+    one common short word with verse 1) breaks after a word or two. The
+    candidate with the longest run wins. A genuine no-header chapter naturally
+    produces its longest run starting at whisper index 0 — no special-casing
+    needed, unlike the previous first-index-that-clears-a-threshold approach.
+
+    Tries plain normalized-text comparison first. If that finds nothing and a
+    `uroman` instance is supplied (the same one MMS already uses to romanize
+    text before CTC alignment — see mms_align_words.py), retries by comparing
+    romanized text instead. This recovers reference text with script-encoding
+    corruption (e.g. a Greek edition where some words were typed with Latin
+    lookalike letters instead of real Greek ones) — MMS's own alignment is
+    already immune to this, since uroman happens to romanize both the
+    corrupted and correct spellings to the same output, but plain string
+    comparison here isn't unless it's routed through the same normalization.
 
     Returns (verse_start_time, header_text) if a header is detected, else (None, None).
     verse_start_time is where the actual verse content begins (use to skip header).
@@ -448,87 +480,263 @@ def detect_audio_header(
     if not whisper_words or not verse_texts:
         return None, None
 
-    # Get first non-empty verse words for matching
-    first_verse = None
-    for vt in verse_texts:
-        vt = vt.strip()
-        if vt:
-            first_verse = vt
-            break
-    if not first_verse:
+    def build_ref_words(transform) -> list[str]:
+        words = []
+        for vt in verse_texts:
+            for w in vt.split():
+                for piece in _split_cjk(w):
+                    tw = transform(piece)
+                    if tw:
+                        words.append(tw)
+        return words
+
+    def build_whisper_tokens(transform, split_cjk: bool) -> tuple[list[str], list[int]]:
+        # Whisper's own CJK tokenization isn't consistently one character per
+        # token — it sometimes groups small common words together (e.g.
+        # Chinese "你们" as one token instead of two characters). Splitting
+        # here too keeps both sides at matching granularity. orig_idx maps
+        # each comparison token back to its source whisper_words index, since
+        # a single original token can now expand into several — needed to
+        # recover a real timestamp for whichever index wins.
+        tokens = []
+        orig_idx = []
+        for i, w in enumerate(whisper_words):
+            pieces = _split_cjk(w["text"]) if split_cjk else [w["text"]]
+            for piece in pieces:
+                tokens.append(transform(piece))
+                orig_idx.append(i)
+        return tokens, orig_idx
+
+    ref_words = build_ref_words(lambda w: normalize_text(w, config))
+    if not ref_words:
         return None, None
 
-    first_verse_words = [normalize_text(w, config) for w in first_verse.split()[:5]]
-    first_verse_words = [w for w in first_verse_words if w]
-    if not first_verse_words:
+    whisper_norm, whisper_orig_idx = build_whisper_tokens(
+        lambda w: normalize_text(w, config), split_cjk=True,
+    )
+
+    def romanize(w: str) -> str:
+        # Lowercase and strip punctuation to match normalize_text()'s
+        # behavior — uroman.romanize_string() preserves original casing
+        # (e.g. Greek "ΚΑΙ" -> "KAI"), and difflib's ratio is case-sensitive,
+        # so leaving case in would silently break every comparison here.
+        return uroman.romanize_string(w).strip().strip(".,;:!?«»’“”").lower()
+
+    result = _match_header_boundary(whisper_norm, ref_words)
+    if result is None and uroman is not None:
+        ref_words_rom = build_ref_words(romanize)
+        whisper_norm_rom, whisper_orig_idx_rom = build_whisper_tokens(
+            romanize, split_cjk=False,
+        )
+        if ref_words_rom:
+            result = _match_header_boundary(whisper_norm_rom, ref_words_rom)
+            if result is not None:
+                whisper_orig_idx = whisper_orig_idx_rom
+
+    if result is None:
         return None, None
 
-    # Signal 1: Find gaps > 2s in the first 80s — common between header and verse text
-    gap_boundary = None
-    for j in range(1, len(whisper_words)):
-        if whisper_words[j]["start"] > 80.0:
-            break
-        gap = whisper_words[j]["start"] - whisper_words[j - 1].get("end", whisper_words[j - 1]["start"])
-        if gap > 2.0:
-            gap_boundary = j  # verse text likely starts at this word index
-            break
-
-    # Signal 2: Find where verse 1 text first matches in the Whisper timeline
-    # Use sliding window of first_verse_words against whisper words
-    text_match_idx = None
-    search_limit = min(len(whisper_words), 50)  # search first 50 words
-    for i in range(search_limit - len(first_verse_words) + 1):
-        window = [normalize_text(whisper_words[i + k]["text"], config) for k in range(len(first_verse_words))]
-        matches = 0
-        for fvw in first_verse_words:
-            best = max(
-                (difflib.SequenceMatcher(None, fvw, ww).ratio() for ww in window),
-                default=0.0,
-            )
-            if best >= 0.7:
-                matches += 1
-        if matches >= max(2, len(first_verse_words) * 0.6):
-            text_match_idx = i
-            break
-
-    # Decide which signal to trust:
-    # - Text match is the strongest signal (it identifies where verse 1 actually
-    #   begins). When present, use it directly.
-    # - Gap alone is unreliable: inter-verse pauses can exceed 2s in many
-    #   recordings, especially after sentence breaks. So when text match is
-    #   missing, only trust the gap if it occurs early enough to plausibly be
-    #   a real header (typical title speech is < 8s).
-    GAP_ONLY_MAX_SECONDS = 8.0
-    boundary_idx = None
-    if text_match_idx is not None and text_match_idx > 0:
-        boundary_idx = text_match_idx
-    elif (
-        gap_boundary is not None
-        and whisper_words[gap_boundary]["start"] <= GAP_ONLY_MAX_SECONDS
-    ):
-        boundary_idx = gap_boundary
-
-    if boundary_idx is None or boundary_idx == 0:
-        return None, None  # No header detected
-
-    verse_start_time = whisper_words[boundary_idx]["start"]
-    header_text_parts = [w["text"].strip() for w in whisper_words[:boundary_idx]]
+    comp_idx, _best_run = result
+    best_idx = whisper_orig_idx[comp_idx]
+    verse_start_time = whisper_words[best_idx]["start"]
+    header_text_parts = [w["text"].strip() for w in whisper_words[:best_idx]]
     header_text = " ".join(header_text_parts)
-
     return verse_start_time, header_text
+
+
+def _match_header_boundary(
+    whisper_norm: list[str],
+    ref_words: list[str],
+) -> tuple[int, int] | None:
+    """Core matching pass used by detect_audio_header — factored out so it
+    can be tried again against a differently-normalized token set (see the
+    uroman fallback above) without duplicating the algorithm itself.
+
+    Returns (best_idx, best_run) for a detected header boundary, or None.
+    """
+    MATCH_RATIO = 0.7
+    # A run needs at least this many consecutive matched words to be trusted —
+    # short chapters/verses simply can't produce more than they have.
+    MIN_RUN = min(5, len(ref_words))
+    # How far into the reference text a single candidate's run is allowed to
+    # extend before we stop checking — plenty to separate a real match from a
+    # coincidental one without scanning the whole chapter every time.
+    MAX_RUN_CHECK = min(len(ref_words), 40)
+    # How many Whisper words to try as a candidate header/verse boundary — a
+    # word count, not a time cutoff, so a long musical intro doesn't cap how
+    # far we look, only how many spoken words can precede real verse content.
+    SEARCH_LIMIT = min(len(whisper_norm), 150)
+
+    def word_match(a: str, b: str) -> bool:
+        # No standalone digit-wildcard here — "either side is a digit" is
+        # unconditionally risky (it lets any unrelated word match any
+        # number). A genuine numeral surface-form mismatch (e.g. spelled-out
+        # "twelve" vs Whisper's "12") is just one instance of "a single word
+        # didn't match the way we expected" — the same shape as a garbled
+        # word — so it's handled generically by the wildcard-recovery path
+        # in run_length() below, which requires real matches before AND
+        # after to trust it, rather than a blanket free pass here.
+        return difflib.SequenceMatcher(None, a, b).ratio() >= MATCH_RATIO
+
+    MAX_SKIPS = 2
+    # How many extra Whisper words a single garbled/split reference word is
+    # allowed to have been transcribed into, e.g. "притчами" -> "при чьими".
+    WILDCARD_WINDOW = 3
+    # How many verified matches must follow a wildcard for it to be trusted —
+    # this is the "replacing confidence" for the position we couldn't verify:
+    # real content keeps matching cleanly for a while afterward; a
+    # coincidental phrase overlap (e.g. a recurring formulaic phrase like
+    # "the angel of the LORD" elsewhere in the same chapter) typically only
+    # picks up one more common word before diverging again.
+    WILDCARD_CONFIRM_MIN = 3
+
+    def run_length(start_idx: int) -> tuple[int, int]:
+        """Consecutive ref/Whisper word matches starting at whisper[start_idx].
+
+        Tolerates a bounded number of one-word skips on either side — either
+        Whisper heard a word not in the reference (insertion) or the
+        reference has a word Whisper never spoke, e.g. a connector dropped in
+        the actual reading (omission) — without killing the whole run. Real
+        matching content recovers and keeps extending; a genuinely wrong
+        starting point can't recover twice in a row and stops immediately.
+
+        As a last resort (at most once per run), tolerates one reference word
+        Whisper garbled beyond recognition — e.g. split into unrelated
+        fragments — by jumping ahead to wherever the *next* reference word
+        reappears, without verifying the garbled word itself. That jump is
+        only trusted if enough real matches follow it (WILDCARD_CONFIRM_MIN);
+        otherwise the run is truncated back to its pre-wildcard length, same
+        as if the wildcard had never been tried.
+
+        Returns (run, skips_used) — skips_used is used only to break ties
+        between candidates that reach the same run length.
+        """
+        ri, wi = 0, start_idx
+        run = 0
+        skips_used = 0
+        wildcard_used = False
+        pre_wildcard_run = None
+        post_wildcard_run = 0
+        while ri < MAX_RUN_CHECK and wi < len(whisper_norm):
+            if word_match(ref_words[ri], whisper_norm[wi]):
+                run += 1
+                if wildcard_used:
+                    post_wildcard_run += 1
+                ri += 1
+                wi += 1
+                continue
+            if skips_used >= MAX_SKIPS:
+                break
+            skip_ref_ok = (
+                ri + 1 < len(ref_words)
+                and word_match(ref_words[ri + 1], whisper_norm[wi])
+            )
+            skip_wh_ok = (
+                wi + 1 < len(whisper_norm)
+                and word_match(ref_words[ri], whisper_norm[wi + 1])
+            )
+            if skip_ref_ok:
+                ri += 1
+                skips_used += 1
+                continue
+            if skip_wh_ok:
+                wi += 1
+                skips_used += 1
+                continue
+            # Only allow the wildcard after at least one real match has
+            # already anchored this candidate — a genuine transcription
+            # garble happens mid-stream in otherwise-continuous speech. At
+            # the very first position (ri == 0) there's nothing yet to
+            # distinguish "this word was garbled" from "this candidate is
+            # simply wrong and real content starts later" — e.g. bridging
+            # over an entire real, correctly-transcribed header phrase by
+            # treating it as a stand-in for one dropped reference word.
+            if not wildcard_used and ri >= 1 and ri + 1 < len(ref_words):
+                found = None
+                for wj in range(wi + 1, min(wi + 1 + WILDCARD_WINDOW, len(whisper_norm))):
+                    if word_match(ref_words[ri + 1], whisper_norm[wj]):
+                        found = wj
+                        break
+                if found is not None:
+                    wildcard_used = True
+                    pre_wildcard_run = run
+                    skips_used += 1
+                    ri += 1
+                    wi = found
+                    continue
+            break  # no recovery works — real mismatch, stop the run
+
+        if wildcard_used and post_wildcard_run < WILDCARD_CONFIRM_MIN:
+            # Not enough confirmation after the wildcard to trust it — fall
+            # back to only the verified pre-wildcard portion of the run.
+            run = pre_wildcard_run
+        return run, skips_used
+
+    def bag_match_count(start_idx: int, n: int) -> int:
+        """Order-independent rescue check: how many of the first n reference
+        words appear anywhere in a slightly padded Whisper window starting at
+        start_idx. Used only to rescue the single best strict-order candidate
+        when it fell just short of MIN_RUN — recovers cases where Whisper's
+        transcript and the reference text say the same words in a locally
+        different order (e.g. adjective/noun swaps), without reintroducing
+        the old algorithm's from-scratch coincidental-match risk, since this
+        never runs as an independent search over every position.
+        """
+        window_end = min(len(whisper_norm), start_idx + n + 2)
+        window = whisper_norm[start_idx:window_end]
+        used = [False] * len(window)
+        count = 0
+        for ri in range(n):
+            for wj, ww in enumerate(window):
+                if not used[wj] and word_match(ref_words[ri], ww):
+                    used[wj] = True
+                    count += 1
+                    break
+        return count
+
+    best_idx = None
+    best_run = 0
+    best_skips = 0
+    near_miss_idx = None
+    near_miss_run = 0
+    for i in range(SEARCH_LIMIT):
+        r, skips = run_length(i)
+        if r > best_run or (r == best_run and r > 0 and skips < best_skips):
+            best_run = r
+            best_skips = skips
+            best_idx = i
+        if 0 < r < MIN_RUN and r > near_miss_run:
+            near_miss_run = r
+            near_miss_idx = i
+
+    if (best_idx is None or best_run < MIN_RUN) and near_miss_idx is not None:
+        # The best strict-order candidate fell just short — check whether a
+        # local word-order difference (not a real mismatch) explains it.
+        rescued = bag_match_count(near_miss_idx, MIN_RUN)
+        if rescued >= MIN_RUN:
+            best_idx = near_miss_idx
+            best_run = rescued
+
+    if best_idx is None or best_run < MIN_RUN:
+        return None  # No confident match anywhere — assume no header
+
+    if best_idx == 0:
+        return None  # Verse 1 text starts immediately — no header
+
+    return best_idx, best_run
 
 
 # ─── Per-Word Fusion Logic ─────────────────────────────────────────────────
 
 def _find_whisper_match(
     mms_word: dict,
-    whisper_words: List[dict],
-    whisper_norm: List[str],
+    whisper_words: list[dict],
+    whisper_norm: list[str],
     search_start: int,
     search_end: int,
     config: LanguageConfig,
     max_time_diff: float = 2.0,
-) -> Optional[Tuple[int, float]]:
+) -> tuple[int, float] | None:
     """Find the best matching Whisper word for an MMS word.
 
     Searches whisper_words[search_start:search_end] for the closest match
@@ -582,16 +790,16 @@ MMS_FALLBACK_THRESHOLD = 0.3  # Default; overridden by config.mms_fallback_thres
 
 
 def fuse_words_per_word(
-    mms_words: List[dict],
-    whisper_words: List[dict],
-    verse_texts: List[str],
+    mms_words: list[dict],
+    whisper_words: list[dict],
+    verse_texts: list[str],
     book: str,
     chapter_str: str,
     config: LanguageConfig,
-    audio_path: Optional[Path] = None,
+    audio_path: Path | None = None,
     mms_components=None,
-    gap_fill_dir: Optional[Path] = None,
-) -> Tuple[List[dict], dict, dict]:
+    gap_fill_dir: Path | None = None,
+) -> tuple[list[dict], dict, dict]:
     """Per-word fusion: MMS primary, Whisper fallback only.
 
     MMS provides all word timestamps (aligned 1:1 with reference text).
@@ -617,7 +825,10 @@ def fuse_words_per_word(
         log(f"  Aramaic passage detected — using MMS-only (threshold={fallback_threshold})")
 
     # Detect spoken audio header (e.g. book title before verse text)
-    header_end, header_text = detect_audio_header(whisper_words, verse_texts, config)
+    _header_uroman = mms_components[4] if mms_components else None
+    header_end, _header_text = detect_audio_header(
+        whisper_words, verse_texts, config, uroman=_header_uroman,
+    )
     if header_end is not None:
         log(f"  Header detected: {header_end:.2f}s "
             f"(Whisper non-matching words before verse text)")
@@ -632,8 +843,11 @@ def fuse_words_per_word(
     if header_end is not None and mms_words:
         first = mms_words[0]
         # Only adjust if the first word starts well before the header end,
-        # indicating it absorbed the header audio (tolerance: 0.5s)
-        if first["start"] + 0.5 < header_end < first.get("end", first["start"]):
+        # indicating it absorbed the header audio (tolerance: 0.5s).
+        # first["start"] is None when MMS couldn't align this word at all
+        # (e.g. the whole-chapter CTC-infeasible fallback) — nothing to
+        # adjust in that case.
+        if first["start"] is not None and first["start"] + 0.5 < header_end < first.get("end", first["start"]):
             mms_words = list(mms_words)  # avoid mutating original
             mms_words[0] = {**first, "start": header_end}
 
@@ -646,10 +860,27 @@ def fuse_words_per_word(
 
     for mms_w in mms_words:
         mms_score = mms_w.get("score", 0.0)
+        # mms_w["start"]/["end"] are None when MMS couldn't align this word
+        # at all (e.g. mms_align_words.py's whole-chapter CTC-infeasible
+        # fallback — text too long for the audio's actual duration).
+        # score is already 0.0 in that case, so the fallback-threshold
+        # check below will prefer a real Whisper timestamp when one
+        # matches. For the remaining case (no Whisper match either),
+        # reuse the previous fused word's position rather than let None
+        # flow into the gap-detection/drift-correction arithmetic further
+        # down, which assumes real numbers throughout — same
+        # reuse-previous-timestamp fallback _map_mms_to_verses() already
+        # uses for this exact situation elsewhere in this file.
+        mms_start = mms_w["start"]
+        if mms_start is None:
+            mms_start = fused_words[-1]["start"] if fused_words else 0.0
+        mms_end = mms_w.get("end", mms_w["start"])
+        if mms_end is None:
+            mms_end = mms_start
         fused = {
             "text": mms_w["text"],
-            "start": mms_w["start"],
-            "end": mms_w.get("end", mms_w["start"]),
+            "start": mms_start,
+            "end": mms_end,
             "score": mms_score,
             "source": "mms",
             "whisper_score": None,
@@ -658,12 +889,12 @@ def fuse_words_per_word(
         # Search for a matching Whisper word (for fallback and diagnostics)
         search_end = min(whisper_search_start + 30, len(whisper_words))
         match = _find_whisper_match(
-            mms_w, whisper_words, whisper_norm,
+            fused, whisper_words, whisper_norm,
             whisper_search_start, search_end, config,
         )
 
         if match is not None:
-            w_idx, match_quality = match
+            w_idx, _match_quality = match
             w_word = whisper_words[w_idx]
             w_score = w_word.get("score", 0.0)
             fused["whisper_score"] = w_score
@@ -776,7 +1007,7 @@ def fuse_words_per_word(
                             log(f"  Gap fill rejected: new_start={new_start:.2f}s, "
                                 f"score={new_score:.2f}")
                 else:
-                    log(f"  Gap cannot be fixed (no MMS components available)")
+                    log("  Gap cannot be fixed (no MMS components available)")
                 break  # only handle one gap per iteration
 
         if not gap_found:
@@ -852,7 +1083,7 @@ def fuse_words_per_word(
             gap_text = " ".join(w["text"] for w in gap_words)
 
             bundle, model, tokenizer, aligner_obj, uroman_obj = mms_components
-            from mms_align_words import realign_from_point, load_audio
+            from mms_align_words import load_audio, realign_from_point
 
             log(f"  Re-running MMS on segment {restart_time:.1f}-{segment_end_time:.1f}s "
                 f"for {len(gap_words)} words around gap")
@@ -895,8 +1126,7 @@ def fuse_words_per_word(
                             fused_words[idx]["source"] = "mms_drift_fix"
                             improved += 1
                         elif abs(new_r["start"] - old_start) < 0.5:
-                            if new_r["score"] > fused_words[idx]["score"]:
-                                fused_words[idx]["score"] = new_r["score"]
+                            fused_words[idx]["score"] = max(fused_words[idx]["score"], new_r["score"])
 
                 if improved > 0:
                     drift_fixed += improved
@@ -916,11 +1146,11 @@ def fuse_words_per_word(
                                 "total_gap_words": len(gap_words),
                             }, df, indent=2)
                 else:
-                    log(f"  Drift re-alignment: no improvement found")
+                    log("  Drift re-alignment: no improvement found")
             elif new_results:
                 log(f"  Drift fix: word count mismatch ({len(new_results)} vs {len(gap_words)})")
             else:
-                log(f"  Drift fix: no results from re-alignment")
+                log("  Drift fix: no results from re-alignment")
 
             break  # only handle first drift per chapter
 
@@ -1010,10 +1240,9 @@ def fuse_words_per_word(
     mono_fixes = 0
     for vnum, times in word_timing["verses"].items():
         for i in range(1, len(times)):
-            if times[i] is not None and times[i - 1] is not None:
-                if times[i] < times[i - 1]:
-                    times[i] = times[i - 1]
-                    mono_fixes += 1
+            if times[i] is not None and times[i - 1] is not None and times[i] < times[i - 1]:
+                times[i] = times[i - 1]
+                mono_fixes += 1
 
     fusion_stats = {
         "total_words": len(fused_words),
@@ -1057,12 +1286,12 @@ def fuse_words_per_word(
 
 def discover_work_items(
     iso: str,
-    testament: Optional[str] = None,
+    testament: str | None = None,
     force: bool = False,
     redo_no_quality: bool = False,
-    book_filter: Optional[str] = None,
-    chapter_filter: Optional[int] = None,
-) -> List[dict]:
+    book_filter: str | None = None,
+    chapter_filter: int | None = None,
+) -> list[dict]:
     """Find chapters that have word timing data (MMS and/or Whisper).
 
     Scans word-timing-data/{canon}/{iso}/{distinct_id}/{book}/ for
@@ -1145,7 +1374,7 @@ def discover_work_items(
     return items
 
 
-def _parse_word_file(path: Path, suffix: str) -> Optional[Tuple[str, str, str]]:
+def _parse_word_file(path: Path, suffix: str) -> tuple[str, str, str] | None:
     """Parse a word timing filename into (book, chapter_str, audio_fileset)."""
     stem = path.stem.replace(suffix, "")
     parts = stem.split("_", 2)
@@ -1156,7 +1385,7 @@ def _parse_word_file(path: Path, suffix: str) -> Optional[Tuple[str, str, str]]:
 
 def _find_reference_text(
     canon: str, iso: str, distinct_id: str, book: str, chapter_str: str,
-) -> Optional[Path]:
+) -> Path | None:
     """Find the reference .txt file for a chapter."""
     for category in AUDIO_TEXT_CATEGORIES:
         base_dir = DOWNLOADS_DIR / canon / category / iso / distinct_id / book
@@ -1196,7 +1425,7 @@ def process_chapter(item: dict, config: LanguageConfig, mms_components=None) -> 
 
     # Read verse texts, stripping non-spoken markers
     with open(ref_text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f.readlines()]
+        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
     while verse_texts and not verse_texts[-1].strip():
         verse_texts.pop()
 
@@ -1250,7 +1479,7 @@ def process_chapter(item: dict, config: LanguageConfig, mms_components=None) -> 
         fusion_stats = None
     elif whisper_words:
         # Whisper only — use verse-level alignment
-        final_timing, final_word_timing, whisper_matched = _align_whisper_to_verses(
+        final_timing, final_word_timing, _whisper_matched = _align_whisper_to_verses(
             whisper_words, verse_texts, book, chapter_str, config,
         )
         source = "whisper"

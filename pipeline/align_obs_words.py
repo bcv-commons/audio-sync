@@ -70,9 +70,13 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
 
-from mms_align_words import load_audio, load_mms_model, realign_from_point, select_device
+from mms_align_words import (
+    load_audio,
+    load_mms_model,
+    realign_from_point,
+    select_device,
+)
 from obs_batch_manifest import fetch_story_text, get_stories, load_obs_batch
 from text_processing import clean_for_alignment, load_language_config, strip_markers
 
@@ -95,7 +99,7 @@ def log(message: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {message}")
 
 
-def parse_story_md(raw: str) -> List[str]:
+def parse_story_md(raw: str) -> list[str]:
     """Split an OBS story .md into its per-segment narration text.
 
     Segment boundaries are OBS-TLF's image markers (the only structural
@@ -145,13 +149,13 @@ def ensure_story_audio(iso: str, story_id: str, audio_url: str, force: bool = Fa
 
 def segment_anchored_align(
     audio_path: Path,
-    segments: List[str],
+    segments: list[str],
     config,
     bundle, model, tokenizer, aligner, uroman,
     window_frac: float = WINDOW_FRAC,
     min_window_seconds: float = MIN_WINDOW_SECONDS,
     min_local_score: float = MIN_LOCAL_SCORE,
-) -> List[dict]:
+) -> list[dict]:
     """Align each segment independently within a window anchored to an
     expected-pace position, instead of one continuous whole-file
     alignment. See module docstring for why.
@@ -287,7 +291,7 @@ def segment_anchored_align(
     return results
 
 
-def write_obs_timing_json(iso: str, story_id: str, results: List[dict], output_path: Path):
+def write_obs_timing_json(iso: str, story_id: str, results: list[dict], output_path: Path):
     entries = [
         {
             "story": story_id,
@@ -342,7 +346,7 @@ def process_story(
     }
 
 
-def write_run_manifest(iso: str, results: List[dict]) -> Path:
+def write_run_manifest(iso: str, results: list[dict]) -> Path:
     manifest = {
         "iso": iso,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

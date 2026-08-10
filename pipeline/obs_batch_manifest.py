@@ -48,10 +48,8 @@ import-spec.md's revision history for the full "why" behind the shape.
 from __future__ import annotations
 
 import json
-import os
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 _OBS_BATCH_DIRS = [Path("_obs_batches"), Path("data/_obs_batches")]
 
