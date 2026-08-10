@@ -550,6 +550,12 @@ Examples:
     )
     scope_group.add_argument("--book", type=str, default=None, help="Filter to a specific book (e.g. GEN)")
     scope_group.add_argument("--chapter", type=int, default=None, help="Filter to a specific chapter number")
+    scope_group.add_argument(
+        "--exclude-distinct-id", type=str, default=None,
+        help="Comma-separated distinct_id(s) to skip regardless of --iso/--iso-list "
+             "(e.g. PORB09) — for excluding a specific edition known to have bad "
+             "source data, without dropping the rest of that language.",
+    )
 
     # Whisper options
     whisper_group = parser.add_argument_group("Whisper options")
@@ -715,6 +721,21 @@ Examples:
 
     # Generate work items
     work_items = generate_work_items(languages, args.testament, refs_by_canon)
+
+    if args.exclude_distinct_id:
+        excluded = {d.strip().upper() for d in args.exclude_distinct_id.split(",") if d.strip()}
+        before = len(work_items)
+        # Placeholder items (distinct_id=None) haven't been resolved to a
+        # real edition yet, so they can't be excluded here — only known
+        # (already-downloaded) items have a distinct_id to match against.
+        work_items = [
+            w for w in work_items
+            if w["distinct_id"] is None or w["distinct_id"].upper() not in excluded
+        ]
+        skipped = before - len(work_items)
+        if skipped:
+            log(f"Excluded {skipped} work item(s) matching distinct_id(s): {', '.join(sorted(excluded))}")
+
     if not work_items:
         log("No syncable filesets found for the selected languages/testament", "WARN")
         sys.exit(0)
