@@ -429,7 +429,21 @@ def has_usable_text_source(iso: str, canon: str, distinct_id: str) -> bool:
     if text_source == "helloao" and source_id:
         return True
     catalog_fs = get_best_fileset_from_catalog(iso, canon, distinct_id)
-    return bool(catalog_fs and catalog_fs.get("text_fileset"))
+    if catalog_fs and catalog_fs.get("text_fileset"):
+        return True
+    # Neither DBT's catalog nor a verified helloAO match knows about this
+    # edition at all — true for any manually-imported edition that was
+    # never registered in an external catalog to begin with (e.g. BSB/Hays
+    # via josh/import_bsb_hays.py, or contrib/ imports). The catalog checks
+    # above only ever answer "is this discoverable externally", not "does
+    # real text already exist" — so before concluding "no usable text
+    # source", check disk directly for at least one already-downloaded
+    # text file. This is the same "trust what's already on disk" escape
+    # hatch the module docstring already promises for the CDN-unreachable
+    # case, just extended to editions that were never catalog-discoverable
+    # in the first place.
+    edition_dir = OUTPUT_DIR / canon.lower() / iso / distinct_id
+    return edition_dir.is_dir() and any(edition_dir.rglob("*.txt"))
 
 
 def _fetch_helloao_chapter(helloao_id, book, chapter_num, dest_path):

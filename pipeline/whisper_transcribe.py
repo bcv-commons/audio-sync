@@ -599,7 +599,16 @@ def discover_chapter_files(
             # from an older or unverified resolution attempt (only when the
             # catalog itself is reachable; if it's down, trust what's on
             # disk rather than discard everything).
-            if txt_candidates and catalog_available:
+            #
+            # Also requires expected_text_tags to be non-empty: an empty
+            # set means the catalog has no opinion at all about this
+            # specific edition (e.g. a manually-imported edition like BSB/
+            # Hays via josh/import_bsb_hays.py, never registered in DBT's
+            # catalog or a verified helloAO match to begin with) — that's
+            # "unknown", not "verified wrong". Only reject when the catalog
+            # actively disagrees with what's on disk, not when it simply
+            # has nothing to say about this edition.
+            if txt_candidates and catalog_available and expected_text_tags:
                 valid = [p for p in txt_candidates if _text_tag(p) in expected_text_tags]
                 if valid:
                     txt_candidates = valid
