@@ -599,6 +599,9 @@ def _match_header_boundary(
         the actual reading (omission) — without killing the whole run. Real
         matching content recovers and keeps extending; a genuinely wrong
         starting point can't recover twice in a row and stops immediately.
+        Also tolerates two reference words Whisper ran together into one
+        token (e.g. "Pada mulanya" -> "Padamulanya") — verified directly by
+        fuzzy-matching the concatenation, not a wildcard.
 
         As a last resort (at most once per run), tolerates one reference word
         Whisper garbled beyond recognition — e.g. split into unrelated
@@ -635,11 +638,31 @@ def _match_header_boundary(
                 wi + 1 < len(whisper_norm)
                 and word_match(ref_words[ri], whisper_norm[wi + 1])
             )
+            # Mirror image of the split-word wildcard below: Whisper
+            # sometimes runs two reference words together into one token
+            # (e.g. reference "Pada mulanya" transcribed as one word
+            # "Padamulanya") instead of splitting one word into several.
+            # Unlike the wildcard, this has direct positive evidence (the
+            # concatenation must itself pass the same fuzzy-match ratio), so
+            # it counts as a verified match rather than needing post-hoc
+            # confirmation.
+            merge_ok = (
+                ri + 1 < len(ref_words)
+                and word_match(ref_words[ri] + ref_words[ri + 1], whisper_norm[wi])
+            )
             if skip_ref_ok:
                 ri += 1
                 skips_used += 1
                 continue
             if skip_wh_ok:
+                wi += 1
+                skips_used += 1
+                continue
+            if merge_ok:
+                run += 1
+                if wildcard_used:
+                    post_wildcard_run += 1
+                ri += 2
                 wi += 1
                 skips_used += 1
                 continue

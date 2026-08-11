@@ -205,6 +205,15 @@ ISO639_3_TO_WHISPER = {
     "hin": "hi",
     "ben": "bn",
     "uzn": "uz",
+    "pan": "pa",  # was missing entirely -> get_whisper_language() returned
+                  # None -> Whisper ran in auto-detect mode with no language
+                  # hint -> transcribed real Punjabi (Gurmukhi-script) audio
+                  # as Latin-script transliteration instead of native script,
+                  # confirmed directly against real PANDPI audio (e.g. MAT 1:
+                  # "Matti di injeel adaye ek Yessu di wansha wali Yessu"
+                  # instead of Gurmukhi text) — broke every downstream
+                  # Whisper-text comparison (header detection, fallback
+                  # matching) for the whole language.
 }
 
 # Book definitions (from download_language_content.py)
@@ -835,6 +844,19 @@ def transcribe_audio(
         kwargs = {
             "path_or_hf_repo": model_name,
             "word_timestamps": True,
+            # Whisper's well-documented hallucination failure mode: on long
+            # silence/music it repeats a generic phrase seen often in
+            # training data (confirmed directly 2026-08-10 against real
+            # audio — Indonesian INDASV chapters producing "Terima kasih
+            # kerana menonton" / "Thank you for watching" once per ~30s
+            # chunk of silence). This tells the decoder to detect and
+            # re-skip silence around a likely hallucination instead of
+            # accepting it — verified bit-identical output on a normal
+            # chapter (CHNCNV GEN 1, no regression) while fully recovering
+            # real content on 3/3 known-hallucinating chapters, including a
+            # real spoken header that a cruder vad_filter-based fix (tested
+            # first, faster-whisper-only) discarded along with the silence.
+            "hallucination_silence_threshold": 2.0,
         }
         if language:
             kwargs["language"] = language
@@ -867,6 +889,14 @@ def transcribe_audio(
         str(audio_path),
         language=language,
         word_timestamps=True,
+        # See the matching MLX-path comment above — same fix, same
+        # verification (3/3 hallucinating chapters fixed, bit-identical
+        # output on a normal chapter). Requires word_timestamps=True (set
+        # above), so not carried into the word_timestamps=False retry
+        # below — that path is already a degraded fallback for a different
+        # bug and hallucination detection needs the word-level timing this
+        # retry deliberately does without.
+        hallucination_silence_threshold=2.0,
     )
 
     # Convert faster-whisper output to openai-whisper-compatible dict.
