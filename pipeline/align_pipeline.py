@@ -588,6 +588,15 @@ Examples:
              "Default: per-device (CPU=5 min, CUDA=2 min, MPS=1 min), or conf/hw.local.json's "
              "mms_chunk_minutes.",
     )
+    mms_group.add_argument(
+        "--ctc-chunk-cells", type=int, default=hw["ctc_chunk_threshold_cells"],
+        help="DP-table (frames x tokens) size above which an oversized chapter is split "
+             "into adaptive chunks before CTC alignment, to avoid a torchaudio segfault on "
+             "very long chapters. This is a crash-safety ceiling, not a runtime target — "
+             "lower it on slow/CPU hardware for more evenly-sized, faster-per-chunk (but "
+             "more boundary-transition) chunks; leave at the 300M default on GPU hardware. "
+             "Default: conf/hw.local.json's ctc_chunk_threshold_cells (300,000,000 built-in).",
+    )
 
     # Processing options
     proc_group = parser.add_argument_group("Processing options")
@@ -627,8 +636,11 @@ Examples:
         import whisper_transcribe as _wt
         _wt._WHISPER_FORCE_CPU = True
 
-    # Apply --mms-cpu / --mms-chunk-minutes flags to mms_align_words module state.
-    if getattr(args, "mms_cpu", False) or getattr(args, "mms_chunk_minutes", None) is not None:
+    # Apply --mms-cpu / --mms-chunk-minutes / --ctc-chunk-cells flags to
+    # mms_align_words module state.
+    if (getattr(args, "mms_cpu", False)
+            or getattr(args, "mms_chunk_minutes", None) is not None
+            or getattr(args, "ctc_chunk_cells", None) is not None):
         import mms_align_words as _mms
         if getattr(args, "mms_cpu", False):
             _mms._MMS_FORCE_CPU = True
@@ -636,6 +648,11 @@ Examples:
             _mms._MAX_CHUNK_SAMPLES = int(args.mms_chunk_minutes * 60 * 16000)
             log(f"MMS chunk size set to {args.mms_chunk_minutes:.1f} min "
                 f"({_mms._MAX_CHUNK_SAMPLES:,} samples)")
+        if getattr(args, "ctc_chunk_cells", None) is not None:
+            if args.ctc_chunk_cells != _mms._CTC_CHUNK_THRESHOLD_CELLS:
+                log(f"CTC chunk threshold set to {args.ctc_chunk_cells:,} cells "
+                    f"(built-in default 300,000,000)")
+            _mms._CTC_CHUNK_THRESHOLD_CELLS = args.ctc_chunk_cells
 
     # Validate selection
     if not any([args.iso, args.iso_list, args.tier is not None, args.all]):

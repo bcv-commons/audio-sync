@@ -238,6 +238,14 @@ FRAMES_PER_SECOND = 50.0
 # rare fallback path (a handful of unusually long chapters across the
 # whole corpus), not a change to normal-case behavior. See
 # _align_or_chunk()/_align_chapter_chunked() below.
+#
+# This is a crash-safety ceiling, not a runtime target — greedy chunk
+# packing prefers the largest chunk that stays under it, so on slow/CPU
+# hardware a near-maximal chunk (e.g. 65 of 66 verses in one chunk) can
+# still take a long time despite never risking the crash. Override via
+# --ctc-chunk-cells or conf/hw.local.json's ctc_chunk_threshold_cells for
+# more evenly-sized (but more boundary-transition) chunks on slow boxes;
+# 300M is calibrated safe to leave as the default for GPU hardware.
 _CTC_CHUNK_THRESHOLD_CELLS = 300_000_000
 
 
@@ -1081,6 +1089,15 @@ def main():
              "Default: per-device (CPU=5 min, CUDA=2 min, MPS=1 min), or conf/hw.local.json's "
              "mms_chunk_minutes.",
     )
+    parser.add_argument(
+        "--ctc-chunk-cells", type=int, default=hw["ctc_chunk_threshold_cells"],
+        help="DP-table (frames x tokens) size above which an oversized chapter is split "
+             "into adaptive chunks before CTC alignment, to avoid a torchaudio segfault on "
+             "very long chapters. This is a crash-safety ceiling, not a runtime target — "
+             "lower it on slow/CPU hardware for more evenly-sized, faster-per-chunk (but "
+             "more boundary-transition) chunks; leave at the 300M default on GPU hardware. "
+             "Default: conf/hw.local.json's ctc_chunk_threshold_cells (300,000,000 built-in).",
+    )
 
     args = parser.parse_args()
 
@@ -1093,6 +1110,13 @@ def main():
         _self._MAX_CHUNK_SAMPLES = int(args.mms_chunk_minutes * 60 * 16000)
         log(f"MMS chunk size set to {args.mms_chunk_minutes:.1f} min "
             f"({_self._MAX_CHUNK_SAMPLES:,} samples)")
+
+    if getattr(args, "ctc_chunk_cells", None) is not None:
+        import mms_align_words as _self
+        if args.ctc_chunk_cells != _self._CTC_CHUNK_THRESHOLD_CELLS:
+            log(f"CTC chunk threshold set to {args.ctc_chunk_cells:,} cells "
+                f"(built-in default 300,000,000)")
+        _self._CTC_CHUNK_THRESHOLD_CELLS = args.ctc_chunk_cells
 
     log("=" * 60)
     log(f"MMS Forced Alignment — {args.iso or 'all languages'}")

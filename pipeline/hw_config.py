@@ -37,6 +37,21 @@ _DEFAULTS: dict[str, Any] = {
     "mms_cpu": False,
     "mms_chunk_minutes": None,    # None -> mms_align_words.py's per-device default
     "mms_device": None,           # None -> auto (cuda > mps > cpu)
+    "ctc_chunk_threshold_cells": 300_000_000,
+                                   # DP-table (frames x tokens) size above which an oversized
+                                   # chapter gets split into adaptive chunks before CTC
+                                   # alignment (see mms_align_words.py's
+                                   # _CTC_CHUNK_THRESHOLD_CELLS comment for the crash-safety
+                                   # calibration this default is based on). That calibration
+                                   # is a *safety* ceiling, not a runtime target — greedy
+                                   # packing prefers the largest safe chunk, which on a weak
+                                   # CPU can still mean one chunk covering nearly the whole
+                                   # chapter (e.g. 65 of 66 verses) and taking a long time
+                                   # despite never risking the crash. Lower this on slow/CPU
+                                   # boxes for more evenly-sized, faster-per-chunk (but more
+                                   # boundary-transition) alignment; the 300M default is safe
+                                   # to leave as-is on GPU hardware, where even a near-maximal
+                                   # chunk computes quickly.
     "parallel_workers": 1,        # shard_align.py's default worker count — 1 = sequential,
                                    # identical to running align_pipeline.py directly. Only
                                    # raise this after testing (see mms_chunk_minutes' note
