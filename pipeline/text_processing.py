@@ -68,6 +68,14 @@ def load_language_config(iso: str) -> LanguageConfig:
     return config
 
 
+def format_verse_id(book: str, chapter_str: str) -> str:
+    """Build the compact "id" field used by the word-timing JSON format:
+    "<BOOK> <chapter>", chapter without zero-padding (e.g. "NUM 7", not
+    "NUM 007").
+    """
+    return f"{book} {int(chapter_str)}"
+
+
 def is_aramaic_chapter(book: str, chapter: int, config: LanguageConfig) -> bool:
     """Check if a book/chapter overlaps with a configured Aramaic passage.
 

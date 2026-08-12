@@ -72,14 +72,36 @@ if [ "${DRY_RUN:-}" = "1" ]; then
     echo "[DRY RUN] No files will be written to CDN."
 fi
 
+# ── Pre-publish plausibility gate ──
+# Scans for chapters with a backwards timestamp jump (verse N+1 timestamped
+# earlier than verse N — never legitimate, always a mis-alignment; see the
+# ENGBSB/ZLMAVB ISA 51 case in session history that motivated this check).
+# Quarantines just the flagged chapters rather than blocking the whole
+# publish — see tools/pre_publish_check.py's docstring for the reasoning
+# and why this is scoped to backwards-only, not the fuller dupes/gaps
+# signal set check_timing_quality.py also tracks (those need per-chapter
+# score cross-referencing to tell a real issue from a legitimate one).
+QUARANTINE_FILE="_runs/pre_publish_quarantine.txt"
+python3 tools/pre_publish_check.py --out "$QUARANTINE_FILE"
+
 # ── Pass 1: timing-data tree -> align/<canon>/<iso>/<version>/<BOOK>/ ──
 # Local layout already mirrors the CDN layout 1:1 (see internal-docs/
-# audio-sync-interface.md §3), so this is a plain recursive copy.
+# audio-sync-interface.md §3), so this is a plain recursive copy — except
+# for two file types that stay local-only:
+#   *_words_quality.json — per-word confidence/source, only consumed by
+#     this repo's own tooling (tools/quality_report.py,
+#     check_timing_quality.py, requeue_dupes_chapters.py, compare_timing.py)
+#   *.srt — no longer generated at all (see whisper_transcribe.py); excluded
+#     here too so any already-on-disk leftovers from before that change
+#     don't get published on a future run.
 echo "── Publishing $TIMING_SOURCE_DIR -> cdn.bibel.wiki/${CDN_PREFIX}/ ..."
 rclone copy "$TIMING_SOURCE_DIR" "$REMOTE" \
     --header-upload "Cache-Control: max-age=3600" \
     --transfers 16 \
     --checkers 16 \
+    --exclude "**/*_words_quality.json" \
+    --exclude "**/*.srt" \
+    --exclude-from "$QUARANTINE_FILE" \
     $DRY_FLAG \
     -v
 

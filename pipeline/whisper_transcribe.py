@@ -5,9 +5,8 @@ Whisper-based Bible audio transcription pipeline (Step 1 of 2).
 Transcribes audio using Whisper and saves the raw word-level timeline.
 Verse alignment is done separately by language-specific scripts (Step 2).
 
-For each chapter, two output files are generated:
+For each chapter, one output file is generated:
   - _whisper_words.json : raw word timeline in word-timing-data/ (for alignment)
-  - .srt                : SRT subtitle file in export/timing-data/
 
 By default, the script automatically:
 1. Scans all templates under templates/ to determine which chapters are needed
@@ -214,6 +213,20 @@ ISO639_3_TO_WHISPER = {
                   # instead of Gurmukhi text) — broke every downstream
                   # Whisper-text comparison (header detection, fallback
                   # matching) for the whole language.
+    "azb": "az",  # was also missing entirely, same class of bug as "pan"
+                  # above. Unlike "pan" though, confirmed this is a no-op in
+                  # practice: explicit language="az" produces byte-identical
+                  # output to the current auto-detect behavior (both
+                  # transcribe real Perso-Arabic-script South Azerbaijani
+                  # audio as Latin-script transliteration) — Whisper's "az"
+                  # model appears trained primarily on Latin-script Northern
+                  # Azerbaijani and doesn't know how to output Perso-Arabic
+                  # regardless of hint. Kept anyway for general robustness
+                  # (explicit beats auto-detect against occasional
+                  # misdetection elsewhere in the corpus), but this alone
+                  # does not fix the script mismatch — that's a genuine
+                  # Whisper model limitation, not something in this
+                  # pipeline's control.
 }
 
 # Book definitions (from download_language_content.py)
@@ -662,8 +675,6 @@ def discover_chapter_files(
                 whisper_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / file_book
                 whisper_words_filename = f"{file_book}_{chapter_str}_{audio_fileset}_whisper_words.json"
                 whisper_words_path = whisper_book_dir / whisper_words_filename
-                srt_filename = f"{file_book}_{chapter_str}_{audio_fileset}.srt"
-                srt_path = out_book_dir / srt_filename
 
                 # Skip only if the chapter is fully complete (final fused
                 # output already exists) — NOT merely because Whisper's
@@ -687,7 +698,6 @@ def discover_chapter_files(
                     "audio_fileset": audio_fileset,
                     "text_fileset": text_fileset,
                     "whisper_words_path": whisper_words_path,
-                    "srt_path": srt_path,
                     "whisper_prefer": audio_fileset == whisper_fileset,
                     "is_drama": is_drama,
                 })
@@ -1337,43 +1347,6 @@ def write_whisper_words_json(
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ─── SRT Generation ────────────────────────────────────────────────────
-
-def format_srt_time(seconds: float) -> str:
-    """Format seconds to SRT timestamp: HH:MM:SS,mmm"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = round((seconds - int(seconds)) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def segments_to_srt(segments: list[dict]) -> str:
-    """Convert Whisper segments to SRT subtitle format."""
-    lines = []
-    for i, seg in enumerate(segments, start=1):
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        start = format_srt_time(seg["start"])
-        end = format_srt_time(seg["end"])
-        lines.append(f"{i}")
-        lines.append(f"{start} --> {end}")
-        lines.append(text)
-        lines.append("")
-    return "\n".join(lines)
-
-
-def write_srt(segments: list[dict], output_path: Path):
-    """Write Whisper segments as an SRT subtitle file."""
-    srt_content = segments_to_srt(segments)
-    if not srt_content:
-        return
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
-
-
 # ─── Output ─────────────────────────────────────────────────────────────────
 
 def write_timing_json(entries: list[dict], output_path: Path):
@@ -1396,7 +1369,6 @@ def process_chapter(
 
     Generates:
       - _whisper_words.json in word-timing-data/ (raw word timeline for alignment)
-      - .srt in export/timing-data/ (subtitle file)
 
     Alignment to verses (_timing.json, _words.json) is done separately by
     language-specific alignment scripts (e.g. align_words.py).
@@ -1410,7 +1382,6 @@ def process_chapter(
     chapter_num = chapter["chapter"]
     audio_path = chapter["audio_path"]
     whisper_words_path = chapter["whisper_words_path"]
-    srt_path = chapter["srt_path"]
 
     # Transcribe (always with word timestamps)
     start_time = time.time()
@@ -1425,7 +1396,6 @@ def process_chapter(
 
     # Write outputs
     write_whisper_words_json(word_timeline, book, str(chapter_num), whisper_words_path)
-    write_srt(segments, srt_path)
 
     return {
         "duration": duration,

@@ -61,6 +61,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -78,7 +79,7 @@ from download_language_content import (
     has_usable_text_source,
 )
 from hw_config import load_hw_config
-from text_processing import load_language_config
+from text_processing import CONFIG_DIR, load_language_config
 from whisper_transcribe import (
     _USE_CUDA,
     _USE_MLX,
@@ -320,6 +321,134 @@ def run_verse_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, con
     """
     from align_verse_words import process_chapter_verse_only
     return process_chapter_verse_only(item, bundle, model, tokenizer, aligner, uroman, config)
+
+
+# ─── Auto verse-only-mode detection ──────────────────────────────────────
+# Automates the investigation that produced config/languages/hin.toml by
+# hand: when Whisper's transcript doesn't text-match the reference at all
+# for a language (wrong script, hallucination, or a model with no real
+# support for it), it does more harm than good as a guide for header
+# detection and fusion's Whisper-fallback/gap-fill. Watches two signals
+# that are already computed as a side effect of the normal pipeline (no
+# extra compute): detect_audio_header()'s per-chapter match/no-match
+# outcome, and the fraction of fused words fusion actually sourced from
+# Whisper. Once both cross threshold over a large enough sample for a
+# language, it's switched to verse_only_mode for the rest of THIS run
+# (skips Whisper for its remaining chapters) and the switch is persisted to
+# config/languages/<iso>.toml so future runs start in verse-only mode from
+# the first chapter — same mechanism as hin's manual flag, just reached
+# automatically instead of via a one-off full-corpus scan.
+AUTO_VERSE_ONLY_MIN_CHAPTERS = 8
+AUTO_VERSE_ONLY_HEADER_FAIL_RATE = 0.8
+AUTO_VERSE_ONLY_WHISPER_FRAC = 0.05
+
+
+def _record_header_check(tracker: dict, iso: str, header_found: bool) -> None:
+    t = tracker.setdefault(
+        iso, {"header_checked": 0, "header_fail": 0, "whisper_fracs": [], "flagged": False},
+    )
+    t["header_checked"] += 1
+    if not header_found:
+        t["header_fail"] += 1
+
+
+def _record_whisper_frac(tracker: dict, iso: str, from_whisper: int, total_words: int) -> None:
+    if total_words <= 0:
+        return
+    t = tracker.setdefault(
+        iso, {"header_checked": 0, "header_fail": 0, "whisper_fracs": [], "flagged": False},
+    )
+    t["whisper_fracs"].append(from_whisper / total_words)
+
+
+def _write_auto_verse_only_config(
+    iso: str, header_fail_rate: float, header_n: int, whisper_frac: float, frac_n: int,
+) -> None:
+    """Persist an auto-detected verse_only_mode=true to config/languages/<iso>.toml.
+
+    If the file already exists (hand-curated pronunciation_map, etc.),
+    patches just the verse_only_mode key rather than overwriting the file —
+    tomllib (stdlib) is read-only, so this edits the text directly rather
+    than pulling in a TOML-writer dependency for one key.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    comment = (
+        f"# Auto-detected {timestamp}: Whisper's transcript doesn't text-match\n"
+        f"# the reference for this language (header-detect fail rate "
+        f"{header_fail_rate:.0%} over {header_n} chapters, avg fused-word\n"
+        f"# share sourced from Whisper {whisper_frac:.1%} over {frac_n} chapters) —\n"
+        f"# an unreliable guide there does more harm than none at all (same\n"
+        f"# signal class as hin.toml's manually-confirmed case). Re-verify if\n"
+        f"# this looks wrong — thresholds are in align_pipeline.py's\n"
+        f"# AUTO_VERSE_ONLY_* constants.\n"
+        f"#\n"
+        f"# verse_only_mode skips Whisper entirely for this language and uses\n"
+        f"# align_verse_words.py's windowed, verse-anchored MMS-only alignment\n"
+        f"# instead (see pipeline/align_verse_words.py's module docstring).\n"
+    )
+    config_path = CONFIG_DIR / f"{iso}.toml"
+    if config_path.exists():
+        text = config_path.read_text(encoding="utf-8")
+        if re.search(r"(?m)^\s*verse_only_mode\s*=", text):
+            # Already a root-level key somewhere in the file — a bare
+            # substitution is safe since it stays exactly where it was
+            # (still before any [table] header, or TOML would already be
+            # broken).
+            text = re.sub(r"(?m)^\s*verse_only_mode\s*=.*$", "verse_only_mode = true", text)
+        else:
+            block = comment + "verse_only_mode = true\n"
+            # New root-level keys must land before the first [table]
+            # header — TOML scopes every bare `key = value` line to
+            # whichever [section] most recently opened above it, so
+            # appending at end-of-file would silently nest this inside
+            # the last table (e.g. [pronunciation_map]) instead of the
+            # document root.
+            table_match = re.search(r"(?m)^\[", text)
+            if table_match:
+                insert_at = table_match.start()
+                text = text[:insert_at] + block + "\n" + text[insert_at:]
+            else:
+                text = text.rstrip("\n") + "\n\n" + block
+    else:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        text = comment + "verse_only_mode = true\n"
+    config_path.write_text(text, encoding="utf-8")
+
+
+def _maybe_auto_flag_verse_only(tracker: dict, iso: str, config, lang_name: str) -> bool:
+    """Check accumulated signals for `iso`; if both cross threshold, flip
+    config.verse_only_mode in place (config is the cached LanguageConfig
+    instance shared across this whole run — see
+    text_processing.load_language_config — so this takes effect immediately
+    for this and every other work item with the same iso in this run) and
+    persist the switch to config/languages/<iso>.toml for future runs.
+
+    Returns True if this call is the one that just flagged it.
+    """
+    t = tracker.get(iso)
+    if not t or t["flagged"] or config.verse_only_mode:
+        return False
+    if (t["header_checked"] < AUTO_VERSE_ONLY_MIN_CHAPTERS
+            or len(t["whisper_fracs"]) < AUTO_VERSE_ONLY_MIN_CHAPTERS):
+        return False
+
+    header_fail_rate = t["header_fail"] / t["header_checked"]
+    avg_whisper_frac = sum(t["whisper_fracs"]) / len(t["whisper_fracs"])
+    if (header_fail_rate < AUTO_VERSE_ONLY_HEADER_FAIL_RATE
+            or avg_whisper_frac >= AUTO_VERSE_ONLY_WHISPER_FRAC):
+        return False
+
+    t["flagged"] = True
+    config.verse_only_mode = True
+    log(f"  {iso} ({lang_name}): Whisper output looks unusable as a guide "
+        f"(header-detect fail rate {header_fail_rate:.0%} over {t['header_checked']} "
+        f"chapters, avg whisper word-share in fusion {avg_whisper_frac:.1%} over "
+        f"{len(t['whisper_fracs'])} chapters) — auto-switching to verse_only_mode "
+        f"for the rest of this run and persisting to config/languages/{iso}.toml",
+        "WARN")
+    _write_auto_verse_only_config(iso, header_fail_rate, t["header_checked"],
+                                   avg_whisper_frac, len(t["whisper_fracs"]))
+    return True
 
 
 # ─── Contract B — run manifest + publish ────────────────────────────────
@@ -602,6 +731,16 @@ Examples:
     proc_group = parser.add_argument_group("Processing options")
     proc_group.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     proc_group.add_argument("--force", action="store_true", help="Re-process even if output exists")
+    proc_group.add_argument("--force-fusion", action="store_true",
+        help="Re-run only the fusion step (Step 2) even if _timing.json/_words.json "
+             "already exist, without forcing Whisper or MMS to redo their own "
+             "already-done work (those still respect their normal skip-if-exists "
+             "check, same as when --force is not passed). MMS's model still loads "
+             "normally (unless --skip-mms), so fusion's gap-fill re-alignment stays "
+             "available. For bulk re-serializing already-aligned chapters into a "
+             "changed output format from cached word-timing-data/ alone — combine "
+             "with --skip-whisper for a purely cache-driven pass with zero new "
+             "Whisper/MMS inference.")
     proc_group.add_argument("--check-audio", action="store_true", help="Only report audio availability")
     proc_group.add_argument("--no-download", action="store_true",
         help="Skip auto-download, only process already-downloaded files")
@@ -894,6 +1033,7 @@ Examples:
     }
     run_results = []  # Contract B run-manifest entries: one per chapter that
     # either finished fusion or failed at any step (download, whisper, mms, fusion)
+    lang_whisper_reliability = {}  # iso -> tracker dict, see _maybe_auto_flag_verse_only
 
     pipeline_start = time.time()
 
@@ -962,7 +1102,7 @@ Examples:
             # prefetch is meant to help.
             chapters, skipped = discover_chapter_files(
                 iso, canon, distinct_id, args.output_dir,
-                force=args.force,
+                force=args.force or args.force_fusion,
                 required_chapters=None,
             )
             total_stats["chapters_skipped"] += skipped
@@ -1005,7 +1145,7 @@ Examples:
                 for book, ch in wanted:
                     ch_list, ch_skipped = discover_chapter_files(
                         iso, canon, distinct_id, args.output_dir,
-                        force=args.force, required_chapters={book: {ch}},
+                        force=args.force or args.force_fusion, required_chapters={book: {ch}},
                     )
                     skipped += ch_skipped
                     chapters.extend(ch_list)
@@ -1072,7 +1212,7 @@ Examples:
                         # in the compute loop below (unchanged from before).
                         ch_list, ch_skipped = discover_chapter_files(
                             iso, canon, distinct_id, args.output_dir,
-                            force=args.force, required_chapters={book: {ch}},
+                            force=args.force or args.force_fusion, required_chapters={book: {ch}},
                         )
                         total_stats["chapters_skipped"] += ch_skipped
                         for ch_dict in ch_list:
@@ -1212,6 +1352,7 @@ Examples:
                         if verse_start:
                             header_skip_time = verse_start
                             log(f"{label} Header detected ({header_skip_time:.1f}s): \"{header_text}\"")
+                        _record_header_check(lang_whisper_reliability, iso, header_found=verse_start is not None)
 
                 # ── Step 1b: MMS ──
                 if not args.skip_mms:
@@ -1245,18 +1386,24 @@ Examples:
                         chapter, canon, iso, distinct_id, args.output_dir,
                     )
 
-                    # Check if fusion output is stale (inputs newer than output)
+                    # Check if fusion output is stale (inputs newer than output).
+                    # --force-fusion behaves like --force for this check only —
+                    # it does NOT flow into MMS's/Whisper's own needs_run() calls
+                    # above, which still key off args.force alone.
+                    force_fusion_step = args.force or args.force_fusion
                     timing_path = fusion_item["timing_path"]
                     timing_existed = timing_path.exists()
-                    fusion_stale = timing_existed and not args.force and needs_run(
+                    fusion_stale = timing_existed and not force_fusion_step and needs_run(
                         timing_path, fusion_item["mms_path"], fusion_item["whisper_path"],
                     )
 
-                    if timing_existed and not args.force and not fusion_stale:
+                    if timing_existed and not force_fusion_step and not fusion_stale:
                         log(f"{label} Fusion: skipped (exists)")
                     else:
                         if fusion_stale:
                             log(f"{label} Fusion: re-running (inputs updated)")
+                        elif args.force_fusion and not args.force and timing_existed:
+                            log(f"{label} Fusion: re-running (--force-fusion)")
                         # Check that at least one source exists
                         if not fusion_item["mms_path"] and not fusion_item["whisper_path"]:
                             log(f"{label} Fusion: no MMS or Whisper data available", "WARN")
@@ -1283,6 +1430,10 @@ Examples:
                                     parts.append(
                                         f"{fs['from_whisper']}/{fs['total_words']} from whisper"
                                     )
+                                    _record_whisper_frac(
+                                        lang_whisper_reliability, iso,
+                                        fs["from_whisper"], fs["total_words"],
+                                    )
                                 if stats.get("quality"):
                                     q = stats["quality"]
                                     parts.append(f"avg={q['avg_score']}")
@@ -1300,6 +1451,8 @@ Examples:
                                     "mms": stats.get("mms_score"),
                                     "verses": stats.get("verses"),
                                 })
+
+                    _maybe_auto_flag_verse_only(lang_whisper_reliability, iso, config, lang_name)
 
             except KeyboardInterrupt:
                 log("Interrupted by user — stopping pipeline", "WARN")

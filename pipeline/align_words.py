@@ -42,6 +42,7 @@ from pathlib import Path
 from text_processing import (
     LanguageConfig,
     clean_for_alignment,
+    format_verse_id,
     is_aramaic_chapter,
     load_language_config,
     normalize_text,
@@ -89,11 +90,27 @@ def load_word_timeline(path: Path) -> list[dict]:
     return words
 
 
-def write_timing_json(entries: list[dict], output_path: Path):
-    """Write verse timing data in the standard format."""
+def write_timing_json(timing: dict, output_path: Path):
+    """Write compact verse-level timing data.
+
+    Shape: {"id": "NUM 7", "intro_end": 5.16, "pos": [6.64, 10.34, ...]}
+    pos[i] is verse (i+1)'s start timestamp — pos[0] is verse 1, not verse
+    0: a dedicated verse-0 slot was considered and dropped, since a genuine
+    numbered verse 0 (e.g. an original-language Psalm superscription
+    counted as verse 0 in some editions) would always start exactly at
+    intro_end (or 0/absent if no intro) anyway — nothing it could hold
+    isn't already derivable from intro_end plus pos[0]. intro_end is
+    present only when a spoken audio-production intro (not scripture) was
+    detected and skipped; absent, not null, when none was detected.
+
+    A future org_intro_end (original-language front matter, e.g. a Psalm
+    superscription merged into verse 1's own text) belongs here too, once a
+    per-edition data source can identify it — not implemented yet, see
+    align_pipeline.py session notes.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2)
+        json.dump(timing, f, separators=(",", ":"))
 
 
 def write_word_timing_json(word_timing: dict, output_path: Path):
@@ -118,40 +135,33 @@ def _map_mms_to_verses(
     book: str,
     chapter_str: str,
     config: LanguageConfig,
-) -> tuple[list[dict], dict, int]:
+) -> tuple[dict, dict, int]:
     """Map flat MMS word results to verse boundaries.
 
     The MMS words are aligned 1:1 with the cleaned reference text words
     (after strip_markers + clean_for_alignment), so we count words per
     verse and slice accordingly.
 
-    Returns (timing_entries, word_timing, verse_count).
-    """
-    timing_entries = [{
-        "book": book,
-        "chapter": chapter_str,
-        "verse_start": "0",
-        "verse_start_alt": "0",
-        "timestamp": 0,
-    }]
-    word_timing = {"book": book, "chapter": chapter_str, "verses": {}, "verse_ends": {}}
+    No Whisper transcript is available in this (MMS-only) path, so no
+    audio-intro detection is possible here — intro_end is never set;
+    see write_timing_json()'s docstring for the compact shape.
 
+    Returns (timing, word_timing, verse_count).
+    """
+    pos = []  # pos[i] is verse (i+1)'s timestamp — see write_timing_json()
+    timing = {"id": format_verse_id(book, chapter_str), "pos": pos}
+    word_timing = {"id": format_verse_id(book, chapter_str), "beg": {}, "end": {}}
+
+    prev_time = 0.0
     word_idx = 0
     for vi, verse_text in enumerate(verse_texts):
         verse_num = vi + 1
         cleaned = clean_for_alignment(verse_text, config)
 
         if not cleaned:
-            prev_time = timing_entries[-1]["timestamp"]
-            timing_entries.append({
-                "book": book,
-                "chapter": chapter_str,
-                "verse_start": str(verse_num),
-                "verse_start_alt": str(verse_num),
-                "timestamp": round(prev_time, 2),
-            })
-            word_timing["verses"][str(verse_num)] = []
-            word_timing["verse_ends"][str(verse_num)] = []
+            pos.append(round(prev_time, 2))
+            word_timing["beg"][str(verse_num)] = []
+            word_timing["end"][str(verse_num)] = []
             continue
 
         verse_word_count = len(cleaned.split())
@@ -164,15 +174,10 @@ def _map_mms_to_verses(
                 verse_time = w["start"]
                 break
         if verse_time is None:
-            verse_time = timing_entries[-1]["timestamp"]
+            verse_time = prev_time
 
-        timing_entries.append({
-            "book": book,
-            "chapter": chapter_str,
-            "verse_start": str(verse_num),
-            "verse_start_alt": str(verse_num),
-            "timestamp": round(verse_time, 2),
-        })
+        pos.append(round(verse_time, 2))
+        prev_time = verse_time
 
         word_times = []
         word_end_times = []
@@ -186,12 +191,12 @@ def _map_mms_to_verses(
                 word_end_times.append(round(end_val, 2))
             else:
                 word_end_times.append(None)
-        word_timing["verses"][str(verse_num)] = word_times
-        word_timing["verse_ends"][str(verse_num)] = word_end_times
+        word_timing["beg"][str(verse_num)] = word_times
+        word_timing["end"][str(verse_num)] = word_end_times
 
         word_idx += verse_word_count
 
-    return timing_entries, word_timing, len(verse_texts)
+    return timing, word_timing, len(verse_texts)
 
 
 # ─── Whisper Verse Alignment ───────────────────────────────────────────────
@@ -224,12 +229,23 @@ def _align_whisper_to_verses(
     book: str,
     chapter_str: str,
     config: LanguageConfig,
-) -> tuple[list[dict], dict, int]:
+    uroman=None,
+) -> tuple[dict, dict, int]:
     """Align Whisper word timeline to verse boundaries using fuzzy matching.
 
-    Returns (timing_entries, word_timing, matched_verse_count).
+    Returns (timing, word_timing, matched_verse_count).
     """
-    word_timing = {"book": book, "chapter": chapter_str, "verses": {}, "verse_ends": {}}
+    word_timing = {"id": format_verse_id(book, chapter_str), "beg": {}, "end": {}}
+
+    # Detect spoken audio-production intro (e.g. book/chapter title, music)
+    # before verse text — same signal fuse_words_per_word() uses, computed
+    # here too since this path has its own independent Whisper transcript.
+    header_end, _header_text = detect_audio_header(
+        whisper_words, verse_texts, config, uroman=uroman,
+    )
+    if header_end is not None:
+        log(f"  Header detected: {header_end:.2f}s "
+            f"(Whisper non-matching words before verse text)")
 
     total_duration = whisper_words[-1]["end"] if whisper_words else 0
     num_timeline = len(whisper_words)
@@ -271,30 +287,21 @@ def _align_whisper_to_verses(
 
     matched = len(anchors)
 
-    # Pass 2: Build timing entries
-    timing_entries = [{
-        "book": book,
-        "chapter": chapter_str,
-        "verse_start": "0",
-        "verse_start_alt": "0",
-        "timestamp": 0,
-    }]
+    # Pass 2: Build timing
+    pos = []  # pos[i] is verse (i+1)'s timestamp — see write_timing_json()
+    timing = {"id": format_verse_id(book, chapter_str), "pos": pos}
+    if header_end is not None:
+        timing["intro_end"] = round(header_end, 2)
+    prev_time = 0.0
 
     for vi, verse_text in enumerate(verse_texts):
         verse_num = vi + 1
         verse_text = verse_text.strip()
 
         if not verse_text:
-            prev_time = timing_entries[-1]["timestamp"]
-            timing_entries.append({
-                "book": book,
-                "chapter": chapter_str,
-                "verse_start": str(verse_num),
-                "verse_start_alt": str(verse_num),
-                "timestamp": round(prev_time, 2),
-            })
-            word_timing["verses"][str(verse_num)] = []
-            word_timing["verse_ends"][str(verse_num)] = []
+            pos.append(round(prev_time, 2))
+            word_timing["beg"][str(verse_num)] = []
+            word_timing["end"][str(verse_num)] = []
             continue
 
         verse_words = verse_text.split()
@@ -307,22 +314,17 @@ def _align_whisper_to_verses(
         else:
             timestamp = _interpolate_verse_time(
                 vi, verse_texts, anchors, whisper_words, total_duration,
-                timing_entries[-1]["timestamp"],
+                prev_time,
             )
             word_times = [None] * num_verse_words
             word_end_times = [None] * num_verse_words
 
-        timing_entries.append({
-            "book": book,
-            "chapter": chapter_str,
-            "verse_start": str(verse_num),
-            "verse_start_alt": str(verse_num),
-            "timestamp": timestamp,
-        })
-        word_timing["verses"][str(verse_num)] = word_times
-        word_timing["verse_ends"][str(verse_num)] = word_end_times
+        pos.append(round(timestamp, 2))
+        prev_time = timestamp
+        word_timing["beg"][str(verse_num)] = word_times
+        word_timing["end"][str(verse_num)] = word_end_times
 
-    return timing_entries, word_timing, matched
+    return timing, word_timing, matched
 
 
 def _align_verse_words_whisper(
@@ -822,7 +824,7 @@ def fuse_words_per_word(
     audio_path: Path | None = None,
     mms_components=None,
     gap_fill_dir: Path | None = None,
-) -> tuple[list[dict], dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     """Per-word fusion: MMS primary, Whisper fallback only.
 
     MMS provides all word timestamps (aligned 1:1 with reference text).
@@ -834,7 +836,7 @@ def fuse_words_per_word(
     consecutive MMS words in the same verse trigger a segment re-alignment.
     Gap-fill results are saved to gap_fill_dir for future reference.
 
-    Returns (timing_entries, word_timing, word_quality, fusion_stats).
+    Returns (timing, word_timing, word_quality, fusion_stats).
     """
     # Use near-zero threshold for Aramaic passages (MMS timings are correct
     # despite low scores; Whisper is unreliable for Aramaic)
@@ -998,8 +1000,18 @@ def fuse_words_per_word(
                         old_start = fused_words[i]["start"]
 
                         # Only use if the new position is between the old position
-                        # and the next word (i.e., it closed the gap)
-                        if old_start < new_start < gap_end and new_score > 0.3:
+                        # and the next word (i.e., it closed the gap). Score check
+                        # MUST come first: align_segment() returns start=None
+                        # (with score=0.0) when the segment hits the CTC-infeasible
+                        # fallback (mms_align_words.py's proactive feasibility
+                        # check) — `and` short-circuits left-to-right, so checking
+                        # new_score first means that case is rejected by the score
+                        # gate before the None ever reaches a `<` comparison.
+                        # Confirmed real 2026-08-12 (full-corpus --force-fusion
+                        # regeneration run): 'float' vs 'NoneType' TypeError,
+                        # aborting the whole chapter's fusion, from the old
+                        # position-check-first ordering.
+                        if new_score > 0.3 and old_start < new_start < gap_end:
                             log(f"  Gap fixed: '{gap_text}' moved "
                                 f"{old_start:.2f}s → {new_start:.2f}s "
                                 f"(score={new_score:.2f})")
@@ -1027,7 +1039,15 @@ def fuse_words_per_word(
                                     }, gf, indent=2)
                             break  # restart scan after fix
                         else:
-                            log(f"  Gap fill rejected: new_start={new_start:.2f}s, "
+                            # new_start can be None here (the CTC-infeasible
+                            # fallback rejected by the score check above) —
+                            # this branch was unreachable before the
+                            # score-first reorder above, so the bare :.2f
+                            # format was never exercised. Confirmed real
+                            # 2026-08-12 (targeted retry of the first fix's
+                            # failures): TypeError formatting None.
+                            new_start_str = f"{new_start:.2f}s" if new_start is not None else "None"
+                            log(f"  Gap fill rejected: new_start={new_start_str}, "
                                 f"score={new_score:.2f}")
                 else:
                     log("  Gap cannot be fixed (no MMS components available)")
@@ -1075,7 +1095,13 @@ def fuse_words_per_word(
                     if not ww_norm:
                         continue
                     sim = difflib.SequenceMatcher(None, fw_text_norm, ww_norm).ratio()
-                    if sim >= 0.6 and ww["score"] > 0.5:
+                    # .get(), not ["score"]: load_word_timeline() only sets
+                    # "score" when the source _whisper_words.json word had
+                    # one — not guaranteed for every Whisper backend/run —
+                    # so a bare ww["score"] KeyErrors on legacy data.
+                    # Confirmed real 2026-08-12 (full-corpus --force-fusion
+                    # regeneration run, NEH 10 arb): "Failed: 'score'".
+                    if sim >= 0.6 and ww.get("score", 0.0) > 0.5:
                         time_diff = mms_time - ww["start"]
                         if time_diff > 2.0:
                             best_wh_time = ww["start"]
@@ -1181,32 +1207,23 @@ def fuse_words_per_word(
         log(f"  Fixed {drift_fixed} word(s) via drift correction")
 
     # Now map fused words to verses (same logic as _map_mms_to_verses)
-    timing_entries = [{
-        "book": book,
-        "chapter": chapter_str,
-        "verse_start": "0",
-        "verse_start_alt": "0",
-        "timestamp": 0,
-    }]
-    word_timing = {"book": book, "chapter": chapter_str, "verses": {}, "verse_ends": {}}
+    pos = []  # pos[i] is verse (i+1)'s timestamp — see write_timing_json()
+    timing = {"id": format_verse_id(book, chapter_str), "pos": pos}
+    if header_end is not None:
+        timing["intro_end"] = round(header_end, 2)
+    word_timing = {"id": format_verse_id(book, chapter_str), "beg": {}, "end": {}}
     quality_verses = {}
 
+    prev_time = 0.0
     word_idx = 0
     for vi, verse_text in enumerate(verse_texts):
         verse_num = vi + 1
         cleaned = clean_for_alignment(verse_text, config)
 
         if not cleaned:
-            prev_time = timing_entries[-1]["timestamp"]
-            timing_entries.append({
-                "book": book,
-                "chapter": chapter_str,
-                "verse_start": str(verse_num),
-                "verse_start_alt": str(verse_num),
-                "timestamp": round(prev_time, 2),
-            })
-            word_timing["verses"][str(verse_num)] = []
-            word_timing["verse_ends"][str(verse_num)] = []
+            pos.append(round(prev_time, 2))
+            word_timing["beg"][str(verse_num)] = []
+            word_timing["end"][str(verse_num)] = []
             quality_verses[str(verse_num)] = []
             continue
 
@@ -1220,15 +1237,10 @@ def fuse_words_per_word(
                 verse_time = w["start"]
                 break
         if verse_time is None:
-            verse_time = timing_entries[-1]["timestamp"]
+            verse_time = prev_time
 
-        timing_entries.append({
-            "book": book,
-            "chapter": chapter_str,
-            "verse_start": str(verse_num),
-            "verse_start_alt": str(verse_num),
-            "timestamp": round(verse_time, 2),
-        })
+        pos.append(round(verse_time, 2))
+        prev_time = verse_time
 
         word_times = []
         word_end_times = []
@@ -1252,8 +1264,8 @@ def fuse_words_per_word(
             elif w["whisper_score"] is not None:
                 q_entry["whisper_score"] = round(w["whisper_score"], 3)
             verse_quality.append(q_entry)
-        word_timing["verses"][str(verse_num)] = word_times
-        word_timing["verse_ends"][str(verse_num)] = word_end_times
+        word_timing["beg"][str(verse_num)] = word_times
+        word_timing["end"][str(verse_num)] = word_end_times
         quality_verses[str(verse_num)] = verse_quality
 
         word_idx += verse_word_count
@@ -1261,7 +1273,7 @@ def fuse_words_per_word(
     # Enforce monotonicity within each verse — if fusion picked timestamps
     # from different sources that are slightly out of order, fix them.
     mono_fixes = 0
-    for vnum, times in word_timing["verses"].items():
+    for vnum, times in word_timing["beg"].items():
         for i in range(1, len(times)):
             if times[i] is not None and times[i - 1] is not None and times[i] < times[i - 1]:
                 times[i] = times[i - 1]
@@ -1279,7 +1291,7 @@ def fuse_words_per_word(
     low_quality_threshold = fallback_threshold
     low_quality_count = sum(1 for s in all_scores if s < low_quality_threshold)
     null_count = sum(
-        1 for times in word_timing["verses"].values()
+        1 for times in word_timing["beg"].values()
         for t in times if t is None
     )
     low_quality_verses = []
@@ -1302,7 +1314,7 @@ def fuse_words_per_word(
         },
     }
 
-    return timing_entries, word_timing, word_quality, fusion_stats
+    return timing, word_timing, word_quality, fusion_stats
 
 
 # ─── Work Item Discovery ───────────────────────────────────────────────────
@@ -1502,8 +1514,10 @@ def process_chapter(item: dict, config: LanguageConfig, mms_components=None) -> 
         fusion_stats = None
     elif whisper_words:
         # Whisper only — use verse-level alignment
+        _whisper_uroman = mms_components[4] if mms_components else None
         final_timing, final_word_timing, _whisper_matched = _align_whisper_to_verses(
             whisper_words, verse_texts, book, chapter_str, config,
+            uroman=_whisper_uroman,
         )
         source = "whisper"
         fusion_stats = None

@@ -50,7 +50,12 @@ from mms_align_words import (
     realign_from_point,
     select_device,
 )
-from text_processing import clean_for_alignment, load_language_config, strip_markers
+from text_processing import (
+    clean_for_alignment,
+    format_verse_id,
+    load_language_config,
+    strip_markers,
+)
 
 DOWNLOADS_DIR = Path("downloads/BB")
 OUTPUT_DIR = Path("export/timing-data")
@@ -230,15 +235,18 @@ def process_chapter_verse_only(
     # Reinsert empty verses (same walk-and-reuse-previous-timestamp pattern
     # as align_words.py's _map_mms_to_verses) and build timing/word/quality
     # payloads in the same on-disk shape fusion-mode already writes.
+    #
+    # No Whisper transcript exists in verse_only_mode (that's the whole
+    # point of this module — see module docstring), so audio-intro
+    # detection isn't possible here; intro_end is never set.
     fallback_threshold = config.mms_fallback_threshold
-    timing_entries = [{
-        "book": book, "chapter": chapter_str,
-        "verse_start": "0", "verse_start_alt": "0", "timestamp": 0,
-    }]
-    word_timing = {"book": book, "chapter": chapter_str, "verses": {}, "verse_ends": {}}
+    pos = []  # pos[i] is verse (i+1)'s timestamp — see write_timing_json()
+    timing = {"id": format_verse_id(book, chapter_str), "pos": pos}
+    word_timing = {"id": format_verse_id(book, chapter_str), "beg": {}, "end": {}}
     quality_verses = {}
     all_scores = []
     fallback_count = 0
+    prev_time = 0.0
 
     result_iter = iter(results)
     for vi, verse_text in enumerate(verse_texts):
@@ -246,22 +254,14 @@ def process_chapter_verse_only(
         cleaned = clean_for_alignment(verse_text, config)
 
         if not cleaned:
-            prev_time = timing_entries[-1]["timestamp"]
-            timing_entries.append({
-                "book": book, "chapter": chapter_str,
-                "verse_start": str(verse_num), "verse_start_alt": str(verse_num),
-                "timestamp": round(prev_time, 2),
-            })
-            word_timing["verses"][str(verse_num)] = []
-            word_timing["verse_ends"][str(verse_num)] = []
+            pos.append(round(prev_time, 2))
+            word_timing["beg"][str(verse_num)] = []
+            word_timing["end"][str(verse_num)] = []
             continue
 
         r = next(result_iter)
-        timing_entries.append({
-            "book": book, "chapter": chapter_str,
-            "verse_start": str(verse_num), "verse_start_alt": str(verse_num),
-            "timestamp": round(r["start"], 2),
-        })
+        pos.append(round(r["start"], 2))
+        prev_time = r["start"]
 
         word_times = []
         word_end_times = []
@@ -273,15 +273,15 @@ def process_chapter_verse_only(
             q_entry = {"score": r["local_score"], "source": r["source"]}
             verse_quality.append(q_entry)
             all_scores.append(r["local_score"])
-        word_timing["verses"][str(verse_num)] = word_times
-        word_timing["verse_ends"][str(verse_num)] = word_end_times
+        word_timing["beg"][str(verse_num)] = word_times
+        word_timing["end"][str(verse_num)] = word_end_times
         quality_verses[str(verse_num)] = verse_quality
 
         if r["source"] == "fallback":
             fallback_count += 1
 
     null_count = sum(
-        1 for times in word_timing["verses"].values() for t in times if t is None
+        1 for times in word_timing["beg"].values() for t in times if t is None
     )
     low_quality_verses = [
         vnum for vnum, qwords in quality_verses.items()
@@ -304,7 +304,7 @@ def process_chapter_verse_only(
         },
     }
 
-    write_timing_json(timing_entries, timing_path)
+    write_timing_json(timing, timing_path)
     write_word_timing_json(word_timing, words_path)
     write_quality_json(word_quality, quality_path)
 

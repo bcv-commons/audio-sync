@@ -55,11 +55,24 @@ def analyze_chapter_timing(path):
     """
     with open(path) as f:
         data = json.load(f)
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+
+    # Two live formats: our own pipeline output (compact {"pos": [...]})
+    # and DBT's original downloaded timecodes under downloads/BB/ (old
+    # verbose list-of-verse-dicts, an external source this tool doesn't
+    # control and which will never move to the compact format).
+    if isinstance(data, dict) and "pos" in data:
+        # pos[i] is verse (i+1)'s timestamp (no verse-0 slot — see
+        # align_words.py's write_timing_json() docstring) — the +1 keeps
+        # verse-number strings real, matching the quality file's "verses"
+        # keys (real verse numbers) that dupe_verses gets cross-referenced
+        # against below.
+        verses = [(str(i + 1), t) for i, t in enumerate(data["pos"]) if t is not None]
+    elif isinstance(data, list) and data and isinstance(data[0], dict):
+        verses = [(str(e["verse_start"]), e["timestamp"]) for e in data
+                  if str(e["verse_start"]) != "0"]
+    else:
         return None
 
-    verses = [(str(e["verse_start"]), e["timestamp"]) for e in data
-              if str(e["verse_start"]) != "0"]
     if len(verses) < 2:
         return None
 
@@ -98,7 +111,7 @@ def analyze_chapter_words(words_path):
     with open(words_path) as f:
         data = json.load(f)
 
-    verses = data.get("verses", {})
+    verses = data.get("beg", {})
     nulls = word_dupes = total_words = 0
 
     for vnum, timestamps in verses.items():

@@ -203,7 +203,9 @@ def find_chapter_files_external(contrib_path, audio_meta):
 
 
 def csv_to_timing_json(csv_path, book, chapter_num):
-    """Convert a per-verse-timestamp CSV to the pipeline's _timing.json format.
+    """Convert a per-verse-timestamp CSV to the pipeline's compact
+    _timing.json format ({"id": ..., "pos": [...]}, see align_words.py's
+    write_timing_json()).
 
     CSV format (sermon-online convention): one float per line (seconds), N
     entries for an N-verse chapter, where each value is the END of verse N
@@ -211,14 +213,17 @@ def csv_to_timing_json(csv_path, book, chapter_num):
     the final verse).
 
     So:
-      v1 starts at 0 (chapter beginning, before any title/intro)
-      v_i (i >= 2) starts at CSV[i-2]
-      v_N ends at CSV[N-1]   (recorded as a sentinel "verse N+1" entry so the
+      v1 (pos[0]) starts at 0 (chapter beginning, before any title/intro)
+      v_i (i >= 2, pos[i-1]) starts at CSV[i-2]
+      v_N ends at CSV[N-1]   (recorded as a sentinel pos[N] entry so the
                               export pipeline can compute v_N's end boundary)
 
-    Output: list of dicts matching DBT timing format.
+    No audio-intro detection is possible from a bare timestamp CSV, so
+    intro_end is never set here — a contributed CSV that already has v1
+    starting at 0 is implicitly claiming there's nothing to skip.
+
+    Output: the compact timing dict, or None if the CSV had no timestamps.
     """
-    chapter_str = f"{chapter_num:03d}"
     timestamps = []
     with open(csv_path, encoding="utf-8") as f:
         for line in f:
@@ -235,22 +240,13 @@ def csv_to_timing_json(csv_path, book, chapter_num):
 
     n = len(timestamps)
 
-    def _entry(verse: int, ts: float) -> dict:
-        return {
-            "book": book,
-            "chapter": chapter_str,
-            "verse_start": str(verse),
-            "verse_start_alt": str(verse),
-            "timestamp": round(ts, 2),
-        }
-
-    entries = [_entry(0, 0)]  # chapter anchor
-    entries.append(_entry(1, 0))  # v1 starts at chapter start (covers any title/intro)
+    pos = [0.0]  # v1 starts at chapter start (covers any title/intro)
     for i in range(2, n + 1):
-        entries.append(_entry(i, timestamps[i - 2]))
+        pos.append(round(timestamps[i - 2], 2))
     # Sentinel for end of the final verse: timestamp the export uses as v_N's end
-    entries.append(_entry(n + 1, timestamps[n - 1]))
-    return entries
+    pos.append(round(timestamps[n - 1], 2))
+
+    return {"id": f"{book} {chapter_num}", "pos": pos}
 
 
 def import_contribution(contrib_path, meta, dry_run=False):
@@ -324,10 +320,10 @@ def import_contribution(contrib_path, meta, dry_run=False):
 
         # Pre-aligned timecodes → _timing.json
         if csv and not timing_target.exists():
-            entries = csv_to_timing_json(csv, book, chapter_num)
-            if entries:
+            timing = csv_to_timing_json(csv, book, chapter_num)
+            if timing:
                 with open(timing_target, "w", encoding="utf-8") as f:
-                    json.dump(entries, f, indent=2, ensure_ascii=False)
+                    json.dump(timing, f, separators=(",", ":"))
                 aligned += 1
 
         imported += 1

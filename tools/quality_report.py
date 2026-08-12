@@ -107,9 +107,18 @@ def find_all_downloaded_timecode(iso: str, testament: str = None) -> dict:
 
 
 def load_timing_verses(path: Path) -> dict:
-    """Load a timing.json file and return {verse_start: timestamp}."""
+    """Load a timing.json file and return {verse_start: timestamp}.
+
+    Handles both our own pipeline output (compact {"pos": [...]}) and
+    DBT's original downloaded timecodes under downloads/BB/ (old verbose
+    list-of-verse-dicts — an external source that stays in that format).
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    if isinstance(data, dict) and "pos" in data:
+        # pos[i] is verse (i+1)'s timestamp — no verse-0 slot, see
+        # align_words.py's write_timing_json() docstring.
+        return {str(i + 1): t for i, t in enumerate(data["pos"]) if t is not None}
     return {str(entry["verse_start"]): entry["timestamp"] for entry in data}
 
 

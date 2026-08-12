@@ -42,6 +42,8 @@ Prerequisites:
 import argparse
 import json
 import os
+import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -122,13 +124,25 @@ def load_mms_model(device: torch.device | None = None):
 def _prepare_words(text: str, uroman: Uroman, tokenizer) -> tuple[list[str], list[str]]:
     """Romanize text and filter to tokenizer dictionary.
 
+    Excludes the CTC blank token's own character from the "valid" set even
+    though it's technically a dictionary key — it's a structural separator
+    in the vocabulary, not a real phoneme, so it must never appear in an
+    alignment target. uroman's CJK romanization can legitimately emit it as
+    a syllable separator (e.g. Chinese "共负一轭" -> "gong-eyi...") —
+    confirmed 2026-08-12 against real cmn/yue 2CO 6 text: torchaudio's
+    forced_align() raises "targets Tensor shouldn't contain blank index"
+    when a target sequence contains it, since a leftover '-' from the old
+    unfiltered dict_keys would otherwise pass straight through (it IS a
+    real dictionary key — just the one reserved for blank, index 0).
+
     Returns (orig_words, clean_rom_words).
     """
     romanized = uroman.romanize_string(text)
     orig_words = text.split()
     rom_words = romanized.split()
 
-    dict_keys = set(tokenizer.dictionary.keys())
+    blank_char = next(k for k, v in tokenizer.dictionary.items() if v == 0)
+    dict_keys = set(tokenizer.dictionary.keys()) - {blank_char}
     clean_rom_words = []
     for w in rom_words:
         cleaned = "".join(c for c in w if c in dict_keys)
@@ -341,9 +355,42 @@ def _align_waveform(
     return results
 
 
+def _load_audio_via_ffmpeg_repair(audio_path: Path):
+    """Re-encode through ffmpeg into a temp WAV, then load that.
+
+    ffmpeg's own decoder tolerates malformed packets (logs a warning,
+    drops the frame, keeps going) where torchaudio's stricter one raises
+    outright — confirmed 2026-08-12 against a real corrupted source file
+    (ron/RONBSR MRK 4: a couple of malformed packets right at the start of
+    the file). Re-encoding recovered 377.3s of the original 380s — only
+    the actually-corrupt lead-in packets were lost, not the whole file.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(audio_path), str(tmp_path)],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise RuntimeError(f"ffmpeg repair transcode failed: {result.stderr[-500:]}")
+        return torchaudio.load(str(tmp_path))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def load_audio(audio_path: Path, bundle):
-    """Load and resample audio, returning (waveform, sample_rate)."""
-    waveform, sample_rate = torchaudio.load(str(audio_path))
+    """Load and resample audio, returning (waveform, sample_rate).
+
+    Falls back to an ffmpeg repair transcode (see
+    _load_audio_via_ffmpeg_repair) when torchaudio's own decoder raises —
+    no overhead for the normal case, only triggers on an actual failure.
+    """
+    try:
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+    except Exception as e:
+        log(f"  torchaudio.load() failed ({e}) — retrying via ffmpeg repair transcode", "WARNING")
+        waveform, sample_rate = _load_audio_via_ffmpeg_repair(audio_path)
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if sample_rate != bundle.sample_rate:
