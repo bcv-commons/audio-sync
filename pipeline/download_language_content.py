@@ -79,12 +79,30 @@ ERROR_LOG_DIR = Path("download_log")
 CROSSREF_PATH = Path("data/version-crossref.json")
 HELLOAO_API = "https://bible.helloao.org/api"
 
-# `bibles` repo's published DBT catalogs (2026-07-29) — replace the old
-# local sorted/BB fileset scan and the old {iso}_{version} naming-guess for
-# helloAO matching. See get_best_fileset_from_catalog() / _find_helloao_id().
-DBT_CATALOG_CDN_BASE = "https://cdn.bibel.wiki/dbt/_app/"
+# `bibles` repo's published DBT catalogs (2026-07-29, moved 2026-08-13) —
+# replace the old local sorted/BB fileset scan and the old {iso}_{version}
+# naming-guess for helloAO matching. See get_best_fileset_from_catalog() /
+# _find_helloao_id().
+#
+# The old /dbt/_app/catalog-*.json path is now frozen (bibles repo doc/
+# README.md, 2026-08-13) — still resolves, doesn't 404, but no longer
+# updated and actively diverging from the real data (e.g. the frozen
+# overlap.json has 2,855 entries vs. the current, correct 1,251). The new
+# path also dropped the "catalog-" filename prefix (redundant once it's
+# already under /catalog/) — see _CATALOG_CDN_FILENAMES.
+DBT_CATALOG_CDN_BASE = "https://cdn.bibel.wiki/catalog/"
 DBT_CATALOG_CACHE_DIR = Path("api-cache/dbt-catalog")
 _dbt_catalog_cache: dict[str, dict] = {}
+
+# Internal `name` params keep their descriptive "catalog-*" form (used
+# throughout this module and its callers, and as the local cache
+# filename) — only the actual CDN filename changed.
+_CATALOG_CDN_FILENAMES = {
+    "catalog-text": "text",
+    "catalog-audio": "audio",
+    "catalog-overlap": "overlap",
+    "catalog-index": "index",
+}
 
 _crossref_cache = None
 
@@ -133,12 +151,13 @@ def _extract_version_id(iso, distinct_id):
 def _load_dbt_catalog(name: str) -> dict:
     """Fetch+cache one of the `bibles` repo's published DBT catalogs.
 
-    name is one of "catalog-text", "catalog-audio", "catalog-overlap"
-    (cdn.bibel.wiki/dbt/_app/<name>.json). Checks the on-disk cache first,
-    then fetches from CDN and caches the raw response — same
-    fetch-then-cache pattern as batch_manifest.py's queue tiers. Returns
-    {} (not an exception) on any fetch/parse failure so callers degrade to
-    "no match found" rather than crashing a whole batch over one lookup.
+    name is one of "catalog-text", "catalog-audio", "catalog-overlap",
+    "catalog-index" (fetched from cdn.bibel.wiki/catalog/<short-name>.json,
+    see _CATALOG_CDN_FILENAMES). Checks the on-disk cache first, then
+    fetches from CDN and caches the raw response — same fetch-then-cache
+    pattern as batch_manifest.py's queue tiers. Returns {} (not an
+    exception) on any fetch/parse failure so callers degrade to "no match
+    found" rather than crashing a whole batch over one lookup.
     """
     if name in _dbt_catalog_cache:
         return _dbt_catalog_cache[name]
@@ -155,7 +174,8 @@ def _load_dbt_catalog(name: str) -> dict:
 
     import urllib.request
 
-    url = f"{DBT_CATALOG_CDN_BASE}{name}.json"
+    cdn_filename = _CATALOG_CDN_FILENAMES.get(name, name)
+    url = f"{DBT_CATALOG_CDN_BASE}{cdn_filename}.json"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "audio-sync"})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -347,6 +367,13 @@ def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> str | None:
     canon_l = canon.lower()
     for key in (f"{iso}:{canon_l}", f"{iso}:{canon_l}p"):
         for group in catalog.get(key, []):
+            # r: false means this cluster's probe fetch failed — it was
+            # never actually verified, so trusting an id inside it would
+            # defeat the whole point of this function (a *verified* match,
+            # not a naming guess). See bcv-commons/bibles doc/
+            # catalog-overlap.md's migration notes (2026-08-13).
+            if group.get("r") is False:
+                continue
             ids = group.get("ids", [])
             if f"d:{distinct_id}" not in ids:
                 continue
@@ -1189,6 +1216,101 @@ def download_timing(
         return False
 
 
+# ─── Cross-process download collision guard ────────────────────────────────
+#
+# Two independent processes can legitimately want to fetch the same chapter
+# at the same time: align_pipeline.py's own on-demand per-chapter fetch (its
+# usual behavior, unchanged) and a standalone batch downloader working ahead
+# through the same corpus (batch_download_audio.py) to prefetch for it. Both
+# ultimately call download_chapter() for the same output file, which without
+# coordination is a check-exists-then-fetch race — risking a corrupt
+# interleaved write or a wasted duplicate API call.
+#
+# Fixed with a plain filesystem claim, not a lock: an O_CREAT|O_EXCL claim
+# file is atomic to create (the OS guarantees only one of two racing
+# processes wins), needs no held file descriptor or process-lifetime
+# cleanup, and survives being reasoned about across two totally independent
+# Python processes. Scoped per OUTPUT FILE, not per chapter or per edition —
+# audio vs. text vs. a fallback text candidate are independent fetches that
+# should never block each other, only a genuine same-file collision should
+# serialize.
+_DOWNLOAD_CLAIM_STALE_AFTER = 180  # seconds — generous vs. a single
+# chapter's fetch (typically low single-digit seconds); long enough that a
+# live fetch is never mistaken for abandoned, short enough that a claim left
+# behind by a killed process (e.g. this box's GPU-wedge auto-reboot cycle)
+# doesn't block that chapter for the full 3-minute window unnecessarily.
+
+
+def _claim_path(dest_path: Path) -> Path:
+    return dest_path.with_suffix(dest_path.suffix + ".claim")
+
+
+def _acquire_download_claim(dest_path: Path) -> bool:
+    """Try to atomically claim dest_path for fetching.
+
+    True: this call won the claim — proceed with the real fetch, then MUST
+    call _release_download_claim(dest_path) when done (success or failure).
+    False: another process already holds a live claim — the caller should
+    not fetch, just wait (see _wait_for_other_download).
+    """
+    claim_path = _claim_path(dest_path)
+    if claim_path.exists():
+        try:
+            age = time.time() - claim_path.stat().st_mtime
+        except OSError:
+            age = 0  # vanished between exists() and stat() — race with the
+            # claim holder's own release; fall through to a normal claim
+            # attempt rather than guessing.
+        if age > _DOWNLOAD_CLAIM_STALE_AFTER:
+            claim_path.unlink(missing_ok=True)  # abandoned — steal it
+        else:
+            return False
+    try:
+        fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_download_claim(dest_path: Path) -> None:
+    _claim_path(dest_path).unlink(missing_ok=True)
+
+
+def _wait_for_other_download(dest_path: Path, timeout: float = 30.0, poll_interval: float = 0.5) -> bool:
+    """Another process claimed dest_path — poll for it to finish rather
+    than duplicating the fetch. Returns whether dest_path exists once the
+    wait ends (by the file showing up, or by timing out)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if dest_path.exists():
+            return True
+        time.sleep(poll_interval)
+    return dest_path.exists()
+
+
+def _fetch_with_claim(dest_path: Path, force: bool, stats: DownloadStats, label: str, fetch_fn) -> bool:
+    """Run fetch_fn() (a zero-arg callable returning bool success) under
+    the collision guard above. Returns True iff dest_path ends up present
+    — whether this call did the fetch, or another process already had/got
+    it — matching the plain bool contract every existing call site expects.
+    """
+    if dest_path.exists() and not force:
+        log(f"  ⊙ Already exists: {label}", "INFO")
+        stats.already_exists += 1
+        return True
+    if _acquire_download_claim(dest_path):
+        try:
+            return fetch_fn()
+        finally:
+            _release_download_claim(dest_path)
+    if _wait_for_other_download(dest_path):
+        log(f"  ⊙ Fetched concurrently by another process: {label}", "INFO")
+        stats.already_exists += 1
+        return True
+    return False
+
+
 def download_chapter(
     iso: str,
     distinct_id: str,
@@ -1231,40 +1353,27 @@ def download_chapter(
     # Download audio (if requested)
     if audio_fileset and "audio" in content_types:
         audio_file = base_dir / f"{book}_{chapter:03d}_{audio_fileset}.mp3"
-        if audio_file.exists() and not force:
-            log(f"  ⊙ Already exists: {audio_file.name}", "INFO")
-            stats.already_exists += 1
-        else:
-            if not download_audio(
-                audio_fileset,
-                book,
-                chapter,
-                audio_file,
-                iso,
-                distinct_id,
-                stats,
-                error_logger,
-            ):
-                success = False
+        if not _fetch_with_claim(
+            audio_file, force, stats, audio_file.name,
+            lambda: download_audio(
+                audio_fileset, book, chapter, audio_file,
+                iso, distinct_id, stats, error_logger,
+            ),
+        ):
+            success = False
 
-    # Download alt audio (if available and requested)
+    # Download alt audio (if available and requested) — failure is not
+    # critical, so its return value is intentionally ignored (matches the
+    # pre-existing `pass` here, just routed through the claim guard now).
     if alt_audio_fileset and "audio" in content_types:
         alt_audio_file = base_dir / f"{book}_{chapter:03d}_{alt_audio_fileset}.mp3"
-        if alt_audio_file.exists() and not force:
-            log(f"  ⊙ Already exists: {alt_audio_file.name} (alt)", "INFO")
-            stats.already_exists += 1
-        else:
-            if not download_audio(
-                alt_audio_fileset,
-                book,
-                chapter,
-                alt_audio_file,
-                iso,
-                distinct_id,
-                stats,
-                error_logger,
-            ):
-                pass  # Alt audio failure is not critical
+        _fetch_with_claim(
+            alt_audio_file, force, stats, f"{alt_audio_file.name} (alt)",
+            lambda: download_audio(
+                alt_audio_fileset, book, chapter, alt_audio_file,
+                iso, distinct_id, stats, error_logger,
+            ),
+        )
 
     # Download text (if requested) — try candidates in priority order so that
     # an upstream 404 on one variant falls back to the next (e.g. text_format
@@ -1290,9 +1399,12 @@ def download_chapter(
             text_downloaded = False
             for cand in candidates:
                 text_file = base_dir / f"{book}_{chapter:03d}_{cand}.txt"
-                if download_text(
-                    cand, book, chapter, text_file,
-                    iso, distinct_id, stats, error_logger,
+                if _fetch_with_claim(
+                    text_file, force, stats, text_file.name,
+                    lambda cand=cand, text_file=text_file: download_text(
+                        cand, book, chapter, text_file,
+                        iso, distinct_id, stats, error_logger,
+                    ),
                 ):
                     if cand != text_fileset:
                         log(f"  Used fallback text fileset: {cand}", "INFO")
@@ -1314,17 +1426,18 @@ def download_chapter(
             # Generate filename using helloAO convention
             hao_fid = ext_id.replace("_", "").upper()
             text_file = base_dir / f"{book}_{chapter:03d}_{hao_fid}_ET.txt"
-            if text_file.exists() and not force:
-                log(f"  ⊙ Already exists: {text_file.name} (helloAO)", "INFO")
-                stats.already_exists += 1
-                text_source_tag = f"helloao:{ext_id}"
-            else:
+
+            def _do_fetch_helloao(ext_id=ext_id, text_file=text_file):
                 if _fetch_helloao_chapter(ext_id, book, chapter, text_file):
                     log(f"  ✓ Downloaded: {text_file.name} (helloAO)", "INFO")
                     stats.downloaded_from_api += 1
-                    text_source_tag = f"helloao:{ext_id}"
-                else:
-                    success = False
+                    return True
+                return False
+
+            if _fetch_with_claim(text_file, force, stats, f"{text_file.name} (helloAO)", _do_fetch_helloao):
+                text_source_tag = f"helloao:{ext_id}"
+            else:
+                success = False
         elif ext_type == "ebible" and ext_id:
             # No eBible fetcher exists in this codebase yet — fail loudly
             # rather than silently reporting success with no text fetched.
@@ -1335,21 +1448,14 @@ def download_chapter(
     # Download timing (if requested and available)
     if timing_available and audio_fileset and "timing" in content_types:
         timing_file = base_dir / f"{book}_{chapter:03d}_{audio_fileset}_timing.json"
-        if timing_file.exists() and not force:
-            log(f"  ⊙ Already exists: {timing_file.name}", "INFO")
-            stats.already_exists += 1
-        else:
-            if not download_timing(
-                audio_fileset,
-                book,
-                chapter,
-                timing_file,
-                iso,
-                distinct_id,
-                stats,
-                error_logger,
-            ):
-                success = False
+        if not _fetch_with_claim(
+            timing_file, force, stats, timing_file.name,
+            lambda: download_timing(
+                audio_fileset, book, chapter, timing_file,
+                iso, distinct_id, stats, error_logger,
+            ),
+        ):
+            success = False
 
     # Write source.json if we have source info
     audio_source_tag = f"dbt:{audio_fileset}" if audio_fileset else None
@@ -1419,8 +1525,8 @@ def download_job(
                     overall_success = False
         return overall_success
 
-    # Fallback: DBT catalog-based resolution (cdn.bibel.wiki/dbt/_app/
-    # catalog-{text,audio}.json), for manifests missing per-job fileset
+    # Fallback: DBT catalog-based resolution (cdn.bibel.wiki/catalog/
+    # {text,audio}.json), for manifests missing per-job fileset
     # enrichment. Canon-level, so resolved once per job rather than per book
     # (see get_best_fileset_from_catalog's docstring).
     fileset_info = get_best_fileset_from_catalog(iso, canon, distinct_id)

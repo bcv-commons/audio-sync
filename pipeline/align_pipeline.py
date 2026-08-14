@@ -78,6 +78,7 @@ from download_language_content import (
     get_dbt_book_coverage,
     has_usable_text_source,
 )
+from gpu_health import CudaContextPoisonedError
 from hw_config import load_hw_config
 from text_processing import CONFIG_DIR, load_language_config
 from whisper_transcribe import (
@@ -146,6 +147,51 @@ class TimeLimit:
 def log(message: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
+
+
+# ─── GPU context-poisoning recovery ────────────────────────────────────────
+# See gpu_health.py for detection. A poisoned CUDA context can't be repaired
+# in-process (confirmed 2026-08-12 — see gpu_health.py's docstring), so the
+# only fix is a fresh process (fresh CUDA context on the same GPU). Rather
+# than requiring every invocation to be wrapped in an external restart
+# script, the process restarts itself via execv — same argv, same env plus
+# a restart counter so a genuinely broken GPU/driver doesn't loop forever.
+
+_GPU_RESTART_ENV = "_ALIGN_PIPELINE_GPU_RESTARTS"
+MAX_GPU_CONTEXT_RESTARTS = 3
+EXIT_GPU_POISONED_GIVE_UP = 42  # distinct from sys.exit(1) — lets a wrapping
+                                 # shell script tell "gave up after repeated
+                                 # GPU context failures" apart from a normal crash
+
+
+def _restart_or_give_up_after_gpu_poisoning():
+    """Self-restart this process (fresh CUDA context) after a
+    CudaContextPoisonedError, or give up after MAX_GPU_CONTEXT_RESTARTS.
+
+    Never returns: either execv's into a fresh process or sys.exit()s.
+    Chapters already written to disk are skipped on restart by each step's
+    normal needs_run()/force logic — this is not a resume mechanism of its
+    own, it relies entirely on that existing skip-if-exists behavior.
+    """
+    restarts_so_far = int(os.environ.get(_GPU_RESTART_ENV, "0"))
+    if restarts_so_far >= MAX_GPU_CONTEXT_RESTARTS:
+        log(
+            f"Giving up after {restarts_so_far} GPU context restarts — "
+            "this looks like a real hardware/driver problem, not a transient "
+            "context failure. Needs human investigation.",
+            "CRITICAL",
+        )
+        sys.exit(EXIT_GPU_POISONED_GIVE_UP)
+
+    log(
+        f"Restarting process for a fresh CUDA context "
+        f"(attempt {restarts_so_far + 1}/{MAX_GPU_CONTEXT_RESTARTS})...",
+        "CRITICAL",
+    )
+    os.environ[_GPU_RESTART_ENV] = str(restarts_so_far + 1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 class Heartbeat:
@@ -1459,6 +1505,17 @@ Examples:
                 total_time = time.time() - pipeline_start
                 _print_summary(total_stats, total_time)
                 sys.exit(1)
+            except CudaContextPoisonedError as e:
+                # Must NOT fall into the generic except below: that logs
+                # "Failed" and moves on to the next chapter, which is
+                # exactly how last night's cascade produced 4,926 silently
+                # corrupted chapters — every chapter after the poisoning
+                # event would fail (or worse, "succeed" via a swallowed
+                # fallback) the same way. Stop immediately instead.
+                log(f"{label} GPU CONTEXT POISONED: {e}", "CRITICAL")
+                total_time = time.time() - pipeline_start
+                _print_summary(total_stats, total_time)
+                _restart_or_give_up_after_gpu_poisoning()
             except Exception as e:
                 log(f"{label} Failed: {e}", "ERROR")
                 total_stats["chapters_failed"] += 1

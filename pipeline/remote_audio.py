@@ -42,8 +42,8 @@ def detect_remote_source(book_dir: Path):
 
     Walks up from {book_dir} to find:
       - audio.json sibling at the version dir → ("sermon-online", audio_meta)
-      - parent matches downloads/helloao/aligned/{canon}/{iso}/{distinct_id}/
-        → ("helloao-bsb", config_for_distinct_id)
+      - version dir's name (== distinct_id) matches a reader in
+        config/helloao.toml → ("helloao-bsb", config_for_distinct_id)
     """
     # Version dir is one level above book_dir (book_dir = .../{distinct_id}/{BOOK})
     version_dir = book_dir.parent
@@ -56,21 +56,26 @@ def detect_remote_source(book_dir: Path):
         except Exception:
             pass
 
-    # helloAO aligned content?
-    parts = book_dir.parts
-    if "helloao" in parts and "aligned" in parts:
-        idx = parts.index("aligned")
-        if idx + 3 < len(parts):
-            distinct_id = parts[idx + 3]
-            cfg = _load_helloao_config()
-            for trans_id, trans_meta in cfg.get("translations", {}).items():
-                for reader_name, reader_meta in trans_meta.get("readers", {}).items():
-                    if reader_meta.get("distinct_id") == distinct_id:
-                        return "helloao-bsb", {
-                            "translation": trans_id,
-                            "reader": reader_name,
-                            "distinct_id": distinct_id,
-                        }
+    # helloAO-sourced content — keyed purely by distinct_id (version_dir's
+    # name), not by directory layout. Originally this only matched the
+    # downloads/helloao/aligned/{canon}/{iso}/{distinct_id}/ layout, but
+    # distinct_id is already a unique key everywhere else in this codebase,
+    # so restricting the match to one specific folder layout just meant a
+    # manually-imported edition sitting in the standard downloads/BB/ tree
+    # (e.g. eng/ENGBSB, imported outside this mechanism, confirmed
+    # 2026-08-14 to be byte-identical to helloAO's BSB/hays audio) could
+    # never be recognized here even after adding its config/helloao.toml
+    # entry. Matching on distinct_id alone covers both layouts.
+    distinct_id = version_dir.name
+    cfg = _load_helloao_config()
+    for trans_id, trans_meta in cfg.get("translations", {}).items():
+        for reader_name, reader_meta in trans_meta.get("readers", {}).items():
+            if reader_meta.get("distinct_id") == distinct_id:
+                return "helloao-bsb", {
+                    "translation": trans_id,
+                    "reader": reader_name,
+                    "distinct_id": distinct_id,
+                }
     return None, None
 
 

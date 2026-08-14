@@ -51,8 +51,8 @@ core (elsewhere) → batch manifest → this repo → CDN
    that language+version+chapter. It resolves which exact fileset IDs to
    use either from the manifest itself (if core already resolved them) or
    by looking them up in the DBT catalogs published on CDN
-   (`cdn.bibel.wiki/dbt/_app/catalog-*.json`) — no local database or setup
-   script needed for this step.
+   (`cdn.bibel.wiki/catalog/{text,audio,overlap,index}.json`) — no local
+   database or setup script needed for this step.
 
 3. **Align.** `align_pipeline.py` runs Whisper transcription, MMS forced
    alignment, and fusion for every chapter in the batch, writing

@@ -1132,6 +1132,7 @@ def fuse_words_per_word(
             gap_text = " ".join(w["text"] for w in gap_words)
 
             bundle, model, tokenizer, aligner_obj, uroman_obj = mms_components
+            from gpu_health import CudaContextPoisonedError
             from mms_align_words import load_audio, realign_from_point
 
             log(f"  Re-running MMS on segment {restart_time:.1f}-{segment_end_time:.1f}s "
@@ -1144,6 +1145,8 @@ def fuse_words_per_word(
                     bundle, model, tokenizer, aligner_obj, uroman_obj,
                     end_time=segment_end_time,
                 )
+            except CudaContextPoisonedError:
+                raise
             except RuntimeError as e:
                 # CTC forced-align raises (not returns a low score) when this
                 # narrow, timestamp-derived window is too short for

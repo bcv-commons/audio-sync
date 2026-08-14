@@ -2,14 +2,29 @@
 """
 Pre-publish plausibility gate for scripts/publish-align.sh.
 
-Scans every *_timing.json under export/timing-data/ (the exact tree about
-to be published) for backwards timestamp jumps — a verse whose timestamp
-is earlier than the previous verse's. Unlike dupes/gaps/tiny-steps (which
-check_timing_quality.py also tracks but which can be legitimate — two
-verses spoken back-to-back, a genuinely long intro), a backwards jump is
-never correct: it means the alignment placed a verse at the wrong point
-in the audio entirely (see the ENGBSB/ZLMAVB ISA 51 case that motivated
-this check — verse 1 landed at 118.7s, verse 2 at 45.24s).
+Scans the exact tree about to be published for two independent, unrelated
+defect shapes:
+
+  1. Backwards timestamp jumps (*_timing.json) — a verse whose timestamp
+     is earlier than the previous verse's. Unlike dupes/gaps/tiny-steps
+     (which check_timing_quality.py also tracks but which can be
+     legitimate — two verses spoken back-to-back, a genuinely long intro),
+     a backwards jump is never correct: it means the alignment placed a
+     verse at the wrong point in the audio entirely (see the ENGBSB/ZLMAVB
+     ISA 51 case that motivated this check — verse 1 landed at 118.7s,
+     verse 2 at 45.24s).
+
+  2. Fallback/failure collapse (*_words_quality.json) — a chapter whose
+     alignment is almost entirely null timestamps / zero-confidence
+     scores. See has_fallback_corruption()'s docstring — this is the
+     on-disk fingerprint of a poisoned CUDA context (pipeline/gpu_health.py),
+     confirmed real 2026-08-12 across 4,926 chapters that "succeeded" with
+     no error while producing unusable output.
+
+Both checks need no prior/before state to compare against — each is a
+standalone judgment about the file's own content, unlike
+tools/fix_timing_gaps.py's snapshot/revert mechanism, which only catches a
+regression relative to a specific run's own before/after pair.
 
 Rather than blocking the whole publish over one bad chapter (this repo's
 existing philosophy — see ruff.toml's BLE001 comment: one failure must
@@ -31,6 +46,15 @@ from pathlib import Path
 
 TIMING_DIR = Path("export/timing-data")
 DEFAULT_OUT = Path("_runs/pre_publish_quarantine.txt")
+
+# A chapter whose word-quality summary is this null-heavy or this
+# low-scoring essentially never happens from real alignment — even a
+# genuinely hard chapter has SOME well-scored words. These thresholds are
+# deliberately conservative (real corruption is null_count == total_words,
+# avg_score == 0.0 exactly) to leave headroom above legitimately rough
+# chapters without false-flagging them.
+_FALLBACK_NULL_FRACTION = 0.9
+_FALLBACK_AVG_SCORE_MAX = 0.02
 
 
 def has_backwards_jump(timing_path: Path) -> bool:
@@ -58,6 +82,46 @@ def has_backwards_jump(timing_path: Path) -> bool:
     return any(verses[i] < verses[i - 1] for i in range(1, len(verses)))
 
 
+def has_fallback_corruption(quality_path: Path) -> bool:
+    """True if a chapter's alignment has collapsed to near-total fallback/
+    failure — nearly every word has a null timestamp and/or zero
+    confidence score.
+
+    This is the on-disk fingerprint of a poisoned CUDA context: each
+    individual word/verse failure looks like an isolated, plausible case
+    (a verse's audio genuinely too short for its text, say), but a whole
+    CHAPTER with this shape essentially never happens from real alignment
+    — even a genuinely hard chapter has some well-scored words. Unlike a
+    backwards jump, this failure mode doesn't corrupt monotonicity or
+    produce an error — the pipeline logs it as a normal success, which is
+    exactly how 4,926 chapters were silently corrupted in a single
+    2026-08-12 run before this check existed (confirmed: every one had
+    summary.avg_score == 0.0 and null_count == total_words).
+
+    Path-agnostic: applies equally to the fusion pipeline's
+    *_words_quality.json (source values "mms"/"whisper"/"mms_gap_fill"/
+    "mms_drift_fix") and verse-only mode's (source "local"/"fallback") —
+    both write the same {"summary": {"total_words", "null_count",
+    "avg_score", ...}} shape (align_words.py / align_verse_words.py), and
+    a poisoned context corrupts either pipeline identically.
+    """
+    try:
+        with open(quality_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    summary = data.get("summary")
+    if not summary:
+        return False
+    total = summary.get("total_words", 0)
+    if not total:
+        return False
+    null_fraction = summary.get("null_count", 0) / total
+    avg_score = summary.get("avg_score", 1.0)
+    return null_fraction >= _FALLBACK_NULL_FRACTION or avg_score <= _FALLBACK_AVG_SCORE_MAX
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
@@ -70,26 +134,42 @@ def main():
         args.out.write_text("")
         return
 
-    flagged_stems = []
-    for tf in sorted(TIMING_DIR.rglob("*_timing.json")):
-        if has_backwards_jump(tf):
-            flagged_stems.append(tf.stem.replace("_timing", ""))
+    backwards_stems = [
+        tf.stem.replace("_timing", "")
+        for tf in sorted(TIMING_DIR.rglob("*_timing.json"))
+        if has_backwards_jump(tf)
+    ]
+    fallback_stems = [
+        qf.stem.replace("_words_quality", "")
+        for qf in sorted(TIMING_DIR.rglob("*_words_quality.json"))
+        if has_fallback_corruption(qf)
+    ]
+
+    # Union — a chapter can in principle trip both checks; the exclude
+    # list only needs each stem once regardless of how many reasons.
+    all_stems = sorted(set(backwards_stems) | set(fallback_stems))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # One glob pattern per chapter, matches all its output files
     # (_timing.json, _words.json, _words_quality.json) at any depth.
-    args.out.write_text("".join(f"**/{stem}_*\n" for stem in flagged_stems))
+    args.out.write_text("".join(f"**/{stem}_*\n" for stem in all_stems))
 
-    if flagged_stems:
-        print(f"[pre-publish-check] {len(flagged_stems)} chapter(s) with a backwards "
-              f"timestamp jump — quarantined, not publishing:")
-        for stem in flagged_stems[:20]:
+    def _print_flagged(label: str, stems: list[str]):
+        print(f"[pre-publish-check] {len(stems)} chapter(s) with {label} — quarantined, not publishing:")
+        for stem in stems[:20]:
             print(f"  {stem}")
-        if len(flagged_stems) > 20:
-            print(f"  ... and {len(flagged_stems) - 20} more")
-        print(f"[pre-publish-check] full list: {args.out}")
+        if len(stems) > 20:
+            print(f"  ... and {len(stems) - 20} more")
+
+    if backwards_stems:
+        _print_flagged("a backwards timestamp jump", backwards_stems)
+    if fallback_stems:
+        _print_flagged("fallback/failure collapse (near-total null/zero-score alignment)", fallback_stems)
+
+    if all_stems:
+        print(f"[pre-publish-check] {len(all_stems)} chapter(s) total quarantined — full list: {args.out}")
     else:
-        print("[pre-publish-check] no backwards-jump chapters found — nothing quarantined")
+        print("[pre-publish-check] no problem chapters found — nothing quarantined")
 
 
 if __name__ == "__main__":

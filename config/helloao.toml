@@ -1,0 +1,17 @@
+# Maps our local distinct_id back to a helloAO (bible.helloao.org) translation
+# + reader (narrator), so pipeline/remote_audio.py's ensure_chapter_audio()
+# can re-fetch/refresh audio for editions that don't come from DBT.
+#
+# ENGBSB (English, Berean Standard Bible) was originally imported manually
+# (via an untracked one-off script, "josh/import_bsb_hays.py" — see comments
+# in pipeline/download_language_content.py and pipeline/whisper_transcribe.py)
+# rather than through this mechanism, and it has no entry in DBT's own
+# catalog at all (cdn.bibel.wiki/catalog/audio.json) — see
+# internal-docs/gpu-wedge-forensics.md's sibling investigation notes,
+# 2026-08-14. Confirmed 2026-08-14 via MD5 checksum on two chapters
+# (GEN 1, MAT 1) that our local audio is byte-for-byte identical to
+# helloAO's "BSB" translation, "hays" reader — one of three narrators
+# helloAO offers for this translation (david/hays/souer) — so this mapping
+# is a verified match, not a guess.
+[translations.BSB.readers.hays]
+distinct_id = "ENGBSB"

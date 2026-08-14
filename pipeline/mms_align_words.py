@@ -56,6 +56,7 @@ import torch
 import torchaudio
 from align_words import detect_audio_header
 from batch_manifest import get_template_chapters_from_batch, load_batch
+from gpu_health import CudaContextPoisonedError, note_alignment_success, wrap_if_poisoned
 from hw_config import load_hw_config
 from text_processing import clean_for_alignment, load_language_config, strip_markers
 from uroman import Uroman
@@ -304,7 +305,10 @@ def _align_waveform(
     # Tokenize and align full waveform
     tokens = tokenizer(clean_rom_words)
 
-    emission = _compute_emission_chunked(waveform, model)
+    try:
+        emission = _compute_emission_chunked(waveform, model)
+    except RuntimeError as e:
+        raise wrap_if_poisoned(e) from e
 
     # Proactive CTC feasibility check — compute whether this call CAN
     # succeed before attempting it, instead of attempting it and catching
@@ -327,7 +331,11 @@ def _align_waveform(
             for w in orig_words
         ]
 
-    token_spans = aligner(emission[0], tokens)
+    try:
+        token_spans = aligner(emission[0], tokens)
+    except RuntimeError as e:
+        raise wrap_if_poisoned(e) from e
+    note_alignment_success()
     ratio = waveform.shape[1] / emission.shape[1] / bundle.sample_rate
 
     results = []
@@ -576,6 +584,8 @@ def _align_chapter_chunked(
                 waveform, sample_rate, chunk_start_time, extended_text,
                 bundle, model, tokenizer, aligner, uroman, end_time=chunk_end_time,
             )
+        except CudaContextPoisonedError:
+            raise
         except RuntimeError as e:
             log(f"    Chunk {chunk_i + 1}/{len(chunks)} alignment failed ({e}), "
                 f"using unaligned fallback for this chunk", "WARNING")

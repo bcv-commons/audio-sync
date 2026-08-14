@@ -55,6 +55,11 @@ def _overlap_helloao_match(overlap_entries, iso, canon, dbt_id):
     """
     for key in (f"{iso}:{canon}", f"{iso}:{canon}p"):
         for group in overlap_entries.get(key, []):
+            # r: false means this cluster's probe fetch failed — never
+            # actually verified. See download_language_content.py's
+            # _find_helloao_id() for the same guard + full rationale.
+            if group.get("r") is False:
+                continue
             ids = group.get("ids", [])
             if f"d:{dbt_id}" not in ids:
                 continue

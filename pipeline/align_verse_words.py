@@ -44,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 
 from align_words import write_quality_json, write_timing_json, write_word_timing_json
+from gpu_health import CudaContextPoisonedError
 from mms_align_words import (
     load_audio,
     load_mms_model,
@@ -73,6 +74,35 @@ OUTPUT_DIR = Path("export/timing-data")
 WINDOW_FRAC = 0.8
 MIN_WINDOW_SECONDS = 8.0
 MIN_LOCAL_SCORE = 0.35
+
+# torch.cuda.empty_cache() every single verse (~25.6 verses/chapter on
+# average here) is ~25x more frequent than the standard whole-chapter
+# path's once-per-chapter clear (mms_align_words.py's process_chapter()).
+# That per-window frequency was empirically justified on MPS (Apple
+# Silicon's unified memory, shared with the whole process including
+# Whisper's model — a real sweep run on 2026-08-05 confirmed exhaustion
+# without it; see align_obs_words.py's segment_anchored_align(), the
+# origin of this pattern) but was only ever extended to CUDA by caution,
+# not separately proven necessary at that frequency — CUDA has dedicated
+# VRAM, not memory shared with the rest of the process.
+#
+# A GPU-wedge cluster on this CUDA box (2026-08-13, internal-docs/
+# gpu-wedge-forensics.md Incidents 11-14) correlates suspiciously well
+# with this frequency: historical whole-chapter runs (this constant
+# doesn't apply to, once-per-chapter only) went 14-29+ hours before their
+# first wedge; this verse-only-mode workload wedged every 20-90 minutes —
+# roughly the same order of magnitude as the ~25x call-frequency gap.
+# Correlation, not proven causation — this constant makes it a real,
+# revertible experiment: clear every Nth verse instead of every verse,
+# bounding worst-case unreleased allocation the same way regardless of
+# chapter length (a fixed count, not "once per chapter", specifically
+# because OT chapter length varies enormously — PSA 117 is 2 verses, PSA
+# 119 is 176 — so tying the interval to chapter boundaries would leave
+# long outlier chapters accumulating far more unreleased allocations
+# before their first clear than short ones, the opposite of what a
+# fragmentation guard should do). CUDA only — MPS keeps clearing every
+# verse, since that's the frequency actually confirmed necessary.
+CUDA_EMPTY_CACHE_EVERY_N_VERSES = 25
 
 
 def log(message: str, level: str = "INFO"):
@@ -133,22 +163,31 @@ def verse_anchored_align(
                     waveform, sample_rate, win_start, verse_text,
                     bundle, model, tokenizer, aligner, uroman, end_time=win_end,
                 )
+            except CudaContextPoisonedError:
+                raise
             except RuntimeError as e:
                 log(f"    verse {i + 1}: CTC align failed ({e}), using fallback", "WARNING")
                 local_words = []
 
-        if next(model.parameters()).device.type == "mps":
+        device_type = next(model.parameters()).device.type
+        if device_type == "mps":
             try:
                 import torch
                 torch.mps.empty_cache()
             except Exception:
                 pass
-        elif next(model.parameters()).device.type == "cuda":
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+        elif device_type == "cuda":
+            # Every Nth verse, not every verse — see
+            # CUDA_EMPTY_CACHE_EVERY_N_VERSES's docstring. Always clears on
+            # the chapter's last verse too, so a short final stretch never
+            # goes uncleared into the next chapter's allocations.
+            is_last_verse = i == len(non_empty_verses) - 1
+            if (i + 1) % CUDA_EMPTY_CACHE_EVERY_N_VERSES == 0 or is_last_verse:
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0

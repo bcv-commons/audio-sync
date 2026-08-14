@@ -1,0 +1,1327 @@
+{
+  "_note": "Languages with 1M+ speakers that are also present in our audio source catalog (cdn.bibel.wiki/catalog/audio.json) — i.e. ones we could actually run alignment batches for. Ordered by speaker count descending; use this order when composing --iso-list for batch runs. Speaker figures from Wikidata (P1098 'number of speakers' + P220 'ISO 639-3 code'), pulled 2026-08-14 — L1+L2 figures of mixed vintage/methodology per Wikidata's own sourcing, not a single authoritative census; treat as a prioritization signal, not exact truth. Where multiple Wikidata entries existed for the same ISO code (e.g. different QIDs for overlapping language concepts), the highest figure was kept. tier: 0 = 100M+ speakers, 1 = 10M-100M, 2 = 1M-10M — matches the tier field pipeline/whisper_transcribe.py's --tier/--all flags already expect; this file was previously referenced by that code (PRIORITY_LANGUAGES_FILE) but did not exist on disk.",
+  "generated_at": "2026-08-14",
+  "source": "Wikidata P1098+P220 (SPARQL), cross-referenced against cdn.bibel.wiki/catalog/audio.json",
+  "languages": [
+    {
+      "iso": "cmn",
+      "language": "Mandarin",
+      "tier": 0,
+      "speakers": 918000000
+    },
+    {
+      "iso": "eng",
+      "language": "English",
+      "tier": 0,
+      "speakers": 753359540
+    },
+    {
+      "iso": "spa",
+      "language": "Spanish",
+      "tier": 0,
+      "speakers": 485000000
+    },
+    {
+      "iso": "hin",
+      "language": "Hindi",
+      "tier": 0,
+      "speakers": 341000000
+    },
+    {
+      "iso": "arb",
+      "language": "Standard Arabic",
+      "tier": 0,
+      "speakers": 335000000
+    },
+    {
+      "iso": "ben",
+      "language": "Bangla",
+      "tier": 0,
+      "speakers": 300000000
+    },
+    {
+      "iso": "por",
+      "language": "Portuguese",
+      "tier": 0,
+      "speakers": 254300000
+    },
+    {
+      "iso": "fra",
+      "language": "French",
+      "tier": 0,
+      "speakers": 208157220
+    },
+    {
+      "iso": "ind",
+      "language": "Indonesian",
+      "tier": 0,
+      "speakers": 198996550
+    },
+    {
+      "iso": "rus",
+      "language": "Russian",
+      "tier": 0,
+      "speakers": 154000000
+    },
+    {
+      "iso": "pan",
+      "language": "Punjabi",
+      "tier": 0,
+      "speakers": 125000000
+    },
+    {
+      "iso": "mar",
+      "language": "Marathi",
+      "tier": 1,
+      "speakers": 83100000
+    },
+    {
+      "iso": "swh",
+      "language": "Kiswahili",
+      "tier": 1,
+      "speakers": 82300000
+    },
+    {
+      "iso": "tur",
+      "language": "Turkish",
+      "tier": 1,
+      "speakers": 82231620
+    },
+    {
+      "iso": "tel",
+      "language": "Telugu",
+      "tier": 1,
+      "speakers": 82000000
+    },
+    {
+      "iso": "kor",
+      "language": "Korean",
+      "tier": 1,
+      "speakers": 77300000
+    },
+    {
+      "iso": "vie",
+      "language": "Vietnamese",
+      "tier": 1,
+      "speakers": 76000000
+    },
+    {
+      "iso": "tam",
+      "language": "Tamil",
+      "tier": 1,
+      "speakers": 75000000
+    },
+    {
+      "iso": "yue",
+      "language": "Yue Chinese",
+      "tier": 1,
+      "speakers": 73100000
+    },
+    {
+      "iso": "urd",
+      "language": "Urdu",
+      "tier": 1,
+      "speakers": 68600000
+    },
+    {
+      "iso": "jav",
+      "language": "Javanese",
+      "tier": 1,
+      "speakers": 68300000
+    },
+    {
+      "iso": "ita",
+      "language": "Italian",
+      "tier": 1,
+      "speakers": 64800000
+    },
+    {
+      "iso": "guj",
+      "language": "Gujarati",
+      "tier": 1,
+      "speakers": 56400000
+    },
+    {
+      "iso": "pes",
+      "language": "Iranian Persian",
+      "tier": 1,
+      "speakers": 52800000
+    },
+    {
+      "iso": "bho",
+      "language": "Bhojpuri",
+      "tier": 1,
+      "speakers": 52200000
+    },
+    {
+      "iso": "nan",
+      "language": "Southern Min",
+      "tier": 1,
+      "speakers": 50100000
+    },
+    {
+      "iso": "hak",
+      "language": "Hakka Chinese",
+      "tier": 1,
+      "speakers": 48200000
+    },
+    {
+      "iso": "pcm",
+      "language": "Nigerian Pidgin",
+      "tier": 1,
+      "speakers": 47500000
+    },
+    {
+      "iso": "apc",
+      "language": "Levantine Arabic",
+      "tier": 1,
+      "speakers": 44000000
+    },
+    {
+      "iso": "hau",
+      "language": "Hausa",
+      "tier": 1,
+      "speakers": 43900000
+    },
+    {
+      "iso": "kan",
+      "language": "Kannada",
+      "tier": 1,
+      "speakers": 43600000
+    },
+    {
+      "iso": "pol",
+      "language": "Polish",
+      "tier": 1,
+      "speakers": 39700000
+    },
+    {
+      "iso": "yor",
+      "language": "Yoruba",
+      "tier": 1,
+      "speakers": 37800000
+    },
+    {
+      "iso": "mal",
+      "language": "Malayalam",
+      "tier": 1,
+      "speakers": 37100000
+    },
+    {
+      "iso": "ory",
+      "language": "Odia",
+      "tier": 1,
+      "speakers": 34500000
+    },
+    {
+      "iso": "mai",
+      "language": "Maithili",
+      "tier": 1,
+      "speakers": 33900000
+    },
+    {
+      "iso": "mya",
+      "language": "Burmese",
+      "tier": 1,
+      "speakers": 32900000
+    },
+    {
+      "iso": "sun",
+      "language": "Sundanese",
+      "tier": 1,
+      "speakers": 32400000
+    },
+    {
+      "iso": "apd",
+      "language": "Sudanese Arabic",
+      "tier": 1,
+      "speakers": 31900000
+    },
+    {
+      "iso": "ibo",
+      "language": "Igbo",
+      "tier": 1,
+      "speakers": 27000000
+    },
+    {
+      "iso": "ukr",
+      "language": "Ukrainian",
+      "tier": 1,
+      "speakers": 26900000
+    },
+    {
+      "iso": "uzn",
+      "language": "Northern Uzbek",
+      "tier": 1,
+      "speakers": 25100000
+    },
+    {
+      "iso": "snd",
+      "language": "Sindhi",
+      "tier": 1,
+      "speakers": 24600000
+    },
+    {
+      "iso": "ron",
+      "language": "Romanian",
+      "tier": 1,
+      "speakers": 24300000
+    },
+    {
+      "iso": "tgl",
+      "language": "Tagalog",
+      "tier": 1,
+      "speakers": 23600000
+    },
+    {
+      "iso": "nld",
+      "language": "Dutch",
+      "tier": 1,
+      "speakers": 23100000
+    },
+    {
+      "iso": "aec",
+      "language": "Sa'idi Arabic",
+      "tier": 1,
+      "speakers": 22400000
+    },
+    {
+      "iso": "awa",
+      "language": "Awadhi",
+      "tier": 1,
+      "speakers": 22000000
+    },
+    {
+      "iso": "amh",
+      "language": "Amharic",
+      "tier": 1,
+      "speakers": 21900000
+    },
+    {
+      "iso": "pbu",
+      "language": "Northern Pashto",
+      "tier": 1,
+      "speakers": 20900000
+    },
+    {
+      "iso": "tha",
+      "language": "Thai",
+      "tier": 1,
+      "speakers": 20700000
+    },
+    {
+      "iso": "mag",
+      "language": "Magahi",
+      "tier": 1,
+      "speakers": 20700000
+    },
+    {
+      "iso": "skr",
+      "language": "Saraiki",
+      "tier": 1,
+      "speakers": 20009000
+    },
+    {
+      "iso": "lin",
+      "language": "Lingala",
+      "tier": 1,
+      "speakers": 20000000
+    },
+    {
+      "iso": "tzm",
+      "language": "Central Atlas Tamazight",
+      "tier": 1,
+      "speakers": 17000000
+    },
+    {
+      "iso": "khm",
+      "language": "Khmer",
+      "tier": 1,
+      "speakers": 16600000
+    },
+    {
+      "iso": "hne",
+      "language": "Chhattisgarhi",
+      "tier": 1,
+      "speakers": 16300000
+    },
+    {
+      "iso": "som",
+      "language": "Somali",
+      "tier": 1,
+      "speakers": 16200000
+    },
+    {
+      "iso": "tuk",
+      "language": "Turkmen",
+      "tier": 1,
+      "speakers": 16000000
+    },
+    {
+      "iso": "ceb",
+      "language": "Cebuano",
+      "tier": 1,
+      "speakers": 15900000
+    },
+    {
+      "iso": "acm",
+      "language": "Iraqi Arabic",
+      "tier": 1,
+      "speakers": 15700000
+    },
+    {
+      "iso": "sin",
+      "language": "Sinhala",
+      "tier": 1,
+      "speakers": 15300000
+    },
+    {
+      "iso": "asm",
+      "language": "Assamese",
+      "tier": 1,
+      "speakers": 15300000
+    },
+    {
+      "iso": "mad",
+      "language": "Madurese",
+      "tier": 1,
+      "speakers": 15000000
+    },
+    {
+      "iso": "ell",
+      "language": "Modern Greek",
+      "tier": 1,
+      "speakers": 15000000
+    },
+    {
+      "iso": "kmr",
+      "language": "Kurmanji",
+      "tier": 1,
+      "speakers": 14600000
+    },
+    {
+      "iso": "fuv",
+      "language": "Nigerian Fulfulde",
+      "tier": 1,
+      "speakers": 14500000
+    },
+    {
+      "iso": "tgk",
+      "language": "Tajik",
+      "tier": 1,
+      "speakers": 14000000
+    },
+    {
+      "iso": "bgc",
+      "language": "Haryanvi",
+      "tier": 1,
+      "speakers": 14000000
+    },
+    {
+      "iso": "syl",
+      "language": "Sylheti",
+      "tier": 1,
+      "speakers": 13980000
+    },
+    {
+      "iso": "azb",
+      "language": "South Azerbaijani",
+      "tier": 1,
+      "speakers": 13800000
+    },
+    {
+      "iso": "ctg",
+      "language": "Chittagonian",
+      "tier": 1,
+      "speakers": 13000000
+    },
+    {
+      "iso": "tso",
+      "language": "Tsonga",
+      "tier": 1,
+      "speakers": 13000000
+    },
+    {
+      "iso": "kaz",
+      "language": "Kazakh",
+      "tier": 1,
+      "speakers": 12900000
+    },
+    {
+      "iso": "hun",
+      "language": "Hungarian",
+      "tier": 1,
+      "speakers": 12600000
+    },
+    {
+      "iso": "kin",
+      "language": "Kinyarwanda",
+      "tier": 1,
+      "speakers": 12100000
+    },
+    {
+      "iso": "nya",
+      "language": "Chewa",
+      "tier": 1,
+      "speakers": 12000000
+    },
+    {
+      "iso": "aeb",
+      "language": "Tunisian Arabic",
+      "tier": 1,
+      "speakers": 11600000
+    },
+    {
+      "iso": "aka",
+      "language": "Akan",
+      "tier": 1,
+      "speakers": 11000000
+    },
+    {
+      "iso": "pbt",
+      "language": "Southern Pashto",
+      "tier": 1,
+      "speakers": 10900000
+    },
+    {
+      "iso": "run",
+      "language": "Kirundi",
+      "tier": 1,
+      "speakers": 10800000
+    },
+    {
+      "iso": "ces",
+      "language": "Czech",
+      "tier": 1,
+      "speakers": 10700000
+    },
+    {
+      "iso": "uig",
+      "language": "Uyghur",
+      "tier": 1,
+      "speakers": 10400000
+    },
+    {
+      "iso": "mup",
+      "language": "Malvi",
+      "tier": 1,
+      "speakers": 10000000
+    },
+    {
+      "iso": "hat",
+      "language": "Haitian Creole",
+      "tier": 2,
+      "speakers": 9600000
+    },
+    {
+      "iso": "prs",
+      "language": "Dari",
+      "tier": 2,
+      "speakers": 9600000
+    },
+    {
+      "iso": "dhd",
+      "language": "Dhundari",
+      "tier": 2,
+      "speakers": 9600000
+    },
+    {
+      "iso": "heb",
+      "language": "Hebrew",
+      "tier": 2,
+      "speakers": 9303950
+    },
+    {
+      "iso": "knc",
+      "language": "Central Kanuri",
+      "tier": 2,
+      "speakers": 9270000
+    },
+    {
+      "iso": "swe",
+      "language": "Swedish",
+      "tier": 2,
+      "speakers": 9244250
+    },
+    {
+      "iso": "azj",
+      "language": "North Azerbaijani",
+      "tier": 2,
+      "speakers": 9220610
+    },
+    {
+      "iso": "ilo",
+      "language": "Ilocano",
+      "tier": 2,
+      "speakers": 9100000
+    },
+    {
+      "iso": "swc",
+      "language": "Congo Swahili",
+      "tier": 2,
+      "speakers": 9100000
+    },
+    {
+      "iso": "bul",
+      "language": "Bulgarian",
+      "tier": 2,
+      "speakers": 9000000
+    },
+    {
+      "iso": "srp",
+      "language": "Serbian",
+      "tier": 2,
+      "speakers": 9000000
+    },
+    {
+      "iso": "sna",
+      "language": "Shona",
+      "tier": 2,
+      "speakers": 8300000
+    },
+    {
+      "iso": "hil",
+      "language": "Hiligaynon",
+      "tier": 2,
+      "speakers": 8200000
+    },
+    {
+      "iso": "shi",
+      "language": "Tashelhit",
+      "tier": 2,
+      "speakers": 8000000
+    },
+    {
+      "iso": "bfy",
+      "language": "Bagheli",
+      "tier": 2,
+      "speakers": 8000000
+    },
+    {
+      "iso": "rwr",
+      "language": "Marwari",
+      "tier": 2,
+      "speakers": 7856410
+    },
+    {
+      "iso": "bel",
+      "language": "Belarusian",
+      "tier": 2,
+      "speakers": 7600000
+    },
+    {
+      "iso": "mos",
+      "language": "Moore",
+      "tier": 2,
+      "speakers": 7600000
+    },
+    {
+      "iso": "tir",
+      "language": "Tigrinya",
+      "tier": 2,
+      "speakers": 7507780
+    },
+    {
+      "iso": "vmw",
+      "language": "Makhuwa",
+      "tier": 2,
+      "speakers": 7430000
+    },
+    {
+      "iso": "ckb",
+      "language": "Sorani",
+      "tier": 2,
+      "speakers": 7250000
+    },
+    {
+      "iso": "hrv",
+      "language": "Croatian",
+      "tier": 2,
+      "speakers": 7000000
+    },
+    {
+      "iso": "tum",
+      "language": "Tumbuka",
+      "tier": 2,
+      "speakers": 7000000
+    },
+    {
+      "iso": "sck",
+      "language": "Nagpuri",
+      "tier": 2,
+      "speakers": 7000000
+    },
+    {
+      "iso": "hye",
+      "language": "Armenian",
+      "tier": 2,
+      "speakers": 6700000
+    },
+    {
+      "iso": "kik",
+      "language": "Gikuyu",
+      "tier": 2,
+      "speakers": 6623000
+    },
+    {
+      "iso": "pst",
+      "language": "Central Pashto",
+      "tier": 2,
+      "speakers": 6520000
+    },
+    {
+      "iso": "lua",
+      "language": "Luba-Kasai",
+      "tier": 2,
+      "speakers": 6300000
+    },
+    {
+      "iso": "nod",
+      "language": "Lanna",
+      "tier": 2,
+      "speakers": 6029500
+    },
+    {
+      "iso": "slk",
+      "language": "Slovak",
+      "tier": 2,
+      "speakers": 6000000
+    },
+    {
+      "iso": "umb",
+      "language": "Umbundu",
+      "tier": 2,
+      "speakers": 6000000
+    },
+    {
+      "iso": "wal",
+      "language": "Wolayttattuwa",
+      "tier": 2,
+      "speakers": 5830000
+    },
+    {
+      "iso": "kab",
+      "language": "Kabyle",
+      "tier": 2,
+      "speakers": 5586000
+    },
+    {
+      "iso": "min",
+      "language": "Minangkabau",
+      "tier": 2,
+      "speakers": 5530000
+    },
+    {
+      "iso": "suk",
+      "language": "Sukuma",
+      "tier": 2,
+      "speakers": 5430000
+    },
+    {
+      "iso": "fin",
+      "language": "Finnish",
+      "tier": 2,
+      "speakers": 5413380
+    },
+    {
+      "iso": "lao",
+      "language": "Lao",
+      "tier": 2,
+      "speakers": 5225552
+    },
+    {
+      "iso": "tat",
+      "language": "Tatar",
+      "tier": 2,
+      "speakers": 5200000
+    },
+    {
+      "iso": "bug",
+      "language": "Bugis",
+      "tier": 2,
+      "speakers": 5017800
+    },
+    {
+      "iso": "mtr",
+      "language": "Mewari",
+      "tier": 2,
+      "speakers": 5000000
+    },
+    {
+      "iso": "cat",
+      "language": "Catalan",
+      "tier": 2,
+      "speakers": 4873396
+    },
+    {
+      "iso": "gug",
+      "language": "Paraguayan Guarani",
+      "tier": 2,
+      "speakers": 4850000
+    },
+    {
+      "iso": "sag",
+      "language": "Sango",
+      "tier": 2,
+      "speakers": 4600000
+    },
+    {
+      "iso": "kir",
+      "language": "Kyrgyz",
+      "tier": 2,
+      "speakers": 4568480
+    },
+    {
+      "iso": "fuc",
+      "language": "Pulaar",
+      "tier": 2,
+      "speakers": 4450000
+    },
+    {
+      "iso": "rif",
+      "language": "Tarifit",
+      "tier": 2,
+      "speakers": 4399000
+    },
+    {
+      "iso": "ayl",
+      "language": "Libyan Arabic",
+      "tier": 2,
+      "speakers": 4320500
+    },
+    {
+      "iso": "bam",
+      "language": "Bambara",
+      "tier": 2,
+      "speakers": 4200000
+    },
+    {
+      "iso": "lug",
+      "language": "Luganda",
+      "tier": 2,
+      "speakers": 4100000
+    },
+    {
+      "iso": "nso",
+      "language": "Northern Sotho",
+      "tier": 2,
+      "speakers": 4100000
+    },
+    {
+      "iso": "lit",
+      "language": "Lithuanian",
+      "tier": 2,
+      "speakers": 4000000
+    },
+    {
+      "iso": "ban",
+      "language": "Balinese",
+      "tier": 2,
+      "speakers": 4000000
+    },
+    {
+      "iso": "tpi",
+      "language": "Tok Pisin",
+      "tier": 2,
+      "speakers": 4000000
+    },
+    {
+      "iso": "ksw",
+      "language": "S'gaw Karen",
+      "tier": 2,
+      "speakers": 4000000
+    },
+    {
+      "iso": "kam",
+      "language": "Kamba",
+      "tier": 2,
+      "speakers": 3893000
+    },
+    {
+      "iso": "mey",
+      "language": "Hassaniya Arabic",
+      "tier": 2,
+      "speakers": 3763900
+    },
+    {
+      "iso": "kat",
+      "language": "Georgian",
+      "tier": 2,
+      "speakers": 3700000
+    },
+    {
+      "iso": "wol",
+      "language": "Wolof",
+      "tier": 2,
+      "speakers": 3700000
+    },
+    {
+      "iso": "bem",
+      "language": "Bemba",
+      "tier": 2,
+      "speakers": 3600000
+    },
+    {
+      "iso": "ace",
+      "language": "Acehnese",
+      "tier": 2,
+      "speakers": 3500032
+    },
+    {
+      "iso": "bos",
+      "language": "Bosnian",
+      "tier": 2,
+      "speakers": 3500000
+    },
+    {
+      "iso": "mzn",
+      "language": "Mazanderani",
+      "tier": 2,
+      "speakers": 3270000
+    },
+    {
+      "iso": "jam",
+      "language": "Jamaican Patois",
+      "tier": 2,
+      "speakers": 3200000
+    },
+    {
+      "iso": "dag",
+      "language": "Dagbanli",
+      "tier": 2,
+      "speakers": 3160000
+    },
+    {
+      "iso": "war",
+      "language": "Waray",
+      "tier": 2,
+      "speakers": 3100000
+    },
+    {
+      "iso": "ewe",
+      "language": "Ewe",
+      "tier": 2,
+      "speakers": 3000000
+    },
+    {
+      "iso": "gbm",
+      "language": "Garhwali",
+      "tier": 2,
+      "speakers": 3000000
+    },
+    {
+      "iso": "shn",
+      "language": "Shan",
+      "tier": 2,
+      "speakers": 3000000
+    },
+    {
+      "iso": "als",
+      "language": "Tosk",
+      "tier": 2,
+      "speakers": 3000000
+    },
+    {
+      "iso": "sdh",
+      "language": "Southern Kurdish",
+      "tier": 2,
+      "speakers": 3000000
+    },
+    {
+      "iso": "luo",
+      "language": "Dholuo",
+      "tier": 2,
+      "speakers": 3000000
+    },
+    {
+      "iso": "khk",
+      "language": "Khalkha Mongolian",
+      "tier": 2,
+      "speakers": 2704030
+    },
+    {
+      "iso": "dyu",
+      "language": "Dioula",
+      "tier": 2,
+      "speakers": 2700000
+    },
+    {
+      "iso": "efi",
+      "language": "Efik",
+      "tier": 2,
+      "speakers": 2693000
+    },
+    {
+      "iso": "shu",
+      "language": "Shuwa",
+      "tier": 2,
+      "speakers": 2600000
+    },
+    {
+      "iso": "glk",
+      "language": "Gilaki",
+      "tier": 2,
+      "speakers": 2550000
+    },
+    {
+      "iso": "bcl",
+      "language": "Central Bikol",
+      "tier": 2,
+      "speakers": 2500000
+    },
+    {
+      "iso": "slv",
+      "language": "Slovene",
+      "tier": 2,
+      "speakers": 2400000
+    },
+    {
+      "iso": "sus",
+      "language": "Susu",
+      "tier": 2,
+      "speakers": 2400000
+    },
+    {
+      "iso": "pam",
+      "language": "Kapampangan",
+      "tier": 2,
+      "speakers": 2400000
+    },
+    {
+      "iso": "nyn",
+      "language": "Runyankole",
+      "tier": 2,
+      "speakers": 2300000
+    },
+    {
+      "iso": "iba",
+      "language": "Iban",
+      "tier": 2,
+      "speakers": 2300000
+    },
+    {
+      "iso": "haz",
+      "language": "Hazaragi",
+      "tier": 2,
+      "speakers": 2221000
+    },
+    {
+      "iso": "bci",
+      "language": "Baoule",
+      "tier": 2,
+      "speakers": 2100000
+    },
+    {
+      "iso": "laj",
+      "language": "Lango",
+      "tier": 2,
+      "speakers": 2100000
+    },
+    {
+      "iso": "mkd",
+      "language": "Macedonian",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "dgo",
+      "language": "Dogri",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "bbc",
+      "language": "Toba Batak",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "kru",
+      "language": "Kurukh",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "tcy",
+      "language": "Tulu",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "wes",
+      "language": "Cameroon Pidgin",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "shk",
+      "language": "Shilluk",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "quc",
+      "language": "K'iche'",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "sas",
+      "language": "Sasak",
+      "tier": 2,
+      "speakers": 2000000
+    },
+    {
+      "iso": "fon",
+      "language": "Fon",
+      "tier": 2,
+      "speakers": 1935500
+    },
+    {
+      "iso": "bgq",
+      "language": "Bagri",
+      "tier": 2,
+      "speakers": 1890815
+    },
+    {
+      "iso": "sid",
+      "language": "Sidamo",
+      "tier": 2,
+      "speakers": 1800000
+    },
+    {
+      "iso": "rhg",
+      "language": "Rohingya",
+      "tier": 2,
+      "speakers": 1800000
+    },
+    {
+      "iso": "kde",
+      "language": "Makonde",
+      "tier": 2,
+      "speakers": 1700000
+    },
+    {
+      "iso": "zza",
+      "language": "Zazaki",
+      "tier": 2,
+      "speakers": 1640000
+    },
+    {
+      "iso": "quh",
+      "language": "South Bolivian Quechua",
+      "tier": 2,
+      "speakers": 1616120
+    },
+    {
+      "iso": "kbd",
+      "language": "Kabardian",
+      "tier": 2,
+      "speakers": 1600000
+    },
+    {
+      "iso": "mak",
+      "language": "Makassar",
+      "tier": 2,
+      "speakers": 1600000
+    },
+    {
+      "iso": "bin",
+      "language": "Edo",
+      "tier": 2,
+      "speakers": 1600000
+    },
+    {
+      "iso": "igl",
+      "language": "Igala",
+      "tier": 2,
+      "speakers": 1600000
+    },
+    {
+      "iso": "nde",
+      "language": "Northern Ndebele",
+      "tier": 2,
+      "speakers": 1572800
+    },
+    {
+      "iso": "guw",
+      "language": "Gun",
+      "tier": 2,
+      "speakers": 1539000
+    },
+    {
+      "iso": "hoc",
+      "language": "Ho",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "khn",
+      "language": "Khandeshi",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "quz",
+      "language": "Cusco Quechua",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "kbr",
+      "language": "Kafa",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "lki",
+      "language": "Laki",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "khg",
+      "language": "Khams Tibetan",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "tyz",
+      "language": "Tay",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "unr",
+      "language": "Mundari",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "lrc",
+      "language": "Northern Luri",
+      "tier": 2,
+      "speakers": 1500000
+    },
+    {
+      "iso": "sgw",
+      "language": "Sebat Bet Gurage",
+      "tier": 2,
+      "speakers": 1480000
+    },
+    {
+      "iso": "mni",
+      "language": "Meitei",
+      "tier": 2,
+      "speakers": 1470000
+    },
+    {
+      "iso": "kxm",
+      "language": "Northern Khmer",
+      "tier": 2,
+      "speakers": 1400000
+    },
+    {
+      "iso": "hyw",
+      "language": "Western Armenian",
+      "tier": 2,
+      "speakers": 1395240
+    },
+    {
+      "iso": "che",
+      "language": "Chechen",
+      "tier": 2,
+      "speakers": 1393900
+    },
+    {
+      "iso": "mnk",
+      "language": "Mandinka",
+      "tier": 2,
+      "speakers": 1350000
+    },
+    {
+      "iso": "toi",
+      "language": "Tonga",
+      "tier": 2,
+      "speakers": 1270000
+    },
+    {
+      "iso": "bak",
+      "language": "Bashkir",
+      "tier": 2,
+      "speakers": 1200000
+    },
+    {
+      "iso": "bod",
+      "language": "Tibetan",
+      "tier": 2,
+      "speakers": 1200000
+    },
+    {
+      "iso": "ach",
+      "language": "Acholi",
+      "tier": 2,
+      "speakers": 1200000
+    },
+    {
+      "iso": "srr",
+      "language": "Serer",
+      "tier": 2,
+      "speakers": 1200000
+    },
+    {
+      "iso": "tsc",
+      "language": "Tswa",
+      "tier": 2,
+      "speakers": 1200000
+    },
+    {
+      "iso": "taj",
+      "language": "Eastern Tamang",
+      "tier": 2,
+      "speakers": 1180000
+    },
+    {
+      "iso": "ekk",
+      "language": "Standard Estonian",
+      "tier": 2,
+      "speakers": 1164770
+    },
+    {
+      "iso": "mtq",
+      "language": "Muong",
+      "tier": 2,
+      "speakers": 1140000
+    },
+    {
+      "iso": "ajg",
+      "language": "Adja",
+      "tier": 2,
+      "speakers": 1133000
+    },
+    {
+      "iso": "pag",
+      "language": "Pangasinan",
+      "tier": 2,
+      "speakers": 1100000
+    },
+    {
+      "iso": "dga",
+      "language": "Dagaare",
+      "tier": 2,
+      "speakers": 1100000
+    },
+    {
+      "iso": "urh",
+      "language": "Urhobo",
+      "tier": 2,
+      "speakers": 1100000
+    },
+    {
+      "iso": "krj",
+      "language": "Karay-a",
+      "tier": 2,
+      "speakers": 1056093
+    }
+  ]
+}
