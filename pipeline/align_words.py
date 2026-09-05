@@ -90,6 +90,31 @@ def load_word_timeline(path: Path) -> list[dict]:
     return words
 
 
+def _vrs_for_output_path(output_path: Path) -> str | None:
+    """Versification scheme for the edition this output path belongs to.
+
+    Identity comes from the path rather than the caller because the layout
+    <canon>/<iso>/<distinct_id>/<BOOK>/<file> is a published contract — it's
+    the CDN URL structure consumers already depend on — whereas the various
+    callers carry iso/distinct_id inconsistently. Doing it here means every
+    writer of a timing.json gets the stamp, including future ones.
+
+    Returns None (caller omits the field) for anything unrecognised.
+    """
+    try:
+        book_dir = output_path.parent
+        distinct_id = book_dir.parent.name
+        iso = book_dir.parent.parent.name
+    except (AttributeError, IndexError):
+        return None
+    try:
+        from versification import lookup_vrs
+        return lookup_vrs(iso, distinct_id)
+    except Exception:
+        # Never let scheme lookup break a write that otherwise succeeded.
+        return None
+
+
 def write_timing_json(timing: dict, output_path: Path):
     """Write compact verse-level timing data.
 
@@ -105,9 +130,21 @@ def write_timing_json(timing: dict, output_path: Path):
 
     A future org_intro_end (original-language front matter, e.g. a Psalm
     superscription merged into verse 1's own text) belongs here too, once a
-    per-edition data source can identify it — not implemented yet, see
-    align_pipeline.py session notes.
+    per-edition data source can identify it — the "vrs" field added below is
+    very likely that source, since whether a superscription is a numbered
+    verse is precisely what distinguishes org from eng.
+
+    Also stamps "vrs": the versification scheme these chapter/verse numbers
+    are expressed in. Without it the artifact is ambiguous in a way that
+    silently corrupts consumers: our pos[] is keyed to the source text's
+    numbering, and 28 of the editions we publish use a non-eng scheme, so
+    e.g. kaz/KAZKAZ PSA 34 is rso Psalm 34 — org Psalm 35 — and nothing said
+    so. Omitted entirely (never guessed) when the edition's scheme isn't
+    positively known; see versification.lookup_vrs().
     """
+    vrs = _vrs_for_output_path(output_path)
+    if vrs and "vrs" not in timing:
+        timing = {**timing, "vrs": vrs}
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(timing, f, separators=(",", ":"))
@@ -128,6 +165,33 @@ def write_quality_json(word_quality: dict, output_path: Path):
 
 
 # ─── MMS-FA Verse Mapping ──────────────────────────────────────────────────
+
+def _shortfall_verse_time(
+    prev_time: float,
+    remaining_verses: int,
+    last_word_end: float | None,
+) -> float:
+    """Estimate a verse's start time when its word slice came up empty.
+
+    This happens when the flat word list (mms_words/fused_words) has fewer
+    entries than clean_for_alignment() expects for the verses up to this
+    point — e.g. stale word-timing-data computed before a language config
+    change (like a new char_replacement) altered how many words a verse
+    cleans down to. Confirmed for real 2026-09-02: heb chapters whose
+    mms_words.json predated heb.toml's maqaf-splitting char_replacement
+    ran short by the exact number of merged maqaf pairs, and the shortfall
+    always surfaced at the first verse the deficit finally exhausted the
+    list on (often, but not necessarily, the chapter's last verse).
+
+    Without this, the caller would just duplicate prev_time, collapsing
+    the verse to zero duration. Distributing the remaining known audio
+    span evenly across the remaining verses is a better estimate — not
+    exact, but never worse than an outright duplicate.
+    """
+    if last_word_end is None or last_word_end <= prev_time or remaining_verses <= 0:
+        return prev_time
+    return prev_time + (last_word_end - prev_time) / (remaining_verses + 1)
+
 
 def _map_mms_to_verses(
     mms_words: list[dict],
@@ -154,6 +218,8 @@ def _map_mms_to_verses(
 
     prev_time = 0.0
     word_idx = 0
+    shortfall_warned = False
+    last_word_end = mms_words[-1].get("end") or mms_words[-1].get("start") if mms_words else None
     for vi, verse_text in enumerate(verse_texts):
         verse_num = vi + 1
         cleaned = clean_for_alignment(verse_text, config)
@@ -174,7 +240,12 @@ def _map_mms_to_verses(
                 verse_time = w["start"]
                 break
         if verse_time is None:
-            verse_time = prev_time
+            if word_idx >= len(mms_words) and not shortfall_warned:
+                log(f"  WARNING: {book} {chapter_str}: mms_words ran short "
+                    f"({len(mms_words)} words for {sum(len(clean_for_alignment(v, config).split()) for v in verse_texts)} expected) "
+                    "— word-timing-data is likely stale for this chapter's current config", "WARN")
+                shortfall_warned = True
+            verse_time = _shortfall_verse_time(prev_time, len(verse_texts) - vi, last_word_end)
 
         pos.append(round(verse_time, 2))
         prev_time = verse_time
@@ -1219,6 +1290,8 @@ def fuse_words_per_word(
 
     prev_time = 0.0
     word_idx = 0
+    shortfall_warned = False
+    last_word_end = (fused_words[-1].get("end") or fused_words[-1].get("start")) if fused_words else None
     for vi, verse_text in enumerate(verse_texts):
         verse_num = vi + 1
         cleaned = clean_for_alignment(verse_text, config)
@@ -1240,7 +1313,12 @@ def fuse_words_per_word(
                 verse_time = w["start"]
                 break
         if verse_time is None:
-            verse_time = prev_time
+            if word_idx >= len(fused_words) and not shortfall_warned:
+                log(f"  WARNING: {book} {chapter_str}: fused_words ran short "
+                    f"({len(fused_words)} words for {sum(len(clean_for_alignment(v, config).split()) for v in verse_texts)} expected) "
+                    "— word-timing-data is likely stale for this chapter's current config", "WARN")
+                shortfall_warned = True
+            verse_time = _shortfall_verse_time(prev_time, len(verse_texts) - vi, last_word_end)
 
         pos.append(round(verse_time, 2))
         prev_time = verse_time

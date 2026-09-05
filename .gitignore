@@ -70,3 +70,4 @@ hays_audio/
 # Installer packages downloaded during machine setup (e.g. cuda-keyring),
 # not source.
 *.deb
+_compare/

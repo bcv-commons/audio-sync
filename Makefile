@@ -71,6 +71,12 @@ align-mms: ## Step 1b: MMS forced alignment
 align-fuse: ## Step 2: Fuse Whisper + MMS into final timing
 	$(PYTHON) $(PIPELINE)/align_words.py $(ARGS)
 
+align-obs: ## OBS narration batch — stage new languages, align all sequentially
+	internal-scripts/run-obs-batch.sh
+
+stage-obs: ## Stage/refresh _obs_batches/<iso>.json manifests from Door43
+	$(PYTHON) $(PIPELINE)/stage_obs_batches.py $(ARGS)
+
 # ---------------------------------------------------------------------------
 # Content preparation
 # ---------------------------------------------------------------------------

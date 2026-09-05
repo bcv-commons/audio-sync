@@ -73,6 +73,7 @@ from pathlib import Path
 
 # ─── Reuse infrastructure from whisper_transcribe.py ─────────────────────
 from batch_manifest import get_jobs, load_batch
+from versification import lookup_vrs
 from download_language_content import (
     ensure_chapter_ready,
     get_dbt_book_coverage,
@@ -269,8 +270,6 @@ def build_refs_from_books(books_spec: str) -> dict[str, set[int]]:
             book, chapter_spec = part.split(":", 1)
             if book in all_books:
                 current_book = book
-                for range_part in chapter_spec.split("-"):
-                    pass  # handled below
                 # Parse "1-3" or "17"
                 if "-" in chapter_spec:
                     start, end = chapter_spec.split("-", 1)
@@ -281,6 +280,20 @@ def build_refs_from_books(books_spec: str) -> dict[str, set[int]]:
             # Bare number: attach to current book
             if current_book:
                 refs[current_book].add(int(part))
+        elif current_book and re.fullmatch(r"\d+-\d+", part):
+            # Bare RANGE continuing the current book, e.g. the "9-11" in
+            # "MAT:4-6,9-11". Without this the range is silently dropped as
+            # an unknown spec — and shard_align.py's own
+            # format_book_chapters() emits exactly this shape whenever a
+            # book's chapters aren't contiguous, so shard_align was
+            # formatting a spec it could not parse back. That round-trip
+            # loss silently discarded chapters from every sharded run with
+            # scattered chapters (confirmed 2026-09-04: the last-verse-fix
+            # rollout re-ran only 1,435 of 3,510 targeted chapters, the rest
+            # never reaching a worker), which is precisely the shape of
+            # every targeted requeue/repair batch.
+            start, end = part.split("-", 1)
+            refs[current_book].update(range(int(start), int(end) + 1))
         elif part in all_books:
             # Full book name
             current_book = part
@@ -503,12 +516,34 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
     """Write the Contract B run manifest for this batch to _runs/<batch_id>.json.
 
     See internal-docs/audio-sync-interface.md §3 in MONO for the schema.
+
+    Carries a "vrs" map declaring the versification scheme of every edition
+    in the run — chapter/verse numbers in these results (and in the timing
+    artifacts they point at) are the source text's, which is NOT eng for 28
+    of the editions we publish. Kept as one per-edition map rather than a
+    field on each per-chapter entry, since it's per-edition data and the
+    results list runs to thousands of rows. Editions whose scheme isn't
+    positively known are simply absent (never guessed) — see
+    versification.lookup_vrs().
     """
+    vrs_map = {}
+    for r in results:
+        iso, did = r.get("iso"), r.get("distinct_id")
+        if not iso or not did:
+            continue
+        key = f"{iso}/{did}"
+        if key not in vrs_map:
+            scheme = lookup_vrs(iso, did)
+            if scheme:
+                vrs_map[key] = scheme
+
     manifest = {
         "batch_id": batch_id,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "results": results,
     }
+    if vrs_map:
+        manifest["vrs"] = vrs_map
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path = RUNS_DIR / f"{batch_id}.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1106,11 +1141,23 @@ Examples:
         # whole edition now instead of grinding through each chapter's
         # download+reject cycle one at a time (real example: fra's
         # FRALSN/FRAPDV have full audio but no usable text anywhere).
-        if not has_usable_text_source(iso, canon, distinct_id):
+        # Three-way result — see has_usable_text_source()'s docstring:
+        # True (unrestricted), False (skip entirely), or a frozenset of
+        # (book, chapter) pairs to restrict to (catalog confirms no text
+        # fileset, but real text already exists on disk for a few
+        # chapters — don't throw that away, but don't attempt fresh
+        # downloads for the rest either).
+        text_usable = has_usable_text_source(iso, canon, distinct_id)
+        if text_usable is False:
             log(f"No usable text source for {iso}/{canon}/{distinct_id} "
-                f"(no DBT fileset, no verified helloAO match) — skipping "
-                f"entire edition", "WARN")
+                f"(no DBT fileset, no verified helloAO match, nothing on "
+                f"disk) — skipping entire edition", "WARN")
             continue
+        text_chapter_restriction = None if text_usable is True else text_usable
+        if text_chapter_restriction is not None:
+            log(f"  {iso}/{canon}/{distinct_id}: catalog confirms no text "
+                f"fileset — restricting to {len(text_chapter_restriction)} "
+                f"chapter(s) with text already on disk", "INFO")
 
         # Discover chapters (filtered to template refs and optional book/chapter)
         # For the discovery, we build chapter refs incorporating --book/--chapter filters
@@ -1179,6 +1226,14 @@ Examples:
                     if before - len(wanted) > 0:
                         log(f"  {before - len(wanted)} chapter(s) not covered by "
                             f"{distinct_id} (per DBT's book listing), skipping", "INFO")
+
+            # Catalog confirmed this edition has no text fileset — only
+            # chapters that already have real text on disk (see
+            # has_usable_text_source()) stand any chance, so cut the rest
+            # here rather than sending them through ensure_chapter_ready
+            # to download audio for text that will never show up.
+            if text_chapter_restriction is not None:
+                wanted = [(b, c) for b, c in wanted if (b, c) in text_chapter_restriction]
 
             if not wanted:
                 log("No audio+text pairs found", "WARN")
@@ -1317,7 +1372,13 @@ Examples:
                 # No-op if mp3 is already present.
                 if not chapter["audio_path"].exists():
                     from remote_audio import ensure_chapter_audio
-                    if not ensure_chapter_audio(chapter["audio_path"], chapter["book"], chapter["chapter"]):
+                    if not ensure_chapter_audio(
+                        chapter["audio_path"],
+                        chapter["book"],
+                        # The AUDIO chapter — differs from chapter["chapter"]
+                        # (the text chapter) under a versification chapter_map.
+                        chapter.get("audio_chapter", chapter["chapter"]),
+                    ):
                         log(f"{label} Audio missing and could not be fetched, skipping", "WARN")
                         total_stats["chapters_failed"] += 1
                         run_results.append({

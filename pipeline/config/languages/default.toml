@@ -1,0 +1,8 @@
+# Default text processing configuration
+# Used for any language without a specific config file
+
+strip_unicode_categories = ["Mn"]
+
+[pronunciation_map]
+
+[char_replacements]

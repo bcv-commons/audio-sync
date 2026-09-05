@@ -1,0 +1,45 @@
+# Hebrew text processing configuration for alignment pipeline
+
+# MMS scores are inherently lower for Hebrew due to script complexity.
+# Use a lower fallback threshold so MMS is trusted more and Whisper
+# (which hallucinates on Hebrew) is used less.
+mms_fallback_threshold = 0.15
+
+# Aramaic passages in the Hebrew Bible — scores are even lower here because
+# MMS was not trained on Aramaic. Timings are still structurally sound.
+# Format: "BOOK CHAPTER:VERSE_START-VERSE_END" (verse range is optional)
+aramaic_passages = [
+    "DAN 2:4-49",
+    "DAN 3",
+    "DAN 4",
+    "DAN 5",
+    "DAN 6",
+    "DAN 7",
+    "EZR 4:8-24",
+    "EZR 5",
+    "EZR 6:1-18",
+    "EZR 7:12-26",
+    "GEN 31:47",
+    "JER 10:11",
+]
+
+# Unicode general categories to strip (Mn = nonspacing marks, i.e. niqqud/cantillation)
+strip_unicode_categories = ["Mn"]
+
+# Non-spoken marker removal rules (applied in order)
+# Each rule has a regex pattern and a replacement string
+[[strip_marker_rules]]
+pattern = '[{(][פס][})]'
+replacement = ""
+
+[[strip_marker_rules]]
+pattern = '(?:^|\s)[פס](?:\s|$)'
+replacement = " "
+
+# Pronunciation substitutions applied before alignment
+[pronunciation_map]
+"יהוה" = "adonay"
+
+# Single-character replacements during cleaning
+[char_replacements]
+"\u05BE" = " "   # Hebrew maqaf (hyphen) -> space

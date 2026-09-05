@@ -51,7 +51,11 @@ def analyze_chapter_timing(path):
     (high-confidence, an isolated single pair) — confirmed as distinct,
     real cases 2026-08-10 (see internal-docs/gpu-wedge-forensics.md-
     adjacent session history around the mms_align_words.py CTC-infeasible
-    fallback fix). See check_language()'s DUPES vs DUPES-OK split.
+    fallback fix). See check_language()'s DUPES vs DUPES-OK vs DUPES-EMPTY
+    split — the latter (a third, even more common cause, confirmed
+    2026-09-02) is a dupe verse that's empty after cleaning (e.g. a lone
+    leftover punctuation mark on its own reference-text line), which
+    check_language() detects separately via each dupe verse's word count.
     """
     with open(path) as f:
         data = json.load(f)
@@ -201,21 +205,51 @@ def check_language(iso, testament=None):
         # Build flags
         flags = []
         if gen_timing["dupes"] > 0:
-            # Cross-reference the specific dupe verses' word scores to tell
-            # a real alignment failure (0.0-score fallback) apart from two
-            # verses genuinely spoken back-to-back with no gap (high-
-            # confidence). Only the former is an actual issue — see
-            # analyze_chapter_timing()'s docstring for how this was found.
-            dupe_scores = []
-            if q_data:
-                for vnum in gen_timing["dupe_verses"]:
-                    for w in q_data["verses"].get(vnum, []):
-                        dupe_scores.append(w["score"])
-            dupe_avg = sum(dupe_scores) / len(dupe_scores) if dupe_scores else None
-            if dupe_avg is not None and dupe_avg >= 0.5:
-                flags.append("DUPES-OK")
+            # A dupe verse with zero words in words.json's "beg" list is a
+            # verse that cleaned down to nothing (e.g. a lone leftover
+            # punctuation mark on its own reference-text line — confirmed
+            # for real 2026-09-02 across 673 sampled DUPES chapters in 28
+            # languages: 100% were this exact case, not an alignment
+            # failure). align_words.py deliberately reuses the previous
+            # verse's timestamp for these (nothing to time), so this is
+            # expected, unfixable-at-the-alignment-level output, not an
+            # issue — distinct from DUPES-OK's "two verses genuinely
+            # spoken back-to-back" case below, but equally benign.
+            empty_dupe_verses = set()
+            if word_stats is not None:
+                try:
+                    with open(words_path, encoding="utf-8") as wf:
+                        beg_by_verse = json.load(wf).get("beg", {})
+                    empty_dupe_verses = {
+                        vnum for vnum in gen_timing["dupe_verses"]
+                        if not beg_by_verse.get(vnum)
+                    }
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            if empty_dupe_verses and len(empty_dupe_verses) == len(gen_timing["dupe_verses"]):
+                flags.append("DUPES-EMPTY")
             else:
-                flags.append("DUPES")
+                # Cross-reference the specific dupe verses' word scores to
+                # tell a real alignment failure (0.0-score fallback) apart
+                # from two verses genuinely spoken back-to-back with no gap
+                # (high-confidence). Only the former is an actual issue —
+                # see analyze_chapter_timing()'s docstring for how this was
+                # found. Empty-verse dupes are excluded from this average
+                # (they have no words/score by definition, which would
+                # otherwise drag dupe_avg down or leave it undefined).
+                dupe_scores = []
+                if q_data:
+                    for vnum in gen_timing["dupe_verses"]:
+                        if vnum in empty_dupe_verses:
+                            continue
+                        for w in q_data["verses"].get(vnum, []):
+                            dupe_scores.append(w["score"])
+                dupe_avg = sum(dupe_scores) / len(dupe_scores) if dupe_scores else None
+                if dupe_avg is not None and dupe_avg >= 0.5:
+                    flags.append("DUPES-OK")
+                else:
+                    flags.append("DUPES")
         if gen_timing["backwards"] > 0:
             flags.append("BACKWARDS")
         if gen_timing["tiny"] >= 3:
@@ -248,14 +282,16 @@ def check_language(iso, testament=None):
     if not chapters:
         return None
 
-    # DUPES-OK is informational, not an issue (see check_language()'s
-    # DUPES/DUPES-OK split above) — a chapter flagged with ONLY that
-    # shouldn't count toward has_issues, and its dupe count shouldn't
-    # inflate total_dupes (which "how many chapters actually need
-    # attention" tooling, e.g. tools/requeue_dupes_chapters.py, reads).
+    # DUPES-OK and DUPES-EMPTY are both informational, not an issue (see
+    # check_language()'s DUPES/DUPES-OK/DUPES-EMPTY split above) — a
+    # chapter flagged with ONLY those shouldn't count toward has_issues,
+    # and their dupe counts shouldn't inflate total_dupes (which "how many
+    # chapters actually need attention" tooling, e.g.
+    # tools/requeue_dupes_chapters.py, reads).
+    BENIGN_DUPE_FLAGS = ("DUPES-OK", "DUPES-EMPTY")
     has_issues = sum(
         1 for c in chapters
-        if any(f != "DUPES-OK" for f in c["flags"])
+        if any(f not in BENIGN_DUPE_FLAGS for f in c["flags"])
     )
     return {
         "iso": iso,
@@ -263,6 +299,7 @@ def check_language(iso, testament=None):
         "has_issues": has_issues,
         "total_dupes": sum(c["dupes"] for c in chapters if "DUPES" in c["flags"]),
         "total_dupes_ok": sum(c["dupes"] for c in chapters if "DUPES-OK" in c["flags"]),
+        "total_dupes_empty": sum(c["dupes"] for c in chapters if "DUPES-EMPTY" in c["flags"]),
         "total_backwards": sum(c["backwards"] for c in chapters),
         "total_nulls": sum(c["nulls"] for c in chapters),
         "total_low_q": sum(c["low_q"] for c in chapters),

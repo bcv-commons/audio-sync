@@ -303,8 +303,16 @@ def write_obs_timing_json(iso: str, story_id: str, results: list[dict], output_p
         for r in results
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
+    # Write to a temp file then atomically rename — a write that fails
+    # partway (e.g. disk-full) must never leave a truncated file at the
+    # real path, since skip-if-exists checks presence, not validity, and
+    # would treat a corrupt file as permanently "already done" (confirmed
+    # for real 2026-09-02: a disk-full OSError mid-write left a 0-byte
+    # gbm/39_timing.json that needed a manual delete to unblock).
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(entries, f, indent=2, ensure_ascii=False)
+    tmp_path.replace(output_path)
 
 
 def process_story(
@@ -347,13 +355,27 @@ def process_story(
 
 
 def write_run_manifest(iso: str, results: list[dict]) -> Path:
+    """Merge new story results into any existing run manifest for this iso,
+    rather than overwriting it — an incremental run (e.g. remaining stories
+    after an earlier partial batch) would otherwise silently drop prior
+    stories' records from the manifest, even though their timing output on
+    disk is untouched.
+    """
+    path = OBS_RUNS_DIR / f"{iso}.json"
+    prior_by_story = {}
+    if path.exists():
+        with open(path) as f:
+            prior_by_story = {r["story_id"]: r for r in json.load(f).get("results", [])}
+    for r in results:
+        prior_by_story[r["story_id"]] = r
+    merged = [prior_by_story[sid] for sid in sorted(prior_by_story)]
+
     manifest = {
         "iso": iso,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "results": results,
+        "results": merged,
     }
     OBS_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    path = OBS_RUNS_DIR / f"{iso}.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     return path
@@ -385,10 +407,22 @@ def main():
     for story_id in sorted(stories):
         story_job = stories[story_id]
         log(f"[{story_id}] aligning ({story_job.get('segment_count', '?')} segments)...")
-        stats = process_story(
-            args.iso, story_id, story_job, batch, config,
-            bundle, model, tokenizer, aligner, uroman, force=args.force,
-        )
+        try:
+            stats = process_story(
+                args.iso, story_id, story_job, batch, config,
+                bundle, model, tokenizer, aligner, uroman, force=args.force,
+            )
+        except Exception as e:
+            # One story's failure must never take down the rest of the
+            # language — confirmed for real 2026-09-02: a disk-full OSError
+            # partway through one story (uncaught here previously) killed
+            # the whole remaining run, leaving every later story unattempted
+            # even though nothing about them was actually broken. Matches
+            # align_pipeline.py's per-chapter error handling, which this
+            # script never had.
+            log(f"[{story_id}] ERROR: {e}", "ERROR")
+            run_results.append({"story_id": story_id, "status": "failed", "error": str(e)})
+            continue
         if stats.get("skipped"):
             log(f"[{story_id}] skipped (exists)")
             continue

@@ -192,9 +192,63 @@ def verse_anchored_align(
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0
 
+        # The chapter's last verse gets a floor-independent retry when the
+        # primary (floor-anchored) attempt is about to fall back — floor
+        # here is the PREVIOUS verse's own reported end, and for the last
+        # verse that's uniquely unreliable in both directions: (a) that
+        # previous verse's end may have been legitimately capped down to
+        # avoid overshooting (see the cap below), pushing this verse's
+        # floor earlier than reality, or (b) the previous verse's own CTC
+        # match may itself have overshot PAST the true boundary, handing
+        # this verse a floor later than reality. Confirmed both directly
+        # 2026-09-03: ace/1CO16 v24 (floor 1.45s too early, from the cap)
+        # and hak/1CH21 v30 (floor 8.5s too late, from verse 29's own
+        # overshoot) both fell back with the primary attempt, but a
+        # window built from exp_start alone — ignoring floor entirely —
+        # found the real content in both cases (0.73 and 0.98 score).
+        # Every other verse keeps relying on floor as before: this
+        # unreliability is specific to the last verse, which is the only
+        # one with no *following* verse whose own successful anchor could
+        # otherwise correct for an errant floor on the next iteration.
+        is_last_verse = i == len(non_empty_verses) - 1
+        used_alt_window = False
+        if is_last_verse and (not local_words or local_avg < min_local_score):
+            alt_win_start = max(0.0, exp_start - window)
+            alt_win_end = min(total_duration, exp_start + exp_dur + window)
+            if alt_win_end - alt_win_start < min_required:
+                alt_win_end = min(total_duration, alt_win_start + min_required)
+            if alt_win_end - alt_win_start >= 1.0 and (alt_win_start, alt_win_end) != (win_start, win_end):
+                try:
+                    alt_words = realign_from_point(
+                        waveform, sample_rate, alt_win_start, verse_text,
+                        bundle, model, tokenizer, aligner, uroman, end_time=alt_win_end,
+                    )
+                except CudaContextPoisonedError:
+                    raise
+                except RuntimeError:
+                    alt_words = []
+                alt_scores = [w["score"] for w in alt_words if w["score"] > 0]
+                alt_avg = sum(alt_scores) / len(alt_scores) if alt_scores else 0.0
+                if alt_avg > local_avg:
+                    local_words, local_avg = alt_words, alt_avg
+                    used_alt_window = True
+
         if local_words and local_avg >= min_local_score:
             start = local_words[0]["start"]
             end = local_words[-1].get("end", start)
+            if used_alt_window and start < floor:
+                # The alt window deliberately ignores floor to escape a
+                # possibly-errant one (see above) — but floor is also the
+                # previous verse's own reported end, and reporting this
+                # verse starting before that would be a backwards
+                # timestamp (confirmed 2026-09-03: awa/LUK24 and
+                # khk/PSA57 both regressed this way before this clamp).
+                # Only the verse-level boundary is clamped; word_results
+                # below keeps the real per-word timestamps the alt window
+                # found, so the richer detail isn't lost, just the single
+                # reported verse start.
+                start = floor
+                end = max(end, start)
             if i < len(non_empty_verses) - 1:
                 # Cap the floor's forward advance at the next verse's
                 # pace-based expected start (prevents runaway overshoot —

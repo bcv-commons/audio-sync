@@ -52,8 +52,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+
 from align_pipeline import build_refs_from_books
+from check_timing_quality import check_language
+from check_verse_only_fallback import check_language_fallback
 from hw_config import load_hw_config
+from purge_aligned_audio import purge_iso_audio
 from whisper_transcribe import NT_BOOKS, OT_BOOKS, load_all_template_refs
 
 ALL_BOOKS = {**OT_BOOKS, **NT_BOOKS}
@@ -212,6 +217,13 @@ def main():
         help=f"Number of concurrent align_pipeline.py processes per language (default: {hw['parallel_workers']}, "
              "from conf/hw.local.json's parallel_workers)",
     )
+    parser.add_argument(
+        "--keep-audio", action="store_true",
+        help="Don't purge downloads/BB/**/*.mp3 after a language finishes (default: purge — see "
+             "tools/purge_aligned_audio.py). Only chapters with a completed _timing.json + "
+             "_words.json pair are ever touched; word-timing-data/, export/timing-data/, and "
+             "every non-.mp3 download stay untouched either way.",
+    )
     args, passthrough = parser.parse_known_args()
 
     if args.workers < 1:
@@ -239,6 +251,78 @@ def main():
         ok = shard_one_language(iso, dict(base_refs), args.workers, passthrough)
         if not ok:
             failed_isos.append(iso)
+
+        # Read-only quality check — logs a warning if this language has
+        # real DUPES/BACKWARDS chapters (DUPES-EMPTY and DUPES-OK are
+        # benign, see check_timing_quality.py's check_language()) so a
+        # regression is visible in the batch log immediately rather than
+        # only surfacing whenever someone happens to run a manual quality
+        # sweep. Deliberately does NOT auto-fix (delete + reprocess) —
+        # not every flagged chapter is fixable by simply re-running (a
+        # genuine CTC-infeasible text/audio mismatch fails the same way
+        # every time, confirmed 2026-09-02 across por/bul/tur/kaz), so an
+        # unconditional auto-retry would just burn GPU time on chapters
+        # that need a human to look at them, not another attempt. Runs
+        # BEFORE the audio purge below on purpose: an eventual auto-fix
+        # step would need this chapter's audio still on disk to resolve
+        # its distinct_id (confirmed 2026-09-02 — a fully-purged language
+        # has no local way to resolve which edition to re-align without a
+        # batch manifest), so this is the right place for that check to
+        # eventually slot in, not after purge.
+        try:
+            result = check_language(iso, testament=None)
+        except Exception as e:
+            log(f"[{iso}] Quality check failed (non-fatal): {e}")
+        else:
+            if result and result["has_issues"]:
+                log(f"[{iso}] Quality check: {result['has_issues']}/{result['chapters']} chapter(s) "
+                    f"flagged (dupes={result['total_dupes']}, backwards={result['total_backwards']}, "
+                    f"low-score={result['total_low_q']}) — see 'python tools/check_timing_quality.py "
+                    f"--iso {iso}' for detail, 'python tools/requeue_dupes_chapters.py --iso-list {iso}' "
+                    "to requeue fixable DUPES chapters")
+
+        # Verse-only-mode fallback check — only fires for a language whose
+        # quality output actually shows the verse_only_mode vocabulary
+        # ("local"/"fallback" per-word source tags from
+        # align_verse_words.py), which covers both a language configured
+        # for it permanently (pipeline/config/languages/<iso>.toml) and
+        # one align_pipeline.py auto-switched into it mid-run for just a
+        # few hard chapters — going by actual output shape rather than
+        # the config flag is what makes this catch both cases. A high
+        # fallback rate is invisible to the DUPES/LOW-SCORE check above:
+        # a chapter can average a fine-looking score while still having
+        # whole verses that are pure pace-estimates, never really
+        # aligned (confirmed 2026-09-03 — bod's corpus-wide rate is
+        # 23.1%, 147/227 chapters at or above 20% fallback, none of
+        # which stood out under the generic quality check).
+        try:
+            vo_result = check_language_fallback(iso, testament=None)
+        except Exception as e:
+            log(f"[{iso}] Verse-only fallback check failed (non-fatal): {e}")
+        else:
+            if vo_result and vo_result["flagged_chapters"]:
+                log(f"[{iso}] Verse-only fallback check: {vo_result['flagged_chapters']}/"
+                    f"{vo_result['chapters']} chapter(s) at/above 20% fallback "
+                    f"(overall {vo_result['overall_fallback_rate']:.1%} of "
+                    f"{vo_result['total_verses']} verses) — see "
+                    f"'python tools/check_verse_only_fallback.py --iso {iso}' for detail")
+
+        # Purge cached source audio for whatever chapters just completed —
+        # self-verifying at the chapter level (only ever deletes an mp3
+        # whose _timing.json + _words.json both already exist), so this
+        # runs regardless of `ok`: a partially-failed language still gets
+        # its genuinely-completed chapters' audio reclaimed, and nothing
+        # unfinished is ever touched. See tools/purge_aligned_audio.py's
+        # module docstring for why this exists (2026-09-02 disk-full
+        # incident) and why it's safe (downloads/BB/ is a re-fetchable
+        # cache, not primary output).
+        if not args.keep_audio:
+            try:
+                deleted, freed = purge_iso_audio(iso)
+                if deleted:
+                    log(f"[{iso}] Purged {deleted} aligned chapter's mp3(s), {freed / 1e9:.2f} GB freed")
+            except OSError as e:
+                log(f"[{iso}] Audio purge failed (non-fatal): {e}")
 
     log("")
     if failed_isos:

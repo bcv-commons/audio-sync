@@ -1,0 +1,13 @@
+# Yiddish (Hebrew script) text processing configuration
+# Used by MMS forced alignment pipeline
+
+# Strip nonspacing marks (niqqud - occasional qamats U+05B8 found in text)
+strip_unicode_categories = ["Mn"]
+
+# Pronunciation substitution: ה׳ (he + geresh) is the divine name abbreviation
+[pronunciation_map]
+"ה׳" = "hashem"
+
+# Non-breaking hyphen (U+2011) used in compounds like ג‑ט -> space
+[char_replacements]
+"\u2011" = " "

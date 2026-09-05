@@ -2,8 +2,8 @@
 """
 Pre-publish plausibility gate for scripts/publish-align.sh.
 
-Scans the exact tree about to be published for two independent, unrelated
-defect shapes:
+Scans the exact tree about to be published for three independent,
+unrelated defect shapes:
 
   1. Backwards timestamp jumps (*_timing.json) — a verse whose timestamp
      is earlier than the previous verse's. Unlike dupes/gaps/tiny-steps
@@ -20,6 +20,17 @@ defect shapes:
      on-disk fingerprint of a poisoned CUDA context (pipeline/gpu_health.py),
      confirmed real 2026-08-12 across 4,926 chapters that "succeeded" with
      no error while producing unusable output.
+
+  3. Legacy pre-compact-format *_timing.json (the old per-verse-dict list
+     shape, superseded by the Aug 12 {"pos": [...]} redesign — see
+     is_legacy_format()). Not a quality defect, just a shape no current or
+     downstream reader should be fed. Confirmed 2026-09-01: the only
+     source left is dramatized/alt ("N2DA"/"O2DA") audio tracks, which
+     pipeline/whisper_transcribe.py's discover_chapter_files() has since
+     deliberately stopped aligning whenever a standard track exists (a
+     quality decision — dramatized audio measurably hurts alignment), so
+     this set can never grow from the current pipeline; it only quarantines
+     the ~453 spa/SPABDA+SPAWTC files left over from before that decision.
 
 Both checks need no prior/before state to compare against — each is a
 standalone judgment about the file's own content, unlike
@@ -122,6 +133,24 @@ def has_fallback_corruption(quality_path: Path) -> bool:
     return null_fraction >= _FALLBACK_NULL_FRACTION or avg_score <= _FALLBACK_AVG_SCORE_MAX
 
 
+def is_legacy_format(timing_path: Path) -> bool:
+    """True if this *_timing.json is still the old per-verse-dict list
+    shape instead of the compact {"pos": [...]} dict.
+
+    Excludes export/timing-data/obs/ — OBS's story/segment timing files
+    are also a JSON list, but that's their own unrelated Contract-B shape
+    (see pipeline/align_obs_words.py), not this pipeline's legacy format.
+    """
+    if "/obs/" in timing_path.as_posix():
+        return False
+    try:
+        with open(timing_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    return isinstance(data, list)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
@@ -144,10 +173,15 @@ def main():
         for qf in sorted(TIMING_DIR.rglob("*_words_quality.json"))
         if has_fallback_corruption(qf)
     ]
+    legacy_stems = [
+        tf.stem.replace("_timing", "")
+        for tf in sorted(TIMING_DIR.rglob("*_timing.json"))
+        if is_legacy_format(tf)
+    ]
 
-    # Union — a chapter can in principle trip both checks; the exclude
-    # list only needs each stem once regardless of how many reasons.
-    all_stems = sorted(set(backwards_stems) | set(fallback_stems))
+    # Union — a chapter can in principle trip more than one check; the
+    # exclude list only needs each stem once regardless of how many reasons.
+    all_stems = sorted(set(backwards_stems) | set(fallback_stems) | set(legacy_stems))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # One glob pattern per chapter, matches all its output files
@@ -165,6 +199,8 @@ def main():
         _print_flagged("a backwards timestamp jump", backwards_stems)
     if fallback_stems:
         _print_flagged("fallback/failure collapse (near-total null/zero-score alignment)", fallback_stems)
+    if legacy_stems:
+        _print_flagged("legacy pre-compact-format timing.json", legacy_stems)
 
     if all_stems:
         print(f"[pre-publish-check] {len(all_stems)} chapter(s) total quarantined — full list: {args.out}")

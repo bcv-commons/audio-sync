@@ -41,6 +41,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -205,6 +206,42 @@ def _catalog_entries(iso: str, canon: str, distinct_id: str, catalog_name: str) 
         by_distinct_id = catalog.get(key, {})
         if distinct_id in by_distinct_id:
             return by_distinct_id[distinct_id]
+    return []
+
+
+def audio_distinct_ids_from_catalog(iso: str, canon: str) -> list[str]:
+    """Every distinct_id with audio for this (iso, canon), per the CDN catalog.
+
+    The reverse of _catalog_entries(): that answers "what filesets does this
+    KNOWN edition have", this answers "which editions exist at all" — which
+    is what you need when nothing local tells you the edition's name.
+
+    That gap is a real failure mode, not a hypothetical.
+    generate_work_items() (whisper_transcribe.py) identifies an edition by
+    scanning downloads/BB/ for a directory containing at least one .mp3 and
+    taking that directory's NAME as the distinct_id. But
+    tools/purge_aligned_audio.py deletes the mp3s once a language finishes,
+    keeping only text — so afterwards the directory still exists, still
+    named e.g. HAKTHV, and is skipped anyway for having no audio in it. With
+    no local metadata either, the work item falls through to a
+    distinct_id=None placeholder and align_pipeline.py silently drops it
+    ("no distinct_id resolved locally or in the batch"), exiting 0 having
+    done nothing. Confirmed 2026-09-04: a last-verse-fix rollout skipped
+    2,075 of 3,510 targeted chapters this way and still reported success.
+
+    The circularity is the point — to download the audio you must know the
+    edition, and the code learnt the edition by looking for the audio. This
+    breaks it with the published catalog instead, which resolves 103 of the
+    111 editions that rollout needed.
+
+    Returns [] on any miss, so callers keep their existing fallbacks.
+    """
+    catalog = _load_dbt_catalog("catalog-audio").get("entries", {})
+    canon_l = canon.lower()
+    for key in (f"{iso}:{canon_l}", f"{iso}:{canon_l}p"):
+        by_distinct_id = catalog.get(key)
+        if by_distinct_id:
+            return sorted(by_distinct_id)
     return []
 
 
@@ -424,31 +461,75 @@ def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> tup
     return "dbt", None
 
 
-def has_usable_text_source(iso: str, canon: str, distinct_id: str) -> bool:
+def _scan_existing_text_chapters(edition_dir: Path) -> frozenset[tuple[str, int]]:
+    """Scan an edition's directory for (book, chapter) pairs that already
+    have a real .txt file on disk, parsed from the standard
+    BOOK_chapter_fileset.txt naming convention. Cheap filesystem walk, no
+    network — used to scope processing to chapters known to already have
+    text when the catalog has ruled out fetching any more."""
+    if not edition_dir.is_dir():
+        return frozenset()
+    found = set()
+    for txt_path in edition_dir.rglob("*.txt"):
+        parts = txt_path.stem.split("_", 2)
+        if len(parts) < 3:
+            continue
+        book, chapter_str = parts[0], parts[1]
+        try:
+            found.add((book, int(chapter_str)))
+        except ValueError:
+            continue
+    return frozenset(found)
+
+
+def has_usable_text_source(
+    iso: str, canon: str, distinct_id: str,
+) -> bool | frozenset[tuple[str, int]]:
     """
     Cheap upfront check: does ANY text source (DBT's own catalog fileset,
     or a verified helloAO overlap match) exist for (iso, canon,
     distinct_id)? Catalogs are cached after first load, so this is cheap
     to call once per edition.
 
-    Lets a caller skip an entire edition in one line instead of
-    discovering "no text anywhere" one chapter at a time — every chapter
-    would otherwise repeat the same catalog lookups and log its own "no
-    text file" warning. Real example: fra's FRALSN and FRAPDV have full
-    audio downloaded but no DBT text fileset and no verified helloAO
-    overlap match — every one of their chapters fails identically, so
-    there's no point starting.
+    Lets a caller skip (or scope down) an entire edition in one line
+    instead of discovering "no text anywhere" one chapter at a time —
+    every chapter would otherwise repeat the same catalog lookups and log
+    its own "no text file" warning. Real example: fra's FRALSN and
+    FRAPDV have full audio downloaded but no DBT text fileset and no
+    verified helloAO overlap match — every one of their chapters fails
+    identically, so there's no point starting.
 
-    Not a perfect substitute for the per-chapter check (which also trusts
-    catalog-verified text files already on disk), just a fast pre-filter —
-    an edition that fails this check will fail every one of its chapters
-    the same way, so skipping early only saves wasted work, it never
-    causes a false skip of real work — EXCEPT if the catalog itself is
-    unreachable (CDN down), in which case the per-chapter code falls back
-    to trusting whatever text is already on disk (see whisper_transcribe.py
-    _expected_text_tags()'s catalog_available). This mirrors that same
-    escape hatch: if catalog-text.json failed to load at all, assume
-    usable rather than risk a false skip of real, already-downloaded work.
+    Returns one of three shapes — callers must check for all three:
+      True      — proceed unrestricted, normal per-chapter flow. Covers:
+                  a confirmed DBT/helloAO text source; the catalog itself
+                  being unreachable (fail open — see below); and an
+                  edition the catalog has *no* record of at all (neither
+                  audio nor text — a manually-imported edition like BSB/
+                  Hays via josh/import_bsb_hays.py, or a contrib/ import,
+                  never registered in an external catalog to begin with).
+                  That last case is "unknown", not "verified wrong", so
+                  it's trusted the same way the per-chapter fallback in
+                  whisper_transcribe.py trusts it.
+      False     — no usable text anywhere for this edition; skip it
+                  entirely.
+      frozenset — the catalog *does* know this specific edition (it has
+                  an audio fileset) and explicitly confirms it has no
+                  text fileset. Chapters here are guaranteed to 404/fail
+                  identically, so don't attempt fresh downloads for them —
+                  but real text already sitting on disk (e.g. a handful
+                  of manually-added chapters, not catalog-registered but
+                  not fabricated either) is genuine, already-verified
+                  content and shouldn't be thrown away just because the
+                  catalog has nothing to say about it. The returned set
+                  is exactly the (book, chapter) pairs to keep; the
+                  caller should skip every chapter not in it without
+                  attempting a download.
+
+    A caller only needs the disk-scan case (frozenset) for the batch/
+    fetch-ahead path — the ad-hoc bulk disk-scan path
+    (discover_chapter_files with required_chapters=None) already only
+    ever surfaces chapters with real audio+text pairs on disk, so it
+    can't be fooled by this in the first place.
     """
     if not _load_dbt_catalog("catalog-text").get("entries"):
         return True
@@ -458,19 +539,34 @@ def has_usable_text_source(iso: str, canon: str, distinct_id: str) -> bool:
     catalog_fs = get_best_fileset_from_catalog(iso, canon, distinct_id)
     if catalog_fs and catalog_fs.get("text_fileset"):
         return True
-    # Neither DBT's catalog nor a verified helloAO match knows about this
-    # edition at all — true for any manually-imported edition that was
-    # never registered in an external catalog to begin with (e.g. BSB/Hays
-    # via josh/import_bsb_hays.py, or contrib/ imports). The catalog checks
-    # above only ever answer "is this discoverable externally", not "does
-    # real text already exist" — so before concluding "no usable text
-    # source", check disk directly for at least one already-downloaded
-    # text file. This is the same "trust what's already on disk" escape
-    # hatch the module docstring already promises for the CDN-unreachable
-    # case, just extended to editions that were never catalog-discoverable
-    # in the first place.
+
     edition_dir = OUTPUT_DIR / canon.lower() / iso / distinct_id
-    return edition_dir.is_dir() and any(edition_dir.rglob("*.txt"))
+
+    if catalog_fs is None:
+        # Neither DBT's catalog nor a verified helloAO match knows about
+        # this edition at all (no audio entry, no text entry) — true for
+        # any manually-imported edition that was never registered in an
+        # external catalog to begin with. The catalog checks above only
+        # ever answer "is this discoverable externally", not "does real
+        # text already exist" — so before concluding "no usable text
+        # source", check disk directly for at least one already-
+        # downloaded text file. This is the same "trust what's already on
+        # disk" escape hatch the module docstring already promises for
+        # the CDN-unreachable case, just extended to editions that were
+        # never catalog-discoverable in the first place. Unrestricted
+        # (not scoped to a chapter set) since a manual import's text is
+        # typically pre-populated in full by its own import step, not
+        # fetched chapter-by-chapter here.
+        return edition_dir.is_dir() and any(edition_dir.rglob("*.txt"))
+
+    # The catalog DOES know this edition — it has an audio fileset — and
+    # explicitly has no text fileset for it. Every chapter we don't
+    # already have text for is a guaranteed, identical failure, so scope
+    # down to exactly what's already on disk rather than trusting the
+    # edition wholesale (which would otherwise trigger a fresh
+    # download+reject cycle for every remaining chapter, one at a time).
+    existing = _scan_existing_text_chapters(edition_dir)
+    return existing if existing else False
 
 
 def _fetch_helloao_chapter(helloao_id, book, chapter_num, dest_path):
@@ -490,6 +586,7 @@ def _fetch_helloao_chapter(helloao_id, book, chapter_num, dest_path):
 
     content = data.get("chapter", {}).get("content", [])
     verses = []
+    raw_verses = []
     for item in content:
         if item.get("type") == "verse":
             text_parts = []
@@ -498,13 +595,19 @@ def _fetch_helloao_chapter(helloao_id, book, chapter_num, dest_path):
                     text_parts.append(part["text"])
                 elif isinstance(part, str):
                     text_parts.append(part)
-            verses.append(" ".join(text_parts))
+            verse_text = " ".join(text_parts)
+            verses.append(verse_text)
+            raw_verses.append({
+                "verse_start": item.get("number"),
+                "verse_end": None,
+                "verse_text": verse_text,
+            })
 
     if not verses:
         return False
 
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    dest_path.write_text("\n".join(verses) + "\n", encoding="utf-8")
+    _atomic_write_text(dest_path, "\n".join(verses) + "\n")
+    _write_raw_json(dest_path, "helloao", helloao_id, raw_verses)
     return True
 
 
@@ -536,6 +639,49 @@ def _get_external_text_source(iso, distinct_id):
                 if ebible_id:
                     return "ebible", ebible_id
     return None, None
+
+
+def _atomic_write_text(dest_path: Path, content: str) -> None:
+    """Write content to dest_path atomically: build it in a temp file in the
+    same directory, then os.replace() it into place. Same directory matters
+    (os.replace is only atomic within one filesystem/mount).
+
+    This tree (downloads/BB) now has more than one writer — lexeme-aligner's
+    write-back path builds the same .txt/.raw.json files via its own
+    temp-file-then-os.replace() when it hits a cache miss we don't have yet.
+    A plain open(...).write() here would let a concurrent reader observe a
+    truncated/partial file if the two writers' timing overlaps; os.replace()
+    guarantees any reader always sees either the old complete file or the
+    new complete file, never a torn one.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=dest_path.parent, prefix=f".{dest_path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_name, dest_path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _write_raw_json(txt_path: Path, source: str, fileset_id: str, verses: list[dict]) -> None:
+    """Write the verse-structured sibling of a downloaded .txt file, e.g.
+    ACT_014_KHKNTPN_ET.txt -> ACT_014_KHKNTPN_ET.raw.json.
+
+    Shared cache format for lexeme-aligner (sibling repo) so it can reuse
+    text this pipeline already fetched instead of hitting DBT/helloAO again.
+    Purely additive — nothing here reads this file back, so it can't affect
+    existing behavior. verse_end preserves bridged-verse chapters (e.g.
+    verses 5-6 printed as one unit), which the .txt file's one-line-per-verse
+    format silently loses.
+    """
+    raw_path = txt_path.with_suffix(".raw.json")
+    content = json.dumps(
+        {"source": source, "fileset_id": fileset_id, "verses": verses},
+        ensure_ascii=False, indent=0,
+    )
+    _atomic_write_text(raw_path, content)
 
 
 def _write_source_json(base_dir, audio_source, text_source):
@@ -1104,19 +1250,24 @@ def download_text(
             response = _get_with_retry(text_content["data"], timeout=DOWNLOAD_TIMEOUT)
             response.raise_for_status()
 
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(response.text)
+            _atomic_write_text(output_path, response.text)
 
         elif text_content["type"] == "verses":
             # Extract verse text from inline data (plain text format)
             verses = []
+            raw_verses = []
             for verse_data in text_content["data"]:
                 verse_text = verse_data.get("verse_text", "")
                 if verse_text:
                     verses.append(verse_text)
+                    raw_verses.append({
+                        "verse_start": verse_data.get("verse_start"),
+                        "verse_end": verse_data.get("verse_end"),
+                        "verse_text": verse_text,
+                    })
 
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(verses))
+            _atomic_write_text(output_path, "\n".join(verses))
+            _write_raw_json(output_path, "dbt", fileset_id, raw_verses)
 
         log(f"  ✓ Downloaded: {output_path.name}", "INFO")
         stats.downloaded_from_api += 1

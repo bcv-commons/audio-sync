@@ -59,7 +59,12 @@ from pathlib import Path
 from batch_manifest import get_book_chapters, load_batch
 from download_language_content import download_job
 from hw_config import load_hw_config
-from text_processing import LanguageConfig, load_language_config, normalize_text
+from text_processing import (
+    LanguageConfig,
+    load_language_config,
+    map_audio_chapter_to_text,
+    normalize_text,
+)
 
 PRIORITY_LANGUAGES_FILE = Path("whisper-priority-languages.json")
 DOWNLOADS_DIR = Path("downloads/BB")
@@ -434,16 +439,52 @@ def generate_work_items(
                         "has_downloads": False,
                     })
             else:
-                # Custom language with no metadata and nothing on disk —
-                # create a placeholder so auto-download can discover filesets
-                work_items.append({
-                    "iso": iso,
-                    "language": lang_name,
-                    "tier": tier,
-                    "canon": canon,
-                    "distinct_id": None,
-                    "has_downloads": False,
-                })
+                # Nothing on disk and no local metadata. Before falling back
+                # to a distinct_id=None placeholder — which align_pipeline.py
+                # silently DROPS ("no distinct_id resolved locally or in the
+                # batch"), so the run exits 0 having done nothing — ask the
+                # published catalog which editions actually have audio here.
+                #
+                # This is the normal state for any language whose audio has
+                # been purged (tools/purge_aligned_audio.py runs after every
+                # language): the directory survives, still named e.g. HAKTHV,
+                # but has_local_audio is False so the branch above skips it,
+                # and the edition's name is lost even though it's sitting in
+                # the path. Confirmed 2026-09-04 to have silently skipped
+                # 2,075 of 3,510 chapters in a targeted re-run.
+                from download_language_content import audio_distinct_ids_from_catalog
+
+                catalog_ids = audio_distinct_ids_from_catalog(iso, canon)
+                if catalog_ids:
+                    for distinct_id in catalog_ids:
+                        work_items.append({
+                            "iso": iso,
+                            "language": lang_name,
+                            "tier": tier,
+                            "canon": canon,
+                            "distinct_id": distinct_id,
+                            # True because the catalog asserts this edition
+                            # HAS audio — the flag gates whether the edition
+                            # is processed at all (align_pipeline.py skips
+                            # has_downloads=False outright), it does not mean
+                            # "already on disk". Actual fetching is per
+                            # chapter via ensure_chapter_ready(). This is the
+                            # same claim a batch manifest makes with its own
+                            # "has_downloads": true, which is why supplying
+                            # one worked where local resolution didn't.
+                            "has_downloads": True,
+                        })
+                else:
+                    # Genuinely unknown — keep the placeholder so auto-download
+                    # can still try to discover filesets.
+                    work_items.append({
+                        "iso": iso,
+                        "language": lang_name,
+                        "tier": tier,
+                        "canon": canon,
+                        "distinct_id": None,
+                        "has_downloads": False,
+                    })
 
     return work_items
 
@@ -547,6 +588,10 @@ def discover_chapter_files(
         suffix = "O2DA" if canon == "ot" else "N2DA"
         external_audio_fileset = f"{distinct_id}{suffix}"
 
+    # Needed only for chapter_map (audio/text versification mismatch). Cheap
+    # and cached per ISO, so load once here rather than per chapter.
+    config = load_language_config(iso)
+
     for book_dir in sorted(base_dir.iterdir()):
         if not book_dir.is_dir():
             continue
@@ -579,10 +624,32 @@ def discover_chapter_files(
                 continue
 
             is_drama = "2DA" in audio_fileset or "2SA" in audio_fileset
-            key = (file_book, chapter_num)
+
+            # Audio and text can use different versification schemes, in
+            # which case this mp3 does NOT contain the same-numbered text
+            # chapter (see map_audio_chapter_to_text()). Remap here, at the
+            # single point where an audio chapter is turned into a lookup
+            # key, so that everything downstream — the text glob below, the
+            # output filenames, and therefore what consumers see on the CDN
+            # — is keyed by the TEXT chapter this audio actually reads. The
+            # mp3 path itself keeps its own (audio) numbering, which is why
+            # audio_chapter is carried alongside for the on-demand download
+            # in align_pipeline.py.
+            #
+            # Only the real-mp3 loop needs this. The external-audio branch
+            # below iterates TEXT files and synthesises an mp3 name from the
+            # text chapter, so its numbering is text-native already.
+            text_chapter = map_audio_chapter_to_text(
+                config, file_book, audio_fileset, chapter_num)
+            if text_chapter is None:
+                continue
+            text_chapter_str = f"{text_chapter:03d}"
+
+            key = (file_book, text_chapter)
             if key not in chapter_mp3s:
                 chapter_mp3s[key] = []
-            chapter_mp3s[key].append((audio_fileset, mp3_path, is_drama, chapter_str))
+            chapter_mp3s[key].append(
+                (audio_fileset, mp3_path, is_drama, text_chapter_str, chapter_num))
 
         # External audio: also discover chapters that only have text files.
         # The mp3 will be fetched on demand by ensure_chapter_audio().
@@ -606,8 +673,10 @@ def discover_chapter_files(
                 # mp3_path is where the on-demand download will land
                 synth_mp3 = book_dir / f"{file_book}_{chapter_str}_{external_audio_fileset}.mp3"
                 is_drama = "2DA" in external_audio_fileset
+                # Text-native numbering here (see the remap comment above),
+                # so audio chapter == text chapter for this branch.
                 chapter_mp3s[key] = [
-                    (external_audio_fileset, synth_mp3, is_drama, chapter_str)
+                    (external_audio_fileset, synth_mp3, is_drama, chapter_str, chapter_num)
                 ]
 
         for (file_book, chapter_num), mp3_list in sorted(chapter_mp3s.items()):
@@ -670,7 +739,7 @@ def discover_chapter_files(
             filesets_to_align = standard if standard else drama
             whisper_fileset = standard[0][0] if standard else mp3_list[0][0]
 
-            for audio_fileset, mp3_path, is_drama, _ in filesets_to_align:
+            for audio_fileset, mp3_path, is_drama, _, audio_chapter_num in filesets_to_align:
                 out_book_dir = output_dir / canon / iso / distinct_id / file_book
                 whisper_book_dir = WORD_TIMING_DIR / canon / iso / distinct_id / file_book
                 whisper_words_filename = f"{file_book}_{chapter_str}_{audio_fileset}_whisper_words.json"
@@ -693,6 +762,13 @@ def discover_chapter_files(
                     "book": file_book,
                     "chapter": chapter_num,
                     "chapter_str": chapter_str,
+                    # Usually identical to "chapter". Differs only when a
+                    # chapter_map remapped this audio onto a differently-
+                    # numbered text chapter (see map_audio_chapter_to_text);
+                    # anything addressing the AUDIO — notably the on-demand
+                    # download in align_pipeline.py — must use this, not
+                    # "chapter", which now names the text.
+                    "audio_chapter": audio_chapter_num,
                     "audio_path": mp3_path,
                     "text_path": txt_path,
                     "audio_fileset": audio_fileset,

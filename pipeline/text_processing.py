@@ -30,6 +30,64 @@ class LanguageConfig:
     mms_fallback_threshold: float = 0.3
     aramaic_passages: list[str] = field(default_factory=list)
     verse_only_mode: bool = False
+    chapter_map: list[dict] = field(default_factory=list)
+
+
+def map_audio_chapter_to_text(
+    config: LanguageConfig,
+    book: str,
+    audio_fileset: str,
+    audio_chapter: int,
+) -> int | None:
+    """Translate an AUDIO chapter number into the TEXT chapter it actually reads.
+
+    An audio fileset and its paired text can follow different versification
+    schemes, in which case audio chapter N does not contain text chapter N.
+    The confirmed case (2026-09-04) is bul/BULCBV: the audio is Orthodox/LXX-
+    numbered while the text is Masoretic-numbered, so e.g. the file named
+    PSA_050 actually reads Psalm 51 — the narration even announces both
+    numbers ("Псалом петдесети. По-еврейски петдесет и първи"). Nothing
+    catches this today: DBT publishes no versification field (only
+    cdn.bibel.wiki/pkf/manifest.json has a "vrs" key, and it covers 2 of our
+    128 aligned languages), so the mapping is derived empirically from the
+    Whisper transcript and recorded in the language config.
+
+    Returns the text chapter number, or None when this audio chapter must be
+    skipped entirely. A None means the audio/text correspondence is a MERGE
+    (one audio chapter spans two text chapters, e.g. LXX Ps 9 = Hebrew Ps
+    9+10) or a SPLIT (two audio chapters cover one text chapter, e.g. LXX Ps
+    114+115 = Hebrew Ps 116). Neither is expressible as a chapter offset —
+    they need verse-range handling that doesn't exist yet — and skipping is
+    strictly better than the status quo, which aligns them against the wrong
+    text and silently emits confident-looking nonsense.
+
+    With no chapter_map configured (every language but bul today) this is an
+    identity function, so callers can apply it unconditionally.
+    """
+    if not config.chapter_map:
+        return audio_chapter
+
+    for rule in config.chapter_map:
+        if rule.get("book") != book:
+            continue
+        fileset = rule.get("audio_fileset")
+        if fileset and fileset != audio_fileset:
+            continue
+        if audio_chapter in rule.get("skip", []):
+            return None
+        for shift in rule.get("shifts", []):
+            lo, hi = shift.get("from"), shift.get("to")
+            if lo is None or hi is None:
+                continue
+            if lo <= audio_chapter <= hi:
+                return audio_chapter + shift.get("offset", 0)
+        # A rule matched this book/fileset but no range covered this chapter.
+        # That's an incomplete map rather than an intentional identity, so
+        # skip instead of guessing — an unmapped chapter in a book known to
+        # be misnumbered is exactly the case that produces silent nonsense.
+        return None
+
+    return audio_chapter
 
 
 _config_cache: dict[str, LanguageConfig] = {}
@@ -60,6 +118,7 @@ def load_language_config(iso: str) -> LanguageConfig:
             mms_fallback_threshold=data.get("mms_fallback_threshold", 0.3),
             aramaic_passages=data.get("aramaic_passages", []),
             verse_only_mode=data.get("verse_only_mode", False),
+            chapter_map=data.get("chapter_map", []),
         )
     else:
         config = LanguageConfig(iso=iso)

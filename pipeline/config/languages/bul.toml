@@ -1,0 +1,102 @@
+# Bulgarian (bul) — BULCBV audio/text versification mismatch.
+#
+# The BULCBV audio is Orthodox/LXX-numbered; its paired text is Masoretic-
+# numbered. So the mp3 named PSA_050 actually reads Psalm 51, and the
+# narration says so out loud: "Псалом петдесети. По-еврейски петдесет и
+# първи." ("Psalm 50. In Hebrew, 51.")
+#
+# Nothing upstream records this. DBT — where this edition comes from —
+# publishes no versification field at all; only cdn.bibel.wiki/pkf/
+# manifest.json carries a "vrs" key, and it covers 2 of our 128 aligned
+# languages (bul is not one of them). So the mapping below was derived
+# empirically on 2026-09-04 by scoring each chapter's Whisper transcript
+# against every text chapter in a +/-4 window
+# (scratchpad/bul_psalm_mapping.py). It reproduces the standard LXX/
+# Masoretic Psalm correspondence exactly, including all four irregular
+# points, which is a strong check that it is right rather than fitted:
+#
+#     audio 1-8     -> text 1-8       1:1
+#     audio 9       -> text 9 + 10    MERGE
+#     audio 10-112  -> text 11-113    shift +1
+#     audio 113     -> text 114 + 115 MERGE
+#     audio 114-115 -> text 116       SPLIT
+#     audio 116-145 -> text 117-146   shift +1
+#     audio 146-147 -> text 147       SPLIT
+#     audio 148-150 -> text 148-150   1:1
+#
+# Match scores are unambiguous: ~0.75-0.85 against the correct text vs
+# ~0.20-0.30 against the same-numbered one. The two MERGE chapters show
+# the expected twin-peak signature (audio 9 scores 0.83/0.81 against texts
+# 9/10 — it contains both).
+#
+# The two MERGE chapters are still mapped rather than skipped, because a
+# merge only means the audio holds MORE than the text chapter it's mapped
+# to — the mapped text still aligns correctly against its portion:
+#   audio 9   -> text 9   (0.83) — already correct today; skipping it would
+#                                  be a regression. Text 10 is the half with
+#                                  no audio of its own.
+#   audio 113 -> text 114 (vs 0.28 for its current text-113 pairing) —
+#                                  recoverable, so skipping it would waste a
+#                                  fixable chapter. Texts 114 and 115 scored
+#                                  0.81/0.83, which is within noise: the
+#                                  score divides by min(word count), so a
+#                                  shorter chapter scores higher for free.
+#                                  Mapped to the FIRST text chapter the audio
+#                                  begins with, consistently with audio 9
+#                                  and JOL audio 2 below — start-anchored
+#                                  alignment is more reliable than asking CTC
+#                                  to skip a whole preceding psalm.
+#
+# Only the SPLITs are skipped: there, two audio chapters each hold HALF of
+# one text chapter, so any single mapping covers half a chapter and leaves
+# the rest to fall back — precisely the "chapter's tail is garbage" shape
+# this fix exists to remove. That needs verse-range support, which doesn't
+# exist yet; skipping is the honest interim.
+#
+# Text chapters 10, 114, 116 and 147 therefore end up with no audio mapped
+# to them at all. Their existing output files are stale and WRONG (aligned
+# against mismatched audio) and must be deleted, not left in place — see
+# tools/prune_unmapped_chapters.py.
+[[chapter_map]]
+book = "PSA"
+audio_fileset = "BULCBVO2DA"
+shifts = [
+    { from = 1, to = 9, offset = 0 },
+    { from = 10, to = 112, offset = 1 },
+    { from = 113, to = 113, offset = 1 },
+    { from = 116, to = 145, offset = 1 },
+    { from = 148, to = 150, offset = 0 },
+]
+skip = [114, 115, 146, 147]
+
+# NOTE ON JOL BELOW: tools/derive_chapter_map.py regenerates these blocks
+# from the bibles repo's published versification data, and its PSA output
+# matches this file exactly. Its JOL output does NOT — it derives offset -1
+# where the correct answer is +1 — because of an upstream inconsistency:
+# rso.vrs declares a 3-chapter Joel (20/32/21), but rso-to-eng.json carries
+# rows mapping rso JOL 3:1-5 -> eng JOL 2:28-32, which only makes sense for
+# a 4-chapter Joel (they are byte-identical to org-to-eng.json's first five
+# JOL rows, so org rows appear to have leaked into the rso map). Hard
+# evidence says +1: this edition's text Joel has 4 chapters and its audio
+# chapter 3 has 21 verses, matching org JOL 4. Keep +1 by hand until the
+# upstream data is fixed; MAL and PSA derive correctly and need no override.
+#
+# Joel: the text is Hebrew-versified (4 chapters, 20/27/5/21 verses), the
+# audio Greek/English-versified (3 chapters). Audio 2 is a MERGE holding
+# Hebrew ch 2 AND 3, so it maps to text 2 (its first and much larger half,
+# 27 verses) — which is what it already does today, correctly. The detector
+# preferred text 3 there only because that chapter is 5 verses long and the
+# match score divides by min(word count); see the PSA note above. Text 3 is
+# left with no audio of its own.
+#
+# Note pipeline/canonical_verse_counts.json itself lists JOL with 4
+# chapters, i.e. that table is Hebrew-versified for this book — worth
+# knowing before treating it as a single-scheme reference.
+[[chapter_map]]
+book = "JOL"
+audio_fileset = "BULCBVO2DA"
+shifts = [
+    { from = 1, to = 2, offset = 0 },
+    { from = 3, to = 3, offset = 1 },
+]
+skip = []

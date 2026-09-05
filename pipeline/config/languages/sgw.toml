@@ -1,0 +1,23 @@
+# Sebat Bet Gurage (Ethiopic script) text processing configuration
+# Used by MMS forced alignment pipeline
+
+# Strip nonspacing marks (Mn) and Private Use Area characters (Co)
+# PUA chars (U+E000–U+E042) appear embedded in words in SGWBSE text files
+strip_unicode_categories = ["Mn", "Co"]
+
+# Auto-detected 2026-09-02: Whisper's transcript doesn't text-match
+# the reference for this language (header-detect fail rate 100% over 8 chapters, avg fused-word
+# share sourced from Whisper 0.0% over 8 chapters) —
+# an unreliable guide there does more harm than none at all (same
+# signal class as hin.toml's manually-confirmed case). Re-verify if
+# this looks wrong — thresholds are in align_pipeline.py's
+# AUTO_VERSE_ONLY_* constants.
+#
+# verse_only_mode skips Whisper entirely for this language and uses
+# align_verse_words.py's windowed, verse-anchored MMS-only alignment
+# instead (see pipeline/align_verse_words.py's module docstring).
+verse_only_mode = true
+
+[pronunciation_map]
+
+[char_replacements]
