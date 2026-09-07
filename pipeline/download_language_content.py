@@ -95,6 +95,18 @@ DBT_CATALOG_CDN_BASE = "https://cdn.bibel.wiki/catalog/"
 DBT_CATALOG_CACHE_DIR = Path("api-cache/dbt-catalog")
 _dbt_catalog_cache: dict[str, dict] = {}
 
+# How long an on-disk catalog copy is trusted before we re-check the CDN.
+# These files are small (4 of them, ~850KB total) and change rarely, but
+# "rarely" is not "never" and the cache had no expiry at all: whatever was
+# fetched first was reused forever. Ours went 3 weeks without a re-check
+# and only stayed correct by luck — a fileset added, renamed or withdrawn
+# upstream would have been invisible for as long as the file sat there,
+# while every lookup kept answering confidently from the stale copy.
+# A stale catalog is still far better than no catalog, so an expired entry
+# is refreshed opportunistically and falls back to the old copy whenever
+# the CDN can't be reached (see _load_dbt_catalog).
+CATALOG_MAX_AGE_SECONDS = int(os.environ.get("AUDIO_SYNC_CATALOG_MAX_AGE", 24 * 3600))
+
 # Internal `name` params keep their descriptive "catalog-*" form (used
 # throughout this module and its callers, and as the local cache
 # filename) — only the actual CDN filename changed.
@@ -164,14 +176,21 @@ def _load_dbt_catalog(name: str) -> dict:
         return _dbt_catalog_cache[name]
 
     cache_path = DBT_CATALOG_CACHE_DIR / f"{name}.json"
+    cached = None
     if cache_path.exists():
         try:
             with open(cache_path) as f:
-                data = json.load(f)
-            _dbt_catalog_cache[name] = data
-            return data
+                cached = json.load(f)
         except (OSError, json.JSONDecodeError):
-            pass
+            cached = None
+        else:
+            try:
+                fresh = (time.time() - cache_path.stat().st_mtime) < CATALOG_MAX_AGE_SECONDS
+            except OSError:
+                fresh = False
+            if fresh:
+                _dbt_catalog_cache[name] = cached
+                return cached
 
     import urllib.request
 
@@ -183,6 +202,13 @@ def _load_dbt_catalog(name: str) -> dict:
             raw = r.read()
         data = json.loads(raw)
     except Exception as e:
+        # An expired copy still beats nothing: going empty here would make
+        # every caller behave as if the edition were unknown, which is a
+        # far bigger change in behaviour than being a day out of date.
+        if cached is not None:
+            log(f"Failed to refresh {url} ({e}) — using cached copy", "WARNING")
+            _dbt_catalog_cache[name] = cached
+            return cached
         log(f"Failed to fetch {url}: {e}", "WARNING")
         data = {}
         _dbt_catalog_cache[name] = data
@@ -258,6 +284,29 @@ def _resolve_catalog_fileset_id(distinct_id: str, raw_id: str) -> str:
     return f"{distinct_id}{value}"
 
 
+def _resolve_text_fileset(text_entries: list, distinct_id: str) -> tuple[str | None, list[str]]:
+    """Pick the best text fileset from a list of catalog-text.json entries
+    for one distinct_id: plain > json > other, USX (fmt == ["u"]) dropped
+    entirely (DBT's USX endpoint often 404s even when listed). Shared by
+    get_best_fileset_from_catalog() (this distinct_id's own text) and
+    _find_unlinked_text_candidate() (another distinct_id's text, found via
+    catalog-overlap.json rather than a direct catalog-text.json match).
+
+    Returns (best_fileset_id_or_None, [candidates_in_priority_order]).
+    """
+    text_candidates = []
+    for e in text_entries:
+        fmt = e.get("fmt", [])
+        if fmt == ["u"]:
+            continue
+        fid = _resolve_catalog_fileset_id(distinct_id, e["id"])
+        base = 0 if "pl" in fmt else 1 if "j" in fmt else 2
+        text_candidates.append(((base, fid), fid))
+    text_candidates.sort()
+    candidates = [fid for _, fid in text_candidates]
+    return (candidates[0] if candidates else None), candidates
+
+
 def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> dict | None:
     """
     Resolve the best audio/text fileset for (iso, canon, distinct_id) from
@@ -310,20 +359,7 @@ def get_best_fileset_from_catalog(iso: str, canon: str, distinct_id: str) -> dic
                 alt_audio_fileset = fid
                 break
 
-    # Text priority: plain > json > other. USX dropped entirely — same
-    # reasoning as the old code: DBT's USX endpoint often 404s even when
-    # the fileset is listed.
-    text_candidates = []
-    for e in text_entries:
-        fmt = e.get("fmt", [])
-        if fmt == ["u"]:
-            continue
-        fid = _resolve_catalog_fileset_id(distinct_id, e["id"])
-        base = 0 if "pl" in fmt else 1 if "j" in fmt else 2
-        text_candidates.append(((base, fid), fid))
-    text_candidates.sort()
-    text_fileset_candidates = [fid for _, fid in text_candidates]
-    text_fileset = text_fileset_candidates[0] if text_fileset_candidates else None
+    text_fileset, text_fileset_candidates = _resolve_text_fileset(text_entries, distinct_id)
 
     if not audio_fileset and not text_fileset:
         return None
@@ -420,6 +456,95 @@ def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> str | None:
     return None
 
 
+def _find_unlinked_text_candidate(iso: str, canon: str, distinct_id: str) -> dict | None:
+    """Find a text candidate for an audio edition catalog-overlap.json has
+    never linked to distinct_id at all — i.e. our audio has no text of its
+    own (get_best_fileset_from_catalog's text side is empty) AND
+    _find_helloao_id() found no group containing f"d:{distinct_id}".
+
+    catalog-overlap.json isn't just a binary verified/not-verified index —
+    the bibles repo's comparator also publishes its own graded verdict on
+    candidates it couldn't link to anything in particular: a "likely"
+    classification (orthography_convention / dialect_variant /
+    distinct_translation) plus a numeric "score", e.g. (confirmed on disk
+    2026-09-07, catalog-overlap.json schema_version 2):
+
+        ita:nt  {"ids": ["d:ITALND"], "likely": "dialect_variant",
+                 "closest": "d:ITAR27", "score": 0.8737}
+        hrv:nt  {"ids": ["h:hrv_bib"], "likely": "distinct_translation",
+                 "closest": "h:hrv_iva", "score": 0.7128}
+
+    That's real signal we were discarding entirely by only ever looking for
+    groups containing our own distinct_id. Two tiers of it are trustworthy
+    enough to use automatically, both because they say something about
+    edition quality/consistency, not because they say anything about
+    matching THIS audio's specific translation choice (they don't — that
+    would need bibles' own comparator to run a probe against this
+    distinct_id directly, tracked separately, see docs/text-comparison-
+    requests.md):
+
+      Tier 0 — a genuine multi-id group (2+ ids, no "r": false, no "score")
+               for this iso:canon. Same trust class the *linked* path
+               already relies on: multiple independent sources (DBT/
+               helloAO) agree with each other. It just doesn't happen to
+               include our distinct_id.
+      Tier 1 — a singleton group whose own "likely" is "orthography_
+               convention" or "dialect_variant" (same underlying
+               translation family, differs only in spelling convention or
+               regional wording) — NOT "distinct_translation", which means
+               genuinely different wording per verse and carries real
+               forced-alignment risk if used unchecked. Ranked by score
+               within the tier.
+
+    "distinct_translation" candidates (Tier 2) are deliberately never
+    returned here, however high their score — they are exactly the case
+    the docstring above (and the session that added this function) flagged
+    as needing either a real bibles-repo probe against this specific
+    distinct_id, or a local audio-vs-text verification step, before being
+    trusted. See tools/list_unlinked_text_candidates.py, which surfaces
+    Tier 2 (and "nothing at all") candidates instead of silently using
+    them.
+
+    Returns None, or {"source": "dbt"|"helloao", "id": ..., "tier": 0|1,
+    "likely": ..., "score": ...}.
+    """
+    catalog = _load_dbt_catalog("catalog-overlap").get("entries", {})
+    canon_l = canon.lower()
+    tier0: list[tuple[str, str]] = []  # (source, id)
+    tier1: list[tuple[float, str, str, str]] = []  # (score, source, id, likely)
+    for key in (f"{iso}:{canon_l}", f"{iso}:{canon_l}p"):
+        for group in catalog.get(key, []):
+            if group.get("r") is False:
+                continue
+            ids = group.get("ids", [])
+            if f"d:{distinct_id}" in ids:
+                # Already handled by the direct-match path — not our case.
+                return None
+            if len(ids) >= 2 and "score" not in group:
+                for i in ids:
+                    src, _, val = i.partition(":")
+                    tier0.append(("dbt" if src == "d" else "helloao", val))
+                continue
+            likely = group.get("likely")
+            if likely in ("orthography_convention", "dialect_variant") and len(ids) == 1:
+                src, _, val = ids[0].partition(":")
+                tier1.append((group.get("score", 0.0), "dbt" if src == "d" else "helloao", val, likely))
+
+    if tier0:
+        # Prefer a DBT id (directly fetchable via download_text) over a
+        # helloAO one when both are present in the same tier.
+        tier0.sort(key=lambda t: t[0] != "dbt")
+        source, val = tier0[0]
+        return {"source": source, "id": val, "tier": 0, "likely": None, "score": None}
+
+    if tier1:
+        tier1.sort(key=lambda t: -t[0])
+        score, source, val, likely = tier1[0]
+        return {"source": source, "id": val, "tier": 1, "likely": likely, "score": score}
+
+    return None
+
+
 def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> tuple[str, str | None]:
     """
     Pick the best available text source for (iso, canon, distinct_id),
@@ -440,8 +565,18 @@ def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> tup
     translation).
 
     Returns (source, source_id):
-      ("helloao", helloao_id)  — prefer helloAO's verified-equivalent text
-      ("dbt", None)            — use DBT's own text (default / only option)
+      ("helloao", helloao_id)   — prefer helloAO's verified-equivalent text
+      ("dbt-other", distinct_id) — another DBT edition's text, found via an
+                                   unlinked-but-scored catalog-overlap.json
+                                   candidate (see _find_unlinked_text_candidate)
+      ("dbt", None)             — use DBT's own text (default / only option)
+
+    "helloao" here always means a *direct* verified match (a group
+    containing our own f"d:{distinct_id}"). "dbt-other"/"helloao" from
+    _find_unlinked_text_candidate() only fire when there's no direct match
+    at all — see that function's docstring for what "Tier 0"/"Tier 1"
+    trustworthy-without-a-direct-link actually means, and why it stops
+    short of "distinct_translation" candidates.
     """
     index = _load_dbt_catalog("catalog-index")
     canon_l = canon.lower()
@@ -450,15 +585,71 @@ def resolve_preferred_text_source(iso: str, canon: str, distinct_id: str) -> tup
         if row[0] == iso and row[1] in (canon_l, f"{canon_l}p")
     }
 
-    if not sources_at_canon or sources_at_canon <= {"d"}:
-        return "dbt", None
-
-    if "h" in sources_at_canon:
+    if sources_at_canon and not (sources_at_canon <= {"d"}) and "h" in sources_at_canon:
         hao_id = _find_helloao_id(iso, canon, distinct_id)
         if hao_id:
             return "helloao", hao_id
 
+    candidate = _find_unlinked_text_candidate(iso, canon, distinct_id)
+    if candidate:
+        log(
+            f"{iso}/{canon}/{distinct_id}: no direct text link — using "
+            f"catalog-overlap.json Tier {candidate['tier']} candidate "
+            f"{candidate['source']}:{candidate['id']}"
+            + (f" (likely={candidate['likely']}, score={candidate['score']:.3f})"
+               if candidate["tier"] == 1 else " (cross-verified cluster)"),
+            "WARN",
+        )
+        if candidate["source"] == "dbt":
+            return "dbt-other", candidate["id"]
+        return "helloao", candidate["id"]
+
     return "dbt", None
+
+
+def describe_text_source(iso: str, canon: str, distinct_id: str) -> dict | None:
+    """Provenance for this edition's text source, or None for the trivial/
+    default case (the edition's own DBT text — not worth recording).
+
+    This is the gap closed 2026-09-07: resolve_preferred_text_source()'s
+    return value alone can't tell a caller whether a "helloao" result came
+    from a *direct*, catalog-overlap.json-verified match to this exact
+    distinct_id (_find_helloao_id — the original, fully-trusted feature)
+    or from _find_unlinked_text_candidate()'s widened, unverified-for-
+    this-audio Tier 0/1 fallback (added the same day) — and per-chapter
+    alignment output (export/timing-data/*_timing.json, deliberately
+    {"id","pos"}-only) carries no source information at all. Without this,
+    nothing downstream of a publish can distinguish "aligned against a
+    verified text" from "aligned against a same-language text nobody has
+    confirmed matches this specific recording" — exactly the distinction
+    the whole Tier 0/1 risk-gating exercise is about.
+
+    Used by write_run_manifest()'s per-edition "text_sources" map (mirrors
+    its existing "vrs" map — see that function's docstring) and by the
+    caller that writes export/timing-data/<canon>/<iso>/<distinct_id>/
+    _source.json, which rides along on the *already-active* Pass 1 of
+    scripts/publish-align.sh with no changes to that script needed.
+
+    Returns None, or e.g.:
+      {"source": "dbt-other", "id": "ITAR27", "verified": False, "tier": 0}
+      {"source": "helloao", "id": "bel_jfc", "verified": False, "tier": 1,
+       "likely": "orthography_convention", "score": 0.997}
+      {"source": "helloao", "id": "eng_cpb", "verified": True}
+    """
+    text_source, text_source_id = resolve_preferred_text_source(iso, canon, distinct_id)
+    if text_source == "dbt":
+        return None
+    info = {"source": text_source, "id": text_source_id}
+    candidate = _find_unlinked_text_candidate(iso, canon, distinct_id)
+    if candidate and candidate["id"] == text_source_id:
+        info["verified"] = False
+        info["tier"] = candidate["tier"]
+        if candidate["likely"]:
+            info["likely"] = candidate["likely"]
+            info["score"] = candidate["score"]
+    else:
+        info["verified"] = True
+    return info
 
 
 def _scan_existing_text_chapters(edition_dir: Path) -> frozenset[tuple[str, int]]:
@@ -534,7 +725,7 @@ def has_usable_text_source(
     if not _load_dbt_catalog("catalog-text").get("entries"):
         return True
     text_source, source_id = resolve_preferred_text_source(iso, canon, distinct_id)
-    if text_source == "helloao" and source_id:
+    if text_source in ("helloao", "dbt-other") and source_id:
         return True
     catalog_fs = get_best_fileset_from_catalog(iso, canon, distinct_id)
     if catalog_fs and catalog_fs.get("text_fileset"):
@@ -1701,6 +1892,17 @@ def download_job(
         text_fileset = None
         text_fileset_candidates = None
         text_source_override = f"helloao:{preferred_source_id}"
+    elif text_source == "dbt-other":
+        # An unlinked-but-scored catalog-overlap.json candidate pointed at
+        # another DBT distinct_id's own text (see
+        # _find_unlinked_text_candidate) — resolve THAT edition's text
+        # fileset the same way get_best_fileset_from_catalog would for its
+        # own distinct_id, then treat it exactly like locally-owned DBT
+        # text (download_text() only needs a real fileset_id, not that it
+        # belongs to this distinct_id — see download_text()'s docstring).
+        other_text_entries = _catalog_entries(iso, canon, preferred_source_id, "catalog-text")
+        text_fileset, text_fileset_candidates = _resolve_text_fileset(other_text_entries, preferred_source_id)
+        text_source_override = None
     else:
         text_fileset = fileset_info["text_fileset"]
         text_fileset_candidates = fileset_info.get("text_fileset_candidates")

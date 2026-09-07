@@ -10,3 +10,21 @@
 # align_verse_words.py's windowed, verse-anchored MMS-only alignment
 # instead (see pipeline/align_verse_words.py's module docstring).
 verse_only_mode = true
+
+# A/B tested 2026-09-05 (scratchpad/ab_whisper_hint.py, 1CO 1 BAKIBT):
+# whisper_transcribe.py's ISO639_3_TO_WHISPER table now maps bak -> "ba",
+# added on the (reasonable but unverified) theory that giving Whisper an
+# explicit hint helps languages missing one entirely. For bak it is a
+# regression, not a no-op: auto-detect already produces correct-script
+# Cyrillic ("Пауелдің көрін фтағы..."), while forcing language="ba" makes
+# Whisper emit Latin transliteration instead ("pavildun karin ftaqe...") —
+# the same failure class as azb's Perso-Arabic->Latin mismatch, but here it
+# actively makes a working default worse rather than being a no-op.
+# Overriding back to auto-detect until Whisper's "ba" model itself improves.
+#
+# Currently inert either way: verse_only_mode above means Whisper never
+# runs for this language at all. Set here so the table's default doesn't
+# silently reintroduce the regression if bak is ever re-tested for
+# possible promotion out of verse_only_mode.
+[whisper]
+language = "auto"

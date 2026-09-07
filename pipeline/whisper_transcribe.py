@@ -232,6 +232,32 @@ ISO639_3_TO_WHISPER = {
                   # does not fix the script mismatch — that's a genuine
                   # Whisper model limitation, not something in this
                   # pipeline's control.
+
+    # Five more that were missing entirely — same class as "pan"/"azb"
+    # above, found 2026-09-05 by asking which verse_only_mode languages had
+    # no hint at all. All five ARE in Whisper's own 100-language inventory
+    # (checked against faster_whisper.tokenizer._LANGUAGE_CODES), so they
+    # were being auto-detected per chapter for no reason.
+    #
+    # This matters more for these than for a normal language, because all
+    # five were AUTO-DEMOTED to verse_only_mode: align_pipeline.py measures
+    # how well Whisper's transcript matches the reference text and, when it
+    # doesn't, permanently writes verse_only_mode = true into the language's
+    # config. A language mis-detected as the wrong language transcribes to
+    # something that cannot match, which looks exactly like "Whisper is
+    # useless here". So the demotion may have been a self-inflicted verdict
+    # rather than a property of the audio.
+    #
+    # NOT YET VERIFIED to change any outcome — "azb" above is the cautionary
+    # precedent, where the identical-looking fix turned out to be a no-op.
+    # Adding the hint is correct regardless (explicit beats auto-detect),
+    # but whether it justifies re-promoting any of these out of
+    # verse_only_mode needs the A/B run described in the module notes.
+    "bak": "ba",  # Bashkir
+    "khk": "mn",  # Halh Mongolian -> Whisper's generic Mongolian
+    "tgk": "tg",  # Tajik
+    "hat": "ht",  # Haitian Creole
+    "tuk": "tk",  # Turkmen
 }
 
 # Book definitions (from download_language_content.py)
@@ -352,7 +378,27 @@ def _build_custom_language_entry(iso: str) -> dict:
 
 
 def get_whisper_language(iso: str) -> str | None:
-    """Map ISO 639-3 code to Whisper language code."""
+    """Whisper language hint for an ISO 639-3 code, or None to auto-detect.
+
+    A language config may override the built-in table via its [whisper]
+    table. That matters because the hint is not a cosmetic preference: a
+    language absent from ISO639_3_TO_WHISPER gets no hint at all, and
+    Whisper then guesses the language per chapter — which is one plausible
+    reason a language ends up auto-demoted to verse_only_mode (see
+    align_pipeline.py's AUTO_VERSE_ONLY_* constants) without Whisper ever
+    having been given a fair attempt.
+
+        [whisper]
+        language = "kk"      # force this hint
+        language = "auto"    # force auto-detect, overriding the table
+
+    Whisper's own inventory is ISO 639-1-ish, so the right value is often
+    a related macrolanguage rather than an exact match; that is a judgement
+    call per language, which is exactly why it belongs in config.
+    """
+    override = load_language_config(iso).whisper.get("language")
+    if override:
+        return None if str(override).lower() == "auto" else str(override)
     return ISO639_3_TO_WHISPER.get(iso)
 
 
@@ -404,6 +450,7 @@ def generate_work_items(
             # downloads (e.g. DEUL12, DEUD05) can't be aligned and shouldn't
             # generate work items.
             found_on_disk = set()
+            purged_on_disk = set()
             for base in (DOWNLOADS_DIR, Path("downloads/contrib"), Path("downloads/helloao/aligned")):
                 iso_dir = base / canon / iso
                 if not iso_dir.is_dir():
@@ -415,6 +462,49 @@ def generate_work_items(
                     has_external_audio = (distinct_dir / "audio.json").exists()
                     if has_local_audio or has_external_audio:
                         found_on_disk.add(distinct_dir.name)
+                    else:
+                        purged_on_disk.add(distinct_dir.name)
+
+            # An edition whose audio has been fully purged leaves its
+            # directory behind but no mp3s, so the scan above can't see it.
+            # That is invisible whenever ANOTHER edition of the same
+            # language still has audio: found_on_disk is non-empty, this
+            # branch wins, and the purged edition is dropped without a
+            # word — while its already-published output (and any bug in
+            # it) stays untouched. Confirmed 2026-09-05: a re-run targeting
+            # 2,168 chapters missed 646 of them this way, aligning e.g.
+            # aka's five still-populated editions while the 18 stale
+            # chapters sat in AKABIB, and urd's URDIRV while the targets
+            # were in URDERA/URDERG/URDERL.
+            #
+            # The catalog fallback below only fires when NOTHING resolves,
+            # so it covers the fully-purged language but not the far more
+            # common partially-purged one. Restore such an edition only
+            # when the published catalog confirms it really has audio, so
+            # this stays limited to editions we actually knew about before
+            # and can download again — it does not pull in every edition
+            # the catalog happens to list.
+            #
+            # Filesets named in the language metadata are folded in the
+            # same way, and for the same reason. They used to have a
+            # branch of their own that emitted has_downloads=False, which
+            # align_pipeline.py hard-skips ("No audio downloaded") — so
+            # that branch could only ever produce items guaranteed to be
+            # dropped, contradicting its own comment about letting
+            # auto-download fetch them. It was unreachable in practice
+            # (every entry in whisper-priority-languages.json carries
+            # empty fileset lists, so all_filesets is always empty), which
+            # is the only reason it never caused visible damage — but it
+            # would have armed itself the moment that metadata was
+            # populated. Routed through the same catalog confirmation
+            # instead, where a positive answer means the edition really is
+            # fetchable per chapter via ensure_chapter_ready().
+            unresolved = (purged_on_disk | all_filesets) - found_on_disk
+            if unresolved:
+                from download_language_content import audio_distinct_ids_from_catalog
+
+                with_audio = set(audio_distinct_ids_from_catalog(iso, canon))
+                found_on_disk |= (unresolved & with_audio)
 
             if found_on_disk:
                 for distinct_id in sorted(found_on_disk):
@@ -425,18 +515,6 @@ def generate_work_items(
                         "canon": canon,
                         "distinct_id": distinct_id,
                         "has_downloads": True,
-                    })
-            elif all_filesets:
-                # Nothing on disk yet but metadata knows filesets — create work items
-                # so auto-download can fetch them
-                for fileset in sorted(all_filesets):
-                    work_items.append({
-                        "iso": iso,
-                        "language": lang_name,
-                        "tier": tier,
-                        "canon": canon,
-                        "distinct_id": fileset,
-                        "has_downloads": False,
                     })
             else:
                 # Nothing on disk and no local metadata. Before falling back
@@ -529,7 +607,9 @@ def _expected_text_tags(iso: str, canon: str, distinct_id: str) -> tuple[set[str
     everything just because resolution couldn't run.
     """
     from download_language_content import (
+        _catalog_entries,
         _load_dbt_catalog,
+        _resolve_text_fileset,
         get_best_fileset_from_catalog,
         resolve_preferred_text_source,
     )
@@ -544,6 +624,14 @@ def _expected_text_tags(iso: str, canon: str, distinct_id: str) -> tuple[set[str
     text_source, source_id = resolve_preferred_text_source(iso, canon, distinct_id)
     if text_source == "helloao" and source_id:
         tags.add(f"{source_id.replace('_', '').upper()}_ET")
+    elif text_source == "dbt-other" and source_id:
+        # An unlinked-but-scored catalog-overlap.json candidate (see
+        # _find_unlinked_text_candidate) — the on-disk fileset tag comes
+        # from the OTHER distinct_id's own catalog-text.json entries, not
+        # ours, mirroring download_job()'s resolution for this same case.
+        other_entries = _catalog_entries(iso, canon, source_id, "catalog-text")
+        _, other_candidates = _resolve_text_fileset(other_entries, source_id)
+        tags.update(other_candidates)
     return tags, catalog_available
 
 
@@ -712,6 +800,7 @@ def discover_chapter_files(
             if not txt_candidates:
                 from download_language_content import (
                     _fetch_helloao_chapter,
+                    download_text,
                     resolve_preferred_text_source,
                 )
                 text_source, source_id = resolve_preferred_text_source(iso, canon, distinct_id)
@@ -720,6 +809,24 @@ def discover_chapter_files(
                     dest_path = book_dir / f"{file_book}_{chapter_str}_{hao_tag}.txt"
                     if _fetch_helloao_chapter(source_id, file_book, chapter_num, dest_path):
                         txt_candidates = [dest_path]
+                elif text_source == "dbt-other" and source_id:
+                    # Unlinked-but-scored catalog-overlap.json candidate
+                    # pointing at another DBT distinct_id's own text — see
+                    # _find_unlinked_text_candidate. Resolve that edition's
+                    # fileset and fetch via the normal DBT text path.
+                    from download_language_content import (
+                        _catalog_entries,
+                        _resolve_text_fileset,
+                        error_logger as _dl_error_logger,
+                        stats as _dl_stats,
+                    )
+                    other_entries = _catalog_entries(iso, canon, source_id, "catalog-text")
+                    other_fileset, _ = _resolve_text_fileset(other_entries, source_id)
+                    if other_fileset:
+                        dest_path = book_dir / f"{file_book}_{chapter_str}_{other_fileset}.txt"
+                        if download_text(other_fileset, file_book, chapter_num, dest_path,
+                                          iso, distinct_id, _dl_stats, _dl_error_logger):
+                            txt_candidates = [dest_path]
                 if not txt_candidates:
                     log(f"  No text file for {file_book} {chapter_num} in {distinct_id}", "WARN")
                     continue
@@ -906,11 +1013,48 @@ def load_whisper_model(model_name: str):
     return _fw_model_cache[key]
 
 
+# Decode parameters a language config may override via its [whisper] table.
+# Split by backend because the two libraries do not accept the same names —
+# faster-whisper calls it log_prob_threshold, mlx/openai logprob_threshold —
+# and passing an unknown keyword is a TypeError that would kill the run.
+# Anything not listed here is ignored with a warning rather than forwarded,
+# so a typo in a .toml degrades to "no override" instead of a crash.
+_FW_DECODE_KEYS = frozenset({
+    "initial_prompt", "condition_on_previous_text", "temperature",
+    "no_speech_threshold", "compression_ratio_threshold",
+    "hallucination_silence_threshold", "log_prob_threshold",
+    "beam_size", "best_of", "patience", "length_penalty",
+    "repetition_penalty", "prompt_reset_on_temperature", "vad_filter",
+})
+_MLX_DECODE_KEYS = frozenset({
+    "initial_prompt", "condition_on_previous_text", "temperature",
+    "no_speech_threshold", "compression_ratio_threshold",
+    "hallucination_silence_threshold", "logprob_threshold",
+})
+
+
+def _decode_kwargs(opts: dict | None, allowed: frozenset, backend: str) -> dict:
+    """Filter a config's [whisper] table down to what this backend accepts."""
+    out = {}
+    for key, value in (opts or {}).items():
+        if key == "language":
+            continue  # applied by get_whisper_language(), not a decode kwarg
+        if key in allowed:
+            # tomllib gives lists; faster-whisper wants a tuple for the
+            # temperature ladder and is indifferent for the rest.
+            out[key] = tuple(value) if isinstance(value, list) else value
+        else:
+            log(f"  [whisper] option {key!r} is not supported by the "
+                f"{backend} backend — ignored", "WARNING")
+    return out
+
+
 def transcribe_audio(
     audio_path: Path,
     model_name: str,
     language: str | None = None,
     _model=None,
+    decode_opts: dict | None = None,
 ) -> dict:
     """Transcribe a single audio file with word timestamps.
 
@@ -944,6 +1088,10 @@ def transcribe_audio(
             # first, faster-whisper-only) discarded along with the silence.
             "hallucination_silence_threshold": 2.0,
         }
+        # Config overrides go on last so a language can deliberately
+        # replace a default above (e.g. relax the hallucination threshold
+        # for a recording where it discards real speech).
+        kwargs.update(_decode_kwargs(decode_opts, _MLX_DECODE_KEYS, "mlx-whisper"))
         if language:
             kwargs["language"] = language
         result = mlx_whisper.transcribe(str(audio_path), **kwargs)
@@ -971,10 +1119,9 @@ def transcribe_audio(
         except Exception:
             pass
 
-    fw_segments, _info = model.transcribe(
-        str(audio_path),
-        language=language,
-        word_timestamps=True,
+    fw_kwargs = {
+        "language": language,
+        "word_timestamps": True,
         # See the matching MLX-path comment above — same fix, same
         # verification (3/3 hallucinating chapters fixed, bit-identical
         # output on a normal chapter). Requires word_timestamps=True (set
@@ -982,8 +1129,10 @@ def transcribe_audio(
         # below — that path is already a degraded fallback for a different
         # bug and hallucination detection needs the word-level timing this
         # retry deliberately does without.
-        hallucination_silence_threshold=2.0,
-    )
+        "hallucination_silence_threshold": 2.0,
+    }
+    fw_kwargs.update(_decode_kwargs(decode_opts, _FW_DECODE_KEYS, "faster-whisper"))
+    fw_segments, _info = model.transcribe(str(audio_path), **fw_kwargs)
 
     # Convert faster-whisper output to openai-whisper-compatible dict.
     # faster-whisper's word-alignment step (find_alignment) has a known bug
@@ -1439,6 +1588,7 @@ def process_chapter(
     model_name: str,
     whisper_language: str | None,
     _whisper_model=None,
+    decode_opts: dict | None = None,
 ) -> dict:
     """
     Process a single chapter: transcribe audio and write intermediate files.
@@ -1461,7 +1611,8 @@ def process_chapter(
 
     # Transcribe (always with word timestamps)
     start_time = time.time()
-    result = transcribe_audio(audio_path, model_name, whisper_language, _model=_whisper_model)
+    result = transcribe_audio(audio_path, model_name, whisper_language,
+                              _model=_whisper_model, decode_opts=decode_opts)
     transcribe_time = time.time() - start_time
 
     segments = result.get("segments", [])
@@ -1772,12 +1923,18 @@ Examples:
                 log(f"  Would process: {ch['book']} {ch['chapter']}")
             continue
 
-        # Get Whisper language hint
+        # Get Whisper language hint (config may override — see
+        # get_whisper_language) and any per-language decode overrides.
         whisper_lang = get_whisper_language(iso)
+        decode_opts = load_language_config(iso).whisper
         if whisper_lang:
             log(f"Whisper language: {whisper_lang}")
         else:
             log("Whisper language: auto-detect")
+        tuned = {k: v for k, v in decode_opts.items() if k != "language"}
+        if tuned:
+            log(f"Whisper decode overrides: "
+                f"{', '.join(f'{k}={v}' for k, v in sorted(tuned.items()))}")
 
         # Process each chapter
         for ch_idx, chapter in enumerate(chapters):
@@ -1791,6 +1948,7 @@ Examples:
                 stats = process_chapter(
                     chapter, args.model, whisper_lang,
                     _whisper_model=whisper_model_instance,
+                    decode_opts=decode_opts,
                 )
                 duration_str = format_duration(stats["duration"])
                 speed = stats["duration"] / stats["transcribe_time"] if stats["transcribe_time"] > 0 else 0

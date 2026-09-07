@@ -40,11 +40,17 @@ started with. Never let a lookup failure block alignment.
 """
 
 import json
+import os
+import time
 import urllib.request
 from pathlib import Path
 
 VRS_INDEX_URL = "https://cdn.bibel.wiki/dbt/_vrs/index.json"
 VRS_CACHE_PATH = Path("api-cache/vrs/index.json")
+# See _load_index(): the published index is extended and corrected in
+# place, so a cached copy must expire. Shares the DBT catalogs' default
+# and honours the same override.
+VRS_INDEX_MAX_AGE_SECONDS = int(os.environ.get("AUDIO_SYNC_CATALOG_MAX_AGE", 24 * 3600))
 
 # Values that are sentinels rather than real scheme names — see the module
 # docstring. Treated exactly like "not found": we know nothing publishable.
@@ -64,13 +70,27 @@ def _load_index() -> dict:
     if _index_cache is not None:
         return _index_cache
 
+    # Expire the on-disk copy like the DBT catalogs do. This index is
+    # actively being extended (coverage was partial by design) and is
+    # corrected in place when a classification turns out wrong — bul/BULCBV
+    # was republished from `rso` to `org` mid-2026-09-04 after we reported
+    # it. A never-expiring cache would keep stamping the superseded scheme
+    # onto every artifact we write, which is worse than not stamping at all.
+    cached = None
     if VRS_CACHE_PATH.exists():
         try:
             with open(VRS_CACHE_PATH, encoding="utf-8") as f:
-                _index_cache = json.load(f).get("l", {})
-            return _index_cache
+                cached = json.load(f).get("l", {})
         except (OSError, json.JSONDecodeError):
-            pass
+            cached = None
+        else:
+            try:
+                age = time.time() - VRS_CACHE_PATH.stat().st_mtime
+            except OSError:
+                age = VRS_INDEX_MAX_AGE_SECONDS + 1
+            if age < VRS_INDEX_MAX_AGE_SECONDS:
+                _index_cache = cached
+                return _index_cache
 
     try:
         req = urllib.request.Request(
@@ -80,8 +100,10 @@ def _load_index() -> dict:
         data = json.loads(raw)
     except Exception:
         # Deliberately silent-ish: this is decoration on the output, never a
-        # reason to fail a run. Cached as {} so we don't retry per chapter.
-        _index_cache = {}
+        # reason to fail a run. An expired copy is still better than none —
+        # falling back to {} would silently drop the `vrs` stamp from every
+        # artifact written during an outage.
+        _index_cache = cached if cached is not None else {}
         return _index_cache
 
     try:

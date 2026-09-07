@@ -31,6 +31,7 @@ class LanguageConfig:
     aramaic_passages: list[str] = field(default_factory=list)
     verse_only_mode: bool = False
     chapter_map: list[dict] = field(default_factory=list)
+    whisper: dict = field(default_factory=dict)
 
 
 def map_audio_chapter_to_text(
@@ -119,6 +120,7 @@ def load_language_config(iso: str) -> LanguageConfig:
             aramaic_passages=data.get("aramaic_passages", []),
             verse_only_mode=data.get("verse_only_mode", False),
             chapter_map=data.get("chapter_map", []),
+            whisper=data.get("whisper", {}),
         )
     else:
         config = LanguageConfig(iso=iso)

@@ -33,6 +33,18 @@ Deliberately a GENERATOR, not runtime derivation: an alignment batch should
 not depend on fetching versification files mid-run, and a generated config
 block stays auditable and diffable in review.
 
+KNOWN LIMIT — review SPLIT skips before pasting them in. This derives from
+the two schemes' declared SHAPES; it has no idea which audio chapters the
+fileset actually contains. So when two audio chapters split one text
+chapter, both are skipped (see to_toml) even if one of them does not exist
+in this particular recording — in which case it is not really a split, and
+skipping the surviving half throws away audio that aligns fine. Real case:
+bul/BULCBV MAL, where rso 3+4 -> org 3 looks exactly like the PSA splits,
+but audio chapter 4 is a genuine 404; skipping both would have discarded
+the 18 recoverable verses in chapter 3 to avoid 6 that no mapping can
+recover. tools/audio_chapter_anomalies.py is the cross-check — it reports
+where a fileset's actual chapter count differs from its scheme's expected.
+
 Verified 2026-09-04: for bul/BULCBV PSA (audio rso, text org) the output
 matches, on all 150 chapters, a mapping derived independently by scoring
 Whisper transcripts against every candidate text chapter.

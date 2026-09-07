@@ -75,6 +75,7 @@ from pathlib import Path
 from batch_manifest import get_jobs, load_batch
 from versification import lookup_vrs
 from download_language_content import (
+    describe_text_source,
     ensure_chapter_ready,
     get_dbt_book_coverage,
     has_usable_text_source,
@@ -527,6 +528,7 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
     versification.lookup_vrs().
     """
     vrs_map = {}
+    text_source_map = {}
     for r in results:
         iso, did = r.get("iso"), r.get("distinct_id")
         if not iso or not did:
@@ -536,6 +538,12 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
             scheme = lookup_vrs(iso, did)
             if scheme:
                 vrs_map[key] = scheme
+        if key not in text_source_map:
+            canon = r.get("canon")
+            if canon:
+                info = describe_text_source(iso, canon, did)
+                if info:
+                    text_source_map[key] = info
 
     manifest = {
         "batch_id": batch_id,
@@ -544,6 +552,12 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
     }
     if vrs_map:
         manifest["vrs"] = vrs_map
+    if text_source_map:
+        # Only present for editions NOT using their own DBT text — see
+        # describe_text_source()'s docstring. A downstream consumer that
+        # cares about alignment risk can filter on "verified": false here
+        # without re-deriving anything from catalog-overlap.json itself.
+        manifest["text_sources"] = text_source_map
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path = RUNS_DIR / f"{batch_id}.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1159,6 +1173,21 @@ Examples:
                 f"fileset — restricting to {len(text_chapter_restriction)} "
                 f"chapter(s) with text already on disk", "INFO")
 
+        # Record text-source provenance for anything other than the
+        # edition's own DBT text, right next to the timing/words output
+        # scripts/publish-align.sh already publishes — so it reaches CDN
+        # with no changes to that script, and a downstream consumer can
+        # tell "verified" text from a Tier 0/1 catalog-overlap.json
+        # candidate that's never been checked against this specific
+        # recording. See describe_text_source()'s docstring.
+        source_info = describe_text_source(iso, canon, distinct_id)
+        if source_info:
+            source_sidecar = args.output_dir / canon / iso / distinct_id / "_source.json"
+            source_sidecar.parent.mkdir(parents=True, exist_ok=True)
+            with open(source_sidecar, "w", encoding="utf-8") as f:
+                json.dump({"text": source_info}, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+
         # Discover chapters (filtered to template refs and optional book/chapter)
         # For the discovery, we build chapter refs incorporating --book/--chapter filters
         filtered_refs = canon_refs if canon_refs else None
@@ -1391,8 +1420,29 @@ Examples:
                     else:
                         log(f"{label} Audio fetched on demand")
 
+                # A dramatized recording gets the same treatment as a
+                # verse_only language, per chapter. Drama filesets (2DA/2SA)
+                # carry background music, sound effects and multiple
+                # overlapping voices, and they do not read the text
+                # verbatim — so word-level alignment against a plain
+                # reference text is asking for something the audio does not
+                # contain. discover_chapter_files() already prefers a
+                # standard reading wherever one exists, so reaching here
+                # with is_drama means this IS the only recording: the
+                # choice is not "drama vs standard" but "verse-level timings
+                # or confident-looking word-level nonsense".
+                #
+                # The live case is kaz/KAZKAZ, our other big quality
+                # outlier, whose problems we traced to a dramatized
+                # recording that under-covers the text — unrelated to the
+                # versification issue we first suspected. Verse-level output
+                # is the honest ceiling for this material.
+                dramatized = bool(chapter.get("is_drama"))
+                if dramatized and not config.verse_only_mode:
+                    log(f"{label} dramatized audio — verse-level alignment only")
+
                 # ── verse_only_mode: single MMS-only step, no Whisper/Fusion ──
-                if config.verse_only_mode:
+                if config.verse_only_mode or dramatized:
                     if args.skip_mms:
                         continue
                     verse_item = build_verse_item(chapter, canon, iso, distinct_id, args.output_dir)

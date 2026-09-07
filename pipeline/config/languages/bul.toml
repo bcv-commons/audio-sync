@@ -53,10 +53,16 @@
 # this fix exists to remove. That needs verse-range support, which doesn't
 # exist yet; skipping is the honest interim.
 #
-# Text chapters 10, 114, 116 and 147 therefore end up with no audio mapped
+# Text chapters 10, 115, 116 and 147 therefore end up with no audio mapped
 # to them at all. Their existing output files are stale and WRONG (aligned
 # against mismatched audio) and must be deleted, not left in place — see
 # tools/prune_unmapped_chapters.py.
+#
+# (Note 114 is NOT among them, though it looks like it should be: audio 113
+# is a MERGE holding texts 114+115 and maps to 114, so 114 keeps audio and
+# 115 is the half left without. Verified against map_audio_chapter_to_text
+# 2026-09-05 — an earlier version of this comment said 114 and was wrong,
+# which would have sent someone hunting for the wrong stale files.)
 [[chapter_map]]
 book = "PSA"
 audio_fileset = "BULCBVO2DA"
@@ -69,17 +75,44 @@ shifts = [
 ]
 skip = [114, 115, 146, 147]
 
-# NOTE ON JOL BELOW: tools/derive_chapter_map.py regenerates these blocks
-# from the bibles repo's published versification data, and its PSA output
-# matches this file exactly. Its JOL output does NOT — it derives offset -1
-# where the correct answer is +1 — because of an upstream inconsistency:
-# rso.vrs declares a 3-chapter Joel (20/32/21), but rso-to-eng.json carries
-# rows mapping rso JOL 3:1-5 -> eng JOL 2:28-32, which only makes sense for
-# a 4-chapter Joel (they are byte-identical to org-to-eng.json's first five
-# JOL rows, so org rows appear to have leaked into the rso map). Hard
-# evidence says +1: this edition's text Joel has 4 chapters and its audio
-# chapter 3 has 21 verses, matching org JOL 4. Keep +1 by hand until the
-# upstream data is fixed; MAL and PSA derive correctly and need no override.
+# NOTE ON JOL BELOW: this block was carried by hand until 2026-09-05,
+# because rso-to-eng.json held five JOL rows that had leaked in from
+# org-to-eng.json — rows describing a 4-chapter Joel, while rso.vrs
+# declares a 3-chapter one. Deriving through them produced offset -1 where
+# the evidence said +1 (this edition's text Joel has 4 chapters and its
+# audio chapter 3 has 21 verses, matching org JOL 4).
+#
+# The bibles repo has since fixed it at the source (the contaminated rows
+# were in their pinned baseline TSV, and the same five had leaked into
+# orgw as well; lxx and catm keep them legitimately, having genuinely
+# 4-chapter Joels). Re-deriving against the corrected data now yields
+# offset +1 — matching this block exactly, and matching the mapping
+# derived independently from the audio. So JOL is no longer an override:
+# it is what the published data says, and regenerating it is safe.
+#
+# MAL is a different matter, and is deliberately absent below.
+# derive_chapter_map.py emits skip = [3, 4] for it. That is its SPLIT
+# policy applied correctly, not a bug: rso MAL 3 (18 verses) + rso MAL 4
+# (6) together make up org MAL 3 (24), so two audio chapters each hold
+# part of one text chapter — structurally identical to PSA 116 <- [114,
+# 115] and PSA 147 <- [146, 147], both of which we verified independently
+# and which this file skips for exactly that reason.
+#
+# What makes MAL different here is not the scheme, it is this fileset:
+# audio chapter 4 is a genuine 404 (confirmed by the bibles repo — those
+# six verses were never recorded). So there is no second half to split
+# with. Audio 3 is the only audio that exists for text MAL 3, covering
+# verses 1-18 of it.
+#
+# With no MAL block the identity default maps audio 3 -> text 3, which
+# aligns those 18 verses correctly; verses 19-24 fall back, but they have
+# no audio anywhere and would fall back under any mapping. Taking the
+# derived skip instead would discard the 18 recoverable verses to avoid
+# the 6 unrecoverable ones. Hence: no block.
+#
+# The general lesson is in derive_chapter_map.py's docstring — it derives
+# from scheme SHAPES and cannot know which audio chapters actually exist,
+# so a split whose other half is missing still reads as a split.
 #
 # Joel: the text is Hebrew-versified (4 chapters, 20/27/5/21 verses), the
 # audio Greek/English-versified (3 chapters). Audio 2 is a MERGE holding
