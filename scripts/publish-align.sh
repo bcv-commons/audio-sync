@@ -72,6 +72,37 @@ if [ "${DRY_RUN:-}" = "1" ]; then
     echo "[DRY RUN] No files will be written to CDN."
 fi
 
+# ── Verse-only exclude list ──
+# _words.json for a chapter that only got verse-level alignment (no
+# Whisper cross-check, MMS-only) isn't wanted on CDN — only its companion
+# _timing.json (verse-level) should publish. Two independent signals,
+# computed fresh from the current source of truth each run rather than a
+# separately-maintained list that could go stale:
+#   - config-driven: the edition's iso has verse_only_mode = true in its
+#     pipeline/config/languages/<iso>.toml. Safe to trust retroactively
+#     here specifically because align_pipeline.py writes that config
+#     itself the moment it auto-detects the need, before continuing the
+#     batch — so the file's current state matches what was true when
+#     those chapters were actually aligned.
+#   - drama-forced: a dramatized fileset (2DA/2SA in its id, embedded
+#     directly in the output filename, e.g. KAZKAZP2DA) takes the same
+#     verse-only code path per chapter regardless of the edition's own
+#     config (kaz/KAZKAZ; bul/BULCBV's PSA) — checked independently of
+#     the toml since neither is configured verse_only_mode.
+# NOT using _words_quality.json's from_whisper count for this: confirmed
+# 2026-09-07 it doesn't distinguish the two modes — a fusion-mode chapter
+# can legitimately show from_whisper=0 when MMS alone won every word.
+VERSE_ONLY_EXCLUDES=(--exclude "**/*2DA*_words.json" --exclude "**/*2SA*_words.json")
+verse_only_iso_count=0
+for cfg in pipeline/config/languages/*.toml; do
+    if grep -qE '^verse_only_mode[[:space:]]*=[[:space:]]*true' "$cfg"; then
+        iso="$(basename "$cfg" .toml)"
+        VERSE_ONLY_EXCLUDES+=(--exclude "**/${iso}/**/*_words.json")
+        verse_only_iso_count=$((verse_only_iso_count + 1))
+    fi
+done
+echo "── Excluding _words.json for $verse_only_iso_count verse_only_mode iso(s) + any dramatized (2DA/2SA) fileset"
+
 # ── Pre-publish plausibility gate ──
 # Scans for chapters with a backwards timestamp jump (verse N+1 timestamped
 # earlier than verse N — never legitimate, always a mis-alignment; see the
@@ -87,13 +118,15 @@ python3 tools/pre_publish_check.py --out "$QUARANTINE_FILE"
 # ── Pass 1: timing-data tree -> align/<canon>/<iso>/<version>/<BOOK>/ ──
 # Local layout already mirrors the CDN layout 1:1 (see internal-docs/
 # audio-sync-interface.md §3), so this is a plain recursive copy — except
-# for two file types that stay local-only:
+# for what stays local-only:
 #   *_words_quality.json — per-word confidence/source, only consumed by
 #     this repo's own tooling (tools/quality_report.py,
 #     check_timing_quality.py, requeue_dupes_chapters.py, compare_timing.py)
 #   *.srt — no longer generated at all (see whisper_transcribe.py); excluded
 #     here too so any already-on-disk leftovers from before that change
 #     don't get published on a future run.
+#   *_words.json for verse-only-aligned chapters — see VERSE_ONLY_EXCLUDES
+#     above. Their _timing.json still publishes normally.
 echo "── Publishing $TIMING_SOURCE_DIR -> cdn.bibel.wiki/${CDN_PREFIX}/ ..."
 rclone copy "$TIMING_SOURCE_DIR" "$REMOTE" \
     --header-upload "Cache-Control: max-age=3600" \
@@ -101,6 +134,7 @@ rclone copy "$TIMING_SOURCE_DIR" "$REMOTE" \
     --checkers 16 \
     --exclude "**/*_words_quality.json" \
     --exclude "**/*.srt" \
+    "${VERSE_ONLY_EXCLUDES[@]}" \
     --exclude-from "$QUARANTINE_FILE" \
     $DRY_FLAG \
     -v
