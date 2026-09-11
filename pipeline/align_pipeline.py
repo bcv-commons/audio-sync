@@ -602,6 +602,37 @@ def needs_run(output_path: Path | None, *input_paths: Path | None, force: bool =
     return any(p and p.exists() and p.stat().st_mtime > out_mtime for p in input_paths)
 
 
+def _chapter_output_exists(
+    output_dir: Path, canon: str, iso: str, distinct_id: str, book: str, chapter: int,
+) -> bool:
+    """True if this chapter's alignment is already fully done — both
+    _timing.json and _words.json exist in export/timing-data/, for some
+    fileset. Glob-based rather than a reconstructed filename, same
+    approach tools/purge_aligned_audio.py already uses for its own
+    "is this chapter done" check, since the audio_fileset suffix varies
+    per edition and isn't known here without already having fetched the
+    chapter at least once.
+
+    Checked in the prefetch worker below, BEFORE ensure_chapter_ready(),
+    so a broader/later re-run (e.g. --books ALL after an earlier narrower
+    --books run already covered some chapters) doesn't re-download audio
+    that purge_aligned_audio.py already deleted for chapters there is no
+    further reason to touch. Without this, needs_run() still correctly
+    skips re-aligning such a chapter — but only after an unnecessary
+    network fetch already happened (confirmed real 2026-09-07: the fetch
+    layer only checks local file presence, not alignment completion).
+    """
+    book_dir = output_dir / canon / iso / distinct_id / book
+    if not book_dir.is_dir():
+        return False
+    prefix = f"{book}_{chapter:03d}_"
+    for timing_path in book_dir.glob(f"{prefix}*_timing.json"):
+        words_path = timing_path.with_name(timing_path.name.replace("_timing.json", "_words.json"))
+        if words_path.exists():
+            return True
+    return False
+
+
 def _source_type_for(canon: str, iso: str, distinct_id: str) -> str:
     """'contrib' / 'helloao' / 'dbt' — which fetch path applies for this
     (canon, iso, distinct_id).
@@ -1331,6 +1362,16 @@ Examples:
 
                 def worker():
                     for book, ch in wanted:
+                        if not (args.force or args.force_fusion) and _chapter_output_exists(
+                            args.output_dir, canon, iso, distinct_id, book, ch,
+                        ):
+                            # Already fully aligned — don't re-fetch audio
+                            # purge_aligned_audio.py may have already
+                            # deleted just to have discover_chapter_files()
+                            # skip it a moment later. See
+                            # _chapter_output_exists()'s docstring.
+                            total_stats["chapters_skipped"] += 1
+                            continue
                         if not args.no_download and source_type == "dbt":
                             ensure_chapter_ready(
                                 iso, canon, distinct_id, book, ch,

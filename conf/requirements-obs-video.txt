@@ -1,0 +1,7 @@
+# OBS video-frame alignment dependencies (tools/cache_obs_images.py and
+# whatever consumes reference_frames.npz next — frame-change detection /
+# video-to-image matching for video-only OBS sources like OBS-OBS4All's
+# Godwari (gdx), where no native-language text exists to align against).
+#
+# Install with: pip install -r conf/requirements-obs-video.txt
+Pillow>=10.0.0

@@ -5,7 +5,8 @@ TOOLS := tools
 
 .PHONY: all align align-whisper align-mms align-fuse \
         import-contrib prepare-cross-source \
-        publish-align publish-align-dry fetch-remote-run \
+        publish-align publish-align-dry \
+        publish-obs-video publish-obs-video-dry fetch-remote-run \
         quality-check quality-compare quality-report \
         install check help
 
@@ -33,6 +34,8 @@ help: ## Show available targets
 	@echo "  ──────────"
 	@echo "  make publish-align      Publish timing-data + run manifest to cdn.bibel.wiki/align/"
 	@echo "  make publish-align-dry  Dry-run (no writes)"
+	@echo "  make publish-obs-video      Publish OBS video-detected timing to cdn.bibel.wiki/obs-video/"
+	@echo "  make publish-obs-video-dry  Dry-run (no writes)"
 	@echo "  make fetch-remote-run HOST=user@host [PORT=22]"
 	@echo "                          Pull a rented-GPU run's output back here before publishing"
 	@echo "                          (see Dockerfile / README's 'Rented GPU deployment' section)"
@@ -96,6 +99,12 @@ publish-align: ## Publish timing-data + run manifest to cdn.bibel.wiki/align/
 
 publish-align-dry: ## Dry-run publish-align (no writes)
 	DRY_RUN=1 scripts/publish-align.sh
+
+publish-obs-video: ## Publish OBS video-detected timing to cdn.bibel.wiki/obs-video/
+	scripts/publish-obs-video.sh
+
+publish-obs-video-dry: ## Dry-run publish-obs-video (no writes)
+	DRY_RUN=1 scripts/publish-obs-video.sh
 
 fetch-remote-run: ## Pull export/timing-data + _runs back from a rented GPU box (HOST=user@host)
 	@if [ -z "$(HOST)" ]; then echo "Usage: make fetch-remote-run HOST=user@host [PORT=22]"; exit 1; fi

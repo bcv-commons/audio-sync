@@ -46,6 +46,7 @@ _batches/
 _obs_batches/
 _runs/
 _obs_runs/
+_obs_verify/
 
 # Downloaded/generated audio, text, and alignment output (runtime data)
 downloads/

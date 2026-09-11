@@ -50,6 +50,7 @@ CATALOG_SEARCH_URL = (
     "?subject=Open%20Bible%20Stories&hasAudio=true&limit=100"
 )
 METADATA_URL_TMPL = "https://git.door43.org/api/v1/catalog/metadata/{full_name}/{tag}"
+RELEASES_URL_TMPL = "https://git.door43.org/api/v1/repos/{full_name}/releases"
 OBS_BATCH_DIR = Path("_obs_batches")
 
 # Preferred org on a language collision (see module docstring).
@@ -85,13 +86,15 @@ def fetch_catalog_entries() -> list[dict]:
     return [by_lang[k] for k in sorted(by_lang)]
 
 
-def extract_stories(entry: dict) -> dict:
-    """Build the {story_id: {audio_url, segment_count?}} dict from a
-    catalog entry's release assets — only real .m4a story audio, skipping
-    non-audio assets (APKs, PDFs, etc. — confirmed some repos publish
-    audio-less releases with e.g. only an Android app asset)."""
+def extract_stories(release: dict) -> dict:
+    """Build the {story_id: {audio_url}} dict from a release's assets —
+    only real per-story audio (.m4a or .mp3 — STORY_AUDIO_RE accepts
+    both), skipping non-audio assets (APKs, PDFs, whole-book zips, etc. —
+    confirmed some repos publish audio-less releases with e.g. only an
+    Android app asset, or bundle every story into one zip instead of
+    per-story files, which this deliberately does NOT unpack)."""
     stories = {}
-    for asset in entry.get("release", {}).get("assets", []):
+    for asset in release.get("assets", []):
         m = STORY_AUDIO_RE.search(asset["name"])
         if not m:
             continue
@@ -100,15 +103,52 @@ def extract_stories(entry: dict) -> dict:
     return stories
 
 
+def find_stories_across_releases(full_name: str) -> tuple[dict, dict] | None:
+    """Fallback for a repo whose catalog-reported "latest" release has no
+    usable per-story audio (e.g. unfoldingWord/en_obs: the catalog search
+    API's release is v9, a docs-only update with just a PDF asset — the
+    real per-story .mp3s sit in the older v8 release, which the catalog
+    entry never surfaces at all). Scans every release newest-first via the
+    plain repo releases API (not the catalog search endpoint, which only
+    ever reports one release per repo) and returns the first one with any
+    matching story audio.
+
+    Generic on purpose, not en-specific — any repo where a newer
+    non-audio release (a docs/PDF/app update) shadows an older audio one
+    hits this same shape, and there is no way to tell which repos those
+    are ahead of time other than trying.
+
+    Returns (release, stories) or None if no release has any usable audio.
+    """
+    try:
+        releases = _fetch_json(RELEASES_URL_TMPL.format(full_name=full_name))
+    except Exception as e:
+        log(f"  {full_name}: releases fetch failed ({e})", "WARN")
+        return None
+    for release in releases:
+        stories = extract_stories(release)
+        if stories:
+            return release, stories
+    return None
+
+
 def build_manifest(entry: dict) -> dict | None:
     iso = entry["language"]
     full_name = entry["full_name"]
-    stories = extract_stories(entry)
-    if not stories:
-        log(f"{iso} ({full_name}): no .m4a story audio in latest release — skipping", "WARN")
-        return None
+    release = entry.get("release", {})
+    stories = extract_stories(release)
 
-    target_commitish = entry.get("release", {}).get("target_commitish") or "master"
+    if not stories:
+        log(f"{iso} ({full_name}): no story audio in catalog's reported release "
+            f"({release.get('tag_name', '?')}) — checking older releases too", "INFO")
+        found = find_stories_across_releases(full_name)
+        if found is None:
+            log(f"{iso} ({full_name}): no story audio in ANY release — skipping", "WARN")
+            return None
+        release, stories = found
+        log(f"  found {len(stories)} stor(y/ies) in release {release.get('tag_name', '?')} instead", "INFO")
+
+    target_commitish = release.get("target_commitish") or "master"
 
     try:
         meta = _fetch_json(METADATA_URL_TMPL.format(full_name=full_name, tag=entry["branch_or_tag_name"]))

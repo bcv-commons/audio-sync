@@ -134,11 +134,22 @@ def ensure_story_audio(iso: str, story_id: str, audio_url: str, force: bool = Fa
     the manifest just carries the door43 URL through, so this repo is
     what fetches and caches it locally, same principle as contrib/'s
     audio_url external-audio pattern.
+
+    A 0-byte cached file is treated the same as "not downloaded" —
+    confirmed 2026-09-11: 9 languages (including gdx's original,
+    long-mysterious 0/50 case) had a 0-byte .m4a dated 2026-09-02 that
+    every subsequent alignment run kept silently reusing via the plain
+    dest.exists() check below, re-attempting alignment against an empty
+    file instead of ever re-fetching — so a since-fixed source would
+    never actually get picked up. Only a 0-byte file is treated this way
+    (not "any size below some guess") since that's the one unambiguous
+    signal of "the download never actually completed", confirmed by the
+    real cases found (all exactly 0 bytes, not merely small).
     """
     from download_language_content import _get_with_retry
 
     dest = OBS_DOWNLOADS_DIR / iso / f"{story_id}.m4a"
-    if dest.exists() and not force:
+    if dest.exists() and dest.stat().st_size > 0 and not force:
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     resp = _get_with_retry(audio_url, timeout=60)
