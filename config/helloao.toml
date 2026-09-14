@@ -2,8 +2,8 @@
 # + reader (narrator), so pipeline/remote_audio.py's ensure_chapter_audio()
 # can re-fetch/refresh audio for editions that don't come from DBT.
 #
-# ENGBSB (English, Berean Standard Bible) was originally imported manually
-# (via an untracked one-off script, "josh/import_bsb_hays.py" — see comments
+# English, Berean Standard Bible — was originally imported manually (via
+# an untracked one-off script, "josh/import_bsb_hays.py" — see comments
 # in pipeline/download_language_content.py and pipeline/whisper_transcribe.py)
 # rather than through this mechanism, and it has no entry in DBT's own
 # catalog at all (cdn.bibel.wiki/catalog/audio.json) — see
@@ -13,5 +13,15 @@
 # helloAO's "BSB" translation, "hays" reader — one of three narrators
 # helloAO offers for this translation (david/hays/souer) — so this mapping
 # is a verified match, not a guess.
+#
+# distinct_id renamed 2026-09-14 from the original locally-invented
+# "ENGBSB" to helloAO's own BSBHAY convention (matching BSBGIL and every
+# other helloAO-sourced edition already using {translation}{reader}
+# naming) — ENGBSB was the one outlier with no derivable relationship to
+# any DBT or helloAO id, which is what prompted a downstream consumer's
+# align/ naming-mismatch report. Self-describing now: no separate
+# id-mapping needed for anyone resolving this edition from helloAO's own
+# catalog. export/timing-data/{nt,ot}/eng/ already renamed to match
+# (align/ republished under the new path, old ENGBSB path retired).
 [translations.BSB.readers.hays]
-distinct_id = "ENGBSB"
+distinct_id = "BSBHAY"

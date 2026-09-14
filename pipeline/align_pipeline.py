@@ -81,6 +81,7 @@ from download_language_content import (
     has_usable_text_source,
 )
 from gpu_health import CudaContextPoisonedError
+from remote_audio import manual_import_audio_info
 from hw_config import load_hw_config
 from text_processing import CONFIG_DIR, load_language_config
 from whisper_transcribe import (
@@ -529,6 +530,7 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
     """
     vrs_map = {}
     text_source_map = {}
+    audio_source_map = {}
     for r in results:
         iso, did = r.get("iso"), r.get("distinct_id")
         if not iso or not did:
@@ -544,6 +546,10 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
                 info = describe_text_source(iso, canon, did)
                 if info:
                     text_source_map[key] = info
+        if key not in audio_source_map:
+            info = manual_import_audio_info(did)
+            if info:
+                audio_source_map[key] = info
 
     manifest = {
         "batch_id": batch_id,
@@ -558,6 +564,13 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
         # cares about alignment risk can filter on "verified": false here
         # without re-deriving anything from catalog-overlap.json itself.
         manifest["text_sources"] = text_source_map
+    if audio_source_map:
+        # Only present for a manually-imported edition whose results have
+        # no "audio_fileset" field (see manual_import_audio_info()'s
+        # docstring) — a consumer resolves real audio via helloAO's own
+        # per-chapter API using this entry's translation/reader instead of
+        # the (absent) DBT fileset formula.
+        manifest["audio_sources"] = audio_source_map
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path = RUNS_DIR / f"{batch_id}.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1212,11 +1225,21 @@ Examples:
         # candidate that's never been checked against this specific
         # recording. See describe_text_source()'s docstring.
         source_info = describe_text_source(iso, canon, distinct_id)
-        if source_info:
+        # Same provenance tracking, audio side — see manual_import_audio_info()'s
+        # docstring for why a manually-imported edition's chapter["audio_fileset"]
+        # (just distinct_id itself, not a real DBT fileset) must NOT be published
+        # as if it resolves the same way a real fileset id does.
+        audio_source_info = manual_import_audio_info(distinct_id)
+        if source_info or audio_source_info:
             source_sidecar = args.output_dir / canon / iso / distinct_id / "_source.json"
             source_sidecar.parent.mkdir(parents=True, exist_ok=True)
+            sidecar_data = {}
+            if source_info:
+                sidecar_data["text"] = source_info
+            if audio_source_info:
+                sidecar_data["audio"] = audio_source_info
             with open(source_sidecar, "w", encoding="utf-8") as f:
-                json.dump({"text": source_info}, f, indent=2, ensure_ascii=False)
+                json.dump(sidecar_data, f, indent=2, ensure_ascii=False)
                 f.write("\n")
 
         # Discover chapters (filtered to template refs and optional book/chapter)
@@ -1510,11 +1533,19 @@ Examples:
                             f"{stats['elapsed']}s")
                         total_stats["mms_done"] += 1
                         total_stats["fusion_done"] += 1
-                        run_results.append({
+                        verse_result = {
                             "iso": iso, "canon": canon, "distinct_id": distinct_id,
                             "book": book, "chapter": ch_num,
                             "status": "ok", "verses": stats.get("verses"),
-                        })
+                        }
+                        # audio_fileset omitted for a manually-imported edition —
+                        # see manual_import_audio_info()'s docstring: it would
+                        # just be distinct_id itself, not a real resolvable
+                        # fileset id, so publishing it would mislead a consumer
+                        # trying to use it the same way as a real DBT fileset.
+                        if not audio_source_info:
+                            verse_result["audio_fileset"] = chapter["audio_fileset"]
+                        run_results.append(verse_result)
                     continue
 
                 # ── Step 1a: Whisper ──
@@ -1641,14 +1672,19 @@ Examples:
                                         )
                                 log(f"{label} Fusion: {', '.join(parts)}")
                                 total_stats["fusion_done"] += 1
-                                run_results.append({
+                                fusion_result = {
                                     "iso": iso, "canon": canon, "distinct_id": distinct_id,
                                     "book": book, "chapter": ch_num,
                                     "status": "ok",
                                     "whisper": stats.get("whisper_score"),
                                     "mms": stats.get("mms_score"),
                                     "verses": stats.get("verses"),
-                                })
+                                }
+                                # See the verse-only branch's identical comment
+                                # above — same reason, same manual_import_audio_info() check.
+                                if not audio_source_info:
+                                    fusion_result["audio_fileset"] = chapter["audio_fileset"]
+                                run_results.append(fusion_result)
 
                     _maybe_auto_flag_verse_only(lang_whisper_reliability, iso, config, lang_name)
 

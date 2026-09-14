@@ -636,6 +636,23 @@ def describe_text_source(iso: str, canon: str, distinct_id: str) -> dict | None:
        "likely": "orthography_convention", "score": 0.997}
       {"source": "helloao", "id": "eng_cpb", "verified": True}
     """
+    # Manually-imported editions (e.g. eng/BSBHAY — see config/helloao.toml's
+    # own comment) aren't registered in any catalog at all, so
+    # resolve_preferred_text_source() below has no direct link to find and
+    # falls through to catalog-overlap.json's cross-language guessing —
+    # confirmed 2026-09-14 to return a flatly WRONG answer for BSBHAY
+    # (guessed "dbt-other"/EN1ESV, i.e. the ESV translation, unverified,
+    # when the real text is helloAO's own "BSB" translation, the same one
+    # BSBHAY's audio comes from — see downloads/helloao/BSB/). A manual
+    # import's own config entry is a direct, authoritative statement of
+    # what it actually is, so check it first and short-circuit before any
+    # guessing logic runs.
+    from remote_audio import _load_helloao_config
+    for trans_id, trans_meta in _load_helloao_config().get("translations", {}).items():
+        for reader_meta in trans_meta.get("readers", {}).values():
+            if reader_meta.get("distinct_id") == distinct_id:
+                return {"source": "helloao", "id": trans_id, "verified": True}
+
     text_source, text_source_id = resolve_preferred_text_source(iso, canon, distinct_id)
     if text_source == "dbt":
         return None

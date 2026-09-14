@@ -65,6 +65,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -82,7 +83,15 @@ from text_processing import clean_for_alignment, load_language_config, strip_mar
 
 OBS_DOWNLOADS_DIR = Path("downloads/obs")
 OBS_OUTPUT_DIR = Path("export/timing-data/obs")
-OBS_RUNS_DIR = Path("_obs_runs")
+# Same _runs/ tree and {batch_id, completed_at, results} shape as
+# align_pipeline.py's Contract B manifests (see write_run_manifest()'s own
+# docstring) — confirmed 2026-09-14 via a downstream consumer request:
+# they'd rather reuse the exact same manifest-pulling code for OBS
+# completion as they already run for Bible text than maintain a second
+# bespoke path for the same underlying problem ("has this been aligned
+# yet"). "story" stands in for "book"/"chapter" in each result; no
+# canon/distinct_id fields, since OBS has neither concept.
+RUNS_DIR = Path("_runs")
 
 # Calibrated 2026-08-05 against mai/sat (lowest-scoring of 11 spot-checked
 # languages) — see module docstring.
@@ -92,6 +101,12 @@ MIN_LOCAL_SCORE = 0.35
 
 IMAGE_RE = re.compile(r"!\[OBS Image\]\((?P<url>[^)]+)\)")
 CITATION_RE = re.compile(r"^_.+_$")
+
+# OBS-OBS4All's fixed placeholder story text (identical across every
+# language in that org — confirmed against its README and multiple
+# languages' actual story .md content 2026-09-11) — see process_story()'s
+# docstring for why this must short-circuit before any alignment attempt.
+VIDEO_ONLY_PLACEHOLDER_MARKER = "This version of OBS is video only."
 
 
 def log(message: str, level: str = "INFO"):
@@ -303,16 +318,22 @@ def segment_anchored_align(
 
 
 def write_obs_timing_json(iso: str, story_id: str, results: list[dict], output_path: Path):
-    entries = [
-        {
-            "story": story_id,
-            "segment": r["segment"],
-            "timestamp": r["start"],
-            "score": r["local_score"],
-            "source": r["source"],
-        }
-        for r in results
-    ]
+    """{id, pos, ...optional} — same baseline shape as align/nt|ot's DBT
+    text-alignment output and obs-video/'s video-detected output (see
+    those two module docstrings). Confirmed 2026-09-12 via a downstream
+    consumer proposal: this was the one pipeline still shipping a
+    bespoke per-row array ({story, segment, timestamp, score, source}),
+    forcing a separate parser for what's structurally the same "ordered
+    list of segment start times" every other pipeline already exposes as
+    pos. score/source ride along as parallel arrays (index-aligned with
+    pos) rather than replacing it — richer data stays, just additive.
+    """
+    entries = {
+        "id": f"{iso} story {story_id}",
+        "pos": [r["start"] for r in results],
+        "score": [r["local_score"] for r in results],
+        "source": [r["source"] for r in results],
+    }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file then atomically rename — a write that fails
     # partway (e.g. disk-full) must never leave a truncated file at the
@@ -338,6 +359,23 @@ def process_story(
         return {"skipped": True}
 
     raw_md = fetch_story_text(batch, story_id)
+    if VIDEO_ONLY_PLACEHOLDER_MARKER in raw_md:
+        # Confirmed 2026-09-11 (gdx story 01, after ruling out every other
+        # explanation including GPU contention by re-running clean on CPU):
+        # OBS-OBS4All's story .md isn't real narration text, it's a fixed
+        # "this is video only, click here to play" placeholder identical
+        # across all its languages (see the org's own README). Force-
+        # aligning that single English sentence against real-language
+        # narration audio can never produce a meaningful result — it was
+        # silently landing on a fallback-only, ~0.0-score "success" that
+        # looked like real output. Skip outright rather than write a
+        # _timing.json that would misrepresent itself as real alignment;
+        # these languages' actual per-story positions come from
+        # tools/detect_obs_video_segments.py instead (export/timing-data/
+        # obs-video/), which doesn't depend on narration text at all.
+        return {"error": "video-only placeholder text (source=OBS-OBS4All) — "
+                          "no real narration to align; see export/timing-data/obs-video/ instead"}
+
     segments = parse_story_md(raw_md)
     if not segments:
         return {"error": "No segments parsed from story .md"}
@@ -365,28 +403,23 @@ def process_story(
     }
 
 
-def write_run_manifest(iso: str, results: list[dict]) -> Path:
-    """Merge new story results into any existing run manifest for this iso,
-    rather than overwriting it — an incremental run (e.g. remaining stories
-    after an earlier partial batch) would otherwise silently drop prior
-    stories' records from the manifest, even though their timing output on
-    disk is untouched.
+def write_run_manifest(results: list[dict]) -> Path:
+    """Write one _runs/<batch_id>.json manifest for this run — same
+    write-once-per-run convention as align_pipeline.py's Contract B
+    manifests (no merge-with-prior-file logic needed: a consumer scanning
+    every manifest in _runs/ for a given (iso, story) already sees every
+    run's result the same way they already do for (iso, book, chapter),
+    so an older manifest recording a story that hasn't been touched since
+    stays exactly as valid as it always was).
     """
-    path = OBS_RUNS_DIR / f"{iso}.json"
-    prior_by_story = {}
-    if path.exists():
-        with open(path) as f:
-            prior_by_story = {r["story_id"]: r for r in json.load(f).get("results", [])}
-    for r in results:
-        prior_by_story[r["story_id"]] = r
-    merged = [prior_by_story[sid] for sid in sorted(prior_by_story)]
-
+    batch_id = os.environ.get("BATCH_ID") or f"obs-local-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     manifest = {
-        "iso": iso,
+        "batch_id": batch_id,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "results": merged,
+        "results": results,
     }
-    OBS_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    path = RUNS_DIR / f"{batch_id}.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     return path
@@ -432,25 +465,25 @@ def main():
             # align_pipeline.py's per-chapter error handling, which this
             # script never had.
             log(f"[{story_id}] ERROR: {e}", "ERROR")
-            run_results.append({"story_id": story_id, "status": "failed", "error": str(e)})
+            run_results.append({"iso": args.iso, "story": story_id, "status": "failed", "error": str(e)})
             continue
         if stats.get("skipped"):
             log(f"[{story_id}] skipped (exists)")
             continue
         if "error" in stats:
             log(f"[{story_id}] ERROR: {stats['error']}", "ERROR")
-            run_results.append({"story_id": story_id, "status": "failed", "error": stats["error"]})
+            run_results.append({"iso": args.iso, "story": story_id, "status": "failed", "error": stats["error"]})
             continue
         log(f"[{story_id}] {stats['segments']} segments, avg_score={stats['avg_score']}, "
             f"fallbacks={stats['fallbacks']}, {stats['elapsed']}s")
         run_results.append({
-            "story_id": story_id, "status": "ok",
-            "segments": stats["segments"], "avg_score": stats["avg_score"],
+            "iso": args.iso, "story": story_id, "status": "ok",
+            "segments": stats["segments"], "score": stats["avg_score"],
             "fallbacks": stats["fallbacks"],
         })
 
     if run_results:
-        path = write_run_manifest(args.iso, run_results)
+        path = write_run_manifest(run_results)
         log(f"Run manifest written: {path} ({len(run_results)} result(s))")
 
 

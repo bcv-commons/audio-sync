@@ -90,6 +90,29 @@ def _load_helloao_config() -> dict:
         return {}
 
 
+def manual_import_audio_info(distinct_id: str) -> dict | None:
+    """Provenance for a manually-imported edition's *audio* (e.g. BSBHAY),
+    or None for the normal/default case (a real DBT fileset id).
+
+    Confirmed 2026-09-14: align_pipeline.py's chapter["audio_fileset"] for
+    a manually-imported edition is just distinct_id itself (e.g. plain
+    "BSBHAY", not a real DBT fileset) — publishing that as if it were a
+    resolvable fileset id would hand a downstream consumer a dead end.
+    The real audio lives at helloAO's own per-chapter API
+    (bible.helloao.org/api/{translation}/{book}/{chapter}.json ->
+    thisChapterAudioLinks[reader]), which needs (translation, reader),
+    not a fileset id — this is that lookup, reusing the same
+    config/helloao.toml registry _load_helloao_config() already reads for
+    the audio-fetch side of this exact same edition.
+    """
+    cfg = _load_helloao_config()
+    for trans_id, trans_meta in cfg.get("translations", {}).items():
+        for reader_name, reader_meta in trans_meta.get("readers", {}).items():
+            if reader_meta.get("distinct_id") == distinct_id:
+                return {"source": "helloao", "translation": trans_id, "reader": reader_name}
+    return None
+
+
 # ─── URL builders ──────────────────────────────────────────────────────────
 
 def sermon_online_url(audio_meta: dict, book: str, chapter_num: int) -> str | None:
