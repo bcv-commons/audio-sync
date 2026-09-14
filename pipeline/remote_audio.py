@@ -9,7 +9,7 @@ because the audio is hosted remotely:
       URL = {baseUrl}{code}{chapter:0Nd}-{title}_Kapitel-{chapter:03d}.mp3
       where N pads the chapter so the leading prefix is 5 chars.
 
-  - helloAO chapter JSON (e.g. eng/BSBHAY): the chapter's
+  - helloAO chapter JSON (e.g. eng/ENGBSBHAY): the chapter's
       `thisChapterAudioLinks[reader]` field has the direct mp3 URL.
 
 The alignment pipeline calls `ensure_chapter_audio()` for each chapter
@@ -91,12 +91,12 @@ def _load_helloao_config() -> dict:
 
 
 def manual_import_audio_info(distinct_id: str) -> dict | None:
-    """Provenance for a manually-imported edition's *audio* (e.g. BSBHAY),
+    """Provenance for a manually-imported edition's *audio* (e.g. ENGBSBHAY),
     or None for the normal/default case (a real DBT fileset id).
 
     Confirmed 2026-09-14: align_pipeline.py's chapter["audio_fileset"] for
     a manually-imported edition is just distinct_id itself (e.g. plain
-    "BSBHAY", not a real DBT fileset) — publishing that as if it were a
+    "ENGBSBHAY", not a real DBT fileset) — publishing that as if it were a
     resolvable fileset id would hand a downstream consumer a dead end.
     The real audio lives at helloAO's own per-chapter API
     (bible.helloao.org/api/{translation}/{book}/{chapter}.json ->

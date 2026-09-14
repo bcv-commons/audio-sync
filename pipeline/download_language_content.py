@@ -636,14 +636,14 @@ def describe_text_source(iso: str, canon: str, distinct_id: str) -> dict | None:
        "likely": "orthography_convention", "score": 0.997}
       {"source": "helloao", "id": "eng_cpb", "verified": True}
     """
-    # Manually-imported editions (e.g. eng/BSBHAY — see config/helloao.toml's
+    # Manually-imported editions (e.g. eng/ENGBSBHAY — see config/helloao.toml's
     # own comment) aren't registered in any catalog at all, so
     # resolve_preferred_text_source() below has no direct link to find and
     # falls through to catalog-overlap.json's cross-language guessing —
-    # confirmed 2026-09-14 to return a flatly WRONG answer for BSBHAY
+    # confirmed 2026-09-14 to return a flatly WRONG answer for ENGBSBHAY
     # (guessed "dbt-other"/EN1ESV, i.e. the ESV translation, unverified,
     # when the real text is helloAO's own "BSB" translation, the same one
-    # BSBHAY's audio comes from — see downloads/helloao/BSB/). A manual
+    # ENGBSBHAY's audio comes from — see downloads/helloao/BSB/). A manual
     # import's own config entry is a direct, authoritative statement of
     # what it actually is, so check it first and short-circuit before any
     # guessing logic runs.

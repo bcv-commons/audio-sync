@@ -575,7 +575,7 @@ def _find_base_dir(canon: str, iso: str, distinct_id: str) -> Path | None:
     Searches in priority order:
       downloads/BB/                  (DBT)
       downloads/contrib/             (contributed: NORNBS, DEUSOL, ...)
-      downloads/helloao/aligned/     (helloAO + reader: BSBHAY, BSBGIL, ...)
+      downloads/helloao/aligned/     (helloAO + reader: ENGBSBHAY, BSBGIL, ...)
     """
     for base in (DOWNLOADS_DIR, Path("downloads/contrib"), Path("downloads/helloao/aligned")):
         candidate = base / canon / iso / distinct_id

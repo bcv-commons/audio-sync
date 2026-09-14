@@ -14,14 +14,25 @@
 # helloAO offers for this translation (david/hays/souer) — so this mapping
 # is a verified match, not a guess.
 #
-# distinct_id renamed 2026-09-14 from the original locally-invented
-# "ENGBSB" to helloAO's own BSBHAY convention (matching BSBGIL and every
-# other helloAO-sourced edition already using {translation}{reader}
-# naming) — ENGBSB was the one outlier with no derivable relationship to
-# any DBT or helloAO id, which is what prompted a downstream consumer's
-# align/ naming-mismatch report. Self-describing now: no separate
-# id-mapping needed for anyone resolving this edition from helloAO's own
-# catalog. export/timing-data/{nt,ot}/eng/ already renamed to match
-# (align/ republished under the new path, old ENGBSB path retired).
+# distinct_id renamed 2026-09-14 (first pass) from the original
+# locally-invented "ENGBSB" to helloAO's own BSBHAY convention (matching
+# BSBGIL and every other helloAO-sourced edition already using
+# {translation}{reader} naming) — ENGBSB was the one outlier with no
+# derivable relationship to any DBT or helloAO id, which is what prompted
+# a downstream consumer's align/ naming-mismatch report. Self-describing:
+# no separate id-mapping needed for anyone resolving this edition from
+# helloAO's own catalog.
+#
+# distinct_id renamed again 2026-09-14 (second pass) from "BSBHAY" to
+# "ENGBSBHAY" — scanned all 863 distinct_ids in export/timing-data/ and
+# found 96%+ start with a 3-letter language-identifying prefix (exact
+# iso639-3, or DBT's own dialect/variant code like EN1 for English, HND
+# for a Hindi variant, AYM for Aymara). BSBHAY was the only id in the
+# whole catalog with a non-language prefix ("BSB" is a translation
+# abbreviation, not a language code) — adding the ENG prefix closes that
+# gap for future-proofing, matching the same convention every other
+# edition already follows. export/timing-data/{nt,ot}/eng/ already
+# renamed to match (align/ republished under the new path, old BSBHAY
+# path retired).
 [translations.BSB.readers.hays]
-distinct_id = "BSBHAY"
+distinct_id = "ENGBSBHAY"
