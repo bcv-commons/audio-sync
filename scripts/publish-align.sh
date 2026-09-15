@@ -127,6 +127,18 @@ python3 tools/pre_publish_check.py --out "$QUARANTINE_FILE"
 #     don't get published on a future run.
 #   *_words.json for verse-only-aligned chapters — see VERSE_ONLY_EXCLUDES
 #     above. Their _timing.json still publishes normally.
+#   obs-video/ — export/timing-data/obs-video/ is a structurally different
+#     tree (video-frame-detected position markers, no canon/version/BOOK
+#     breakdown, no _words.json — see scripts/publish-obs-video.sh's own
+#     header comment) that happens to live as a subdirectory here so
+#     tools/detect_obs_video_segments.py can share the local "timing-data"
+#     root, but it must never be swept into align/ itself — that would
+#     misrepresent it to any consumer expecting real word/verse timing.
+#     It has its own publish script + CDN root (cdn.bibel.wiki/obs-video/).
+#     Confirmed 2026-09-15 this exclude was missing since whenever
+#     obs-video/ was first added — 599 files were already live at
+#     align/obs-video/ from a past run; cleaned up separately, this
+#     exclude just stops it recurring.
 echo "── Publishing $TIMING_SOURCE_DIR -> cdn.bibel.wiki/${CDN_PREFIX}/ ..."
 rclone copy "$TIMING_SOURCE_DIR" "$REMOTE" \
     --header-upload "Cache-Control: max-age=3600" \
@@ -134,6 +146,7 @@ rclone copy "$TIMING_SOURCE_DIR" "$REMOTE" \
     --checkers 16 \
     --exclude "**/*_words_quality.json" \
     --exclude "**/*.srt" \
+    --exclude "obs-video/**" \
     "${VERSE_ONLY_EXCLUDES[@]}" \
     --exclude-from "$QUARANTINE_FILE" \
     $DRY_FLAG \
