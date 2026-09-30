@@ -58,7 +58,7 @@ from align_words import detect_audio_header
 from batch_manifest import get_template_chapters_from_batch, load_batch
 from gpu_health import CudaContextPoisonedError, note_alignment_success, wrap_if_poisoned
 from hw_config import load_hw_config
-from text_processing import clean_for_alignment, load_language_config, strip_markers
+from text_processing import clean_for_alignment, load_language_config, read_verse_texts
 from uroman import Uroman
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -970,12 +970,7 @@ def process_chapter(item: dict, bundle, model, tokenizer, aligner, uroman, confi
     mms_path = item["mms_path"]
 
     # Read verse texts, stripping non-spoken markers
-    with open(text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
-
-    # Remove trailing empty lines
-    while verse_texts and not verse_texts[-1].strip():
-        verse_texts.pop()
+    verse_texts = read_verse_texts(text_path, config)
 
     # Clean verses for alignment and join into single text
     cleaned_verses = [clean_for_alignment(v, config) for v in verse_texts]
@@ -1240,8 +1235,7 @@ def main():
         if whisper_path:
             whisper_words = _load_whisper_words(whisper_path)
             if whisper_words:
-                with open(item["text_path"], "r", encoding="utf-8") as f:
-                    verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
+                verse_texts = read_verse_texts(item["text_path"], config)
                 verse_start, header_text = detect_audio_header(whisper_words, verse_texts, config)
                 if verse_start:
                     header_skip_time = verse_start

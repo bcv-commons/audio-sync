@@ -37,8 +37,10 @@ Output:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -426,6 +428,294 @@ def get_dbt_book_coverage(distinct_id: str) -> dict[str, list] | None:
 
     _book_coverage_cache[distinct_id] = coverage
     return coverage
+
+
+_official_filesets_cache: dict[str, dict[str, str] | None] = {}
+DBT_FILESETS_CACHE_DIR = Path("api-cache/dbt-filesets")
+
+
+def get_official_filesets(distinct_id: str) -> dict[str, str] | None:
+    """Fetch (and cache) the {fileset_id: type} map DBT's own bibles/{id}
+    endpoint lists for this distinct_id, across all its collections
+    (dbp-prod, dbp-vid, ...) — e.g. {"GORLAIN_ET": "text_plain",
+    "GORLAIN_ET-json": "text_json", ...}.
+
+    This is the authoritative safety gate for recover_missing_verses()
+    below: confirmed 2026-09-15 that a fileset id can respond to a direct
+    /bibles/filesets/{id}/{book}/{chapter} query even when it is NOT
+    listed here — e.g. the bare "GORLAI" id (no _ET suffix) returns a
+    DIFFERENT translation's wording throughout (verified word-for-word
+    mismatch on 10 sampled verses), not just a differently-formatted
+    export of the same text, while "MOGLAI" (bare, for a different
+    edition) IS listed here (type "text_format") and its content matches
+    that edition's own "_ET" text exactly. Also confirmed the local
+    api-cache/dbt-catalog/catalog-text.json cache is NOT a reliable
+    substitute for this check on its own — 2 of 18 editions tested
+    (alp/ALPWBT, hns/HNSWBT) had a live-official bare fileset that
+    catalog-text.json's own 'f'-format tag didn't show (stale/incomplete
+    cache) — so this must be a live (cached-on-disk, but freshly fetched
+    per distinct_id) check, not derived from catalog-text.json.
+
+    Returns None if the API call itself failed (caller should treat that
+    as "can't verify, don't use" — not "confirmed absent").
+    """
+    if distinct_id in _official_filesets_cache:
+        return _official_filesets_cache[distinct_id]
+
+    cache_path = DBT_FILESETS_CACHE_DIR / f"{distinct_id}.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                filesets = json.load(f)
+            _official_filesets_cache[distinct_id] = filesets
+            return filesets
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    data = make_api_request(f"bibles/{distinct_id}", use_key_param=True)
+    if not data or not data.get("data"):
+        _official_filesets_cache[distinct_id] = None
+        return None
+
+    collections = data["data"].get("filesets", {})
+    filesets = {
+        item["id"]: item["type"]
+        for items in collections.values()
+        for item in items
+        if item.get("id") and item.get("type")
+    }
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(filesets, f)
+
+    _official_filesets_cache[distinct_id] = filesets
+    return filesets
+
+
+def _sofria_verse_texts(data: dict) -> dict[str, str]:
+    """Extract {verse_number_or_range: text} from a sofria-schema JSON
+    document (DBT's "text_json" format), reading ONLY the text directly
+    inside each verse's own wrapper — not recursing into nested "graft"
+    sub-sequences (footnotes, figure/image captions).
+
+    Confirmed 2026-09-15 (bgq/BGQWBT MAT 27): a verse can have a wrapper
+    node with a number label but EMPTY content — its real text was
+    smuggled inside a sibling image-caption graft attached to a
+    different, earlier verse's wrapper. Counting that graft's text as
+    "belonging" to the empty verse would be wrong (it's not cleanly
+    attributable per-verse); this function deliberately leaves such
+    verses out rather than guessing.
+
+    A verse number can itself be a merged range like "2-11" (DBT's own
+    representation of a multi-verse chunk with no internal per-verse
+    boundary, seen in gor/GORLAI MAT 1) — returned as-is under that
+    string key, not split, since there's no way to know where within the
+    chunk each real verse actually starts.
+    """
+    out: dict[str, list[str]] = {}
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            if obj.get("type") == "wrapper" and obj.get("subtype") == "verses":
+                num = obj.get("atts", {}).get("number")
+                if num:
+                    texts = [c for c in obj.get("content", []) if isinstance(c, str) and c.strip()]
+                    if texts:
+                        out.setdefault(num, []).extend(texts)
+                return
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return {k: " ".join(v).strip() for k, v in out.items()}
+
+
+def recover_missing_verses(
+    iso: str, distinct_id: str, book: str, chapter: int,
+) -> dict | None:
+    """Try to recover verse content missing from the normal "plain" text
+    fetch, for one chapter — via DBT's bare/"text_format" fileset first,
+    then its "text_json" (sofria) fileset, EACH gated on being officially
+    listed for this exact distinct_id (see get_official_filesets()'s
+    docstring for why that gate is required, not optional).
+
+    This is a standalone recovery utility, NOT part of download_job()'s
+    normal candidate chain — confirmed 2026-09-15 via a 319-chapter
+    corpus audit that only ~16% of verse-count mismatches are safely
+    recoverable this way at all (most are genuine DBT-side text gaps or
+    merged-verse chunks with no fix available), so this must stay an
+    explicit, reviewed, per-chapter recovery step — never a silent
+    fallback in the main fetch path.
+
+    Returns {"fileset_id": ..., "type": "text_format"|"text_json",
+    "verses": [{"verse_start": ..., "verse_end": ..., "verse_text": ...}]}
+    for whichever candidate returns the most verses, or None if neither
+    official candidate exists or both come back empty.
+    """
+    official = get_official_filesets(distinct_id)
+    if not official:
+        return None
+
+    # official is already scoped to this exact distinct_id (fetched via
+    # bibles/{distinct_id}), so every entry in it is legitimately part of
+    # this bible — no additional id-prefix filter needed (and none would
+    # be safe: a fileset's real id often doesn't share distinct_id's own
+    # prefix at all, e.g. bgq/BGQWBT's own filesets are "BGQWINN_ET-*").
+    candidates = [(fid, ftype) for fid, ftype in official.items()
+                  if ftype in ("text_format", "text_json")]
+
+    best = None
+    for fid, ftype in candidates:
+        try:
+            content = get_text_content(fid, book, chapter)
+        except Exception:
+            continue
+        if not content:
+            continue
+
+        verses = []
+        if content["type"] == "verses":
+            for v in content["data"]:
+                if v.get("verse_text", "").strip():
+                    verses.append({
+                        "verse_start": v["verse_start"],
+                        "verse_end": v.get("verse_end", v["verse_start"]),
+                        "verse_text": v["verse_text"],
+                    })
+        elif content["type"] == "path":
+            try:
+                doc = _get_with_retry(content["data"], timeout=DOWNLOAD_TIMEOUT).json()
+            except requests.RequestException:
+                continue
+            sofria_verses = _sofria_verse_texts(doc)
+            for num, text in sofria_verses.items():
+                # A verse label can carry a lettered sub-verse suffix (e.g.
+                # "6a"/"6b" for a translation split within one verse, seen
+                # in ifu/IFUWPS LUK 3) — take the leading digits and drop
+                # the letter; still the same verse for our count/timing
+                # purposes, just not distinguishing the sub-split.
+                parts = num.split("-", 1)
+                digits = [re.match(r"\d+", p) for p in parts]
+                if not all(digits):
+                    continue
+                a = int(digits[0].group())
+                b = int(digits[-1].group())
+                verses.append({"verse_start": a, "verse_end": b, "verse_text": text})
+
+        if verses and (best is None or len(verses) > len(best["verses"])):
+            best = {"fileset_id": fid, "type": ftype, "verses": verses}
+
+    return best
+
+
+def _local_verse_count(text_path: Path) -> int:
+    """Cheap, filesystem-only stand-in for a text file's verse count — one
+    non-blank physical line per verse, same base assumption read_verse_texts()
+    (text_processing.py) applies (it additionally merges continuation
+    lines, which would only ever reduce this count further). Used purely
+    as _maybe_recover_text()'s pre-check for whether it's worth making any
+    live API call at all — not as alignment input itself.
+    """
+    try:
+        lines = [ln for ln in text_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return 0
+    return len(lines)
+
+
+def _local_timing_verse_count(timing_path: Path) -> int:
+    """DBT's own raw timing file's verse count — its verse_start entries,
+    minus the "0" intro marker. This is the ground-truth count
+    recover_missing_verses() is trying to reach; see that function's
+    docstring and get_official_filesets()'s for why an unlisted fileset
+    must never be used to fill the gap even when it looks more complete.
+    """
+    try:
+        data = json.loads(timing_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(data, list):
+        return 0
+    nums = set()
+    for entry in data:
+        try:
+            n = int(entry.get("verse_start"))
+        except (TypeError, ValueError):
+            continue
+        if n != 0:
+            nums.add(n)
+    return len(nums)
+
+
+def _maybe_recover_text(
+    text_file: Path, timing_file: Path, iso: str, distinct_id: str, book: str, chapter: int,
+) -> str | None:
+    """After a normal DBT text+timing fetch, opportunistically check
+    whether the text came up short against DBT's own timing verse count
+    and, if an officially-listed alternate fileset for this same edition
+    resolves the gap, overwrite the text file with it.
+
+    Confirmed 2026-09-15 via a 319-chapter corpus audit + live recovery
+    pass: about 69/319 (21.6%) of DBT text/timing verse-count mismatches
+    are safely recoverable this way (officially-listed bare "text_format"
+    or "text_json" fileset gives DBT's exact verse count); the rest are
+    genuine DBT-side text gaps or multi-verse chunks with no fix
+    available — recover_missing_verses() returns None or a partial result
+    for those, and this function correctly does nothing in that case
+    rather than overwriting a complete file with an incomplete one.
+
+    Never crashes the caller: recovery is a pure enhancement over an
+    already-successful download, so any failure here (network, parse,
+    write) is swallowed and the original text file is left untouched.
+
+    Returns the fileset id actually used for the (successful) recovery,
+    for text_source_tag provenance — or None if no recovery happened.
+    """
+    if not text_file.exists() or not timing_file.exists():
+        return None
+    text_count = _local_verse_count(text_file)
+    timing_count = _local_timing_verse_count(timing_file)
+    if timing_count == 0 or text_count >= timing_count:
+        return None
+
+    try:
+        recovered = recover_missing_verses(iso, distinct_id, book, chapter)
+    except Exception:
+        return None
+    if not recovered or len(recovered["verses"]) <= text_count:
+        return None
+
+    lines = [v["verse_text"] for v in sorted(recovered["verses"], key=lambda x: x["verse_start"])]
+    try:
+        _atomic_write_text(text_file, "\n".join(lines))
+        # Not the shared _write_raw_json() — this needs an explicit
+        # "recovered" marker so align_pipeline.py's write_run_manifest()
+        # can tell "this chapter used a non-default fileset because it was
+        # recovered" apart from "this chapter's default fileset always was
+        # this one" without re-deriving the expected default each time.
+        raw_path = text_file.with_suffix(".raw.json")
+        raw_content = json.dumps(
+            {
+                "source": "dbt", "fileset_id": recovered["fileset_id"],
+                "recovered": True, "recovered_type": recovered["type"],
+                "verses": recovered["verses"],
+            },
+            ensure_ascii=False, indent=0,
+        )
+        _atomic_write_text(raw_path, raw_content)
+    except OSError:
+        return None
+
+    log(
+        f"  Recovered {len(recovered['verses'])}/{timing_count} verses for "
+        f"{text_file.name} via {recovered['fileset_id']} ({recovered['type']}), was {text_count}",
+        "INFO",
+    )
+    return recovered["fileset_id"]
 
 
 def _find_helloao_id(iso: str, canon: str, distinct_id: str) -> str | None:
@@ -1150,6 +1440,48 @@ def _classify_api_failure() -> str:
     return "http_error"
 
 
+def _requests_get_wall_clock(url: str, *, wall_clock_timeout: float, **kwargs):
+    """requests.get() with an actual total-duration cap — not just
+    requests' own `timeout=` kwarg, which bounds connect time and the gap
+    between individual socket reads, NOT overall wall-clock time. A
+    connection that keeps trickling a few bytes just often enough (each
+    individual read landing under the per-read timeout) can hang for
+    arbitrarily long without requests ever raising Timeout.
+
+    Confirmed 2026-09-16: this exact gap caused a real incident — a
+    download_audio() call for one chapter (cmo/CMOBSCK MRK 5's second
+    audio variant) hung for 6+ minutes despite timeout=60 being passed
+    through, with no requests.Timeout ever raised (so _get_with_retry()'s
+    own retry-on-Timeout never triggered either). That silently blocked
+    the whole worker until the external stall-watchdog's 300s no-progress
+    check finally killed the ENTIRE process tree and forced a full
+    restart-from-the-start-of-the-iso-list (see watchdog-align-parallel.sh
+    + tools/stall_quarantine.py) — a single slow download costing far
+    more than just that one chapter.
+
+    Runs the real requests.get() in a throwaway single-use thread (a
+    fresh ThreadPoolExecutor per call, not a shared pool — a shared pool
+    would eventually fill up with orphaned hung threads over a
+    long-running batch and start blocking NEW requests on old hangs) and
+    gives up waiting after wall_clock_timeout, converting a hang into a
+    normal, retryable requests.Timeout. The abandoned thread is not
+    killed (Python has no safe way to kill a thread mid-syscall) — it
+    either finishes or times out on its own eventually and is garbage
+    collected; harmless, since the caller is already unblocked either way.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(requests.get, url, **kwargs)
+    try:
+        return future.result(timeout=wall_clock_timeout)
+    except concurrent.futures.TimeoutError as e:
+        raise requests.Timeout(
+            f"wall-clock timeout ({wall_clock_timeout}s) exceeded waiting for {url} "
+            f"(requests' own read timeout never fired — a slow trickle, not a hard failure)"
+        ) from e
+    finally:
+        executor.shutdown(wait=False)
+
+
 def _get_with_retry(url: str, *, attempts: int = 3, backoff: float = 2.0, **kwargs):
     """requests.get() with retry-with-backoff on transient network errors.
 
@@ -1159,11 +1491,18 @@ def _get_with_retry(url: str, *, attempts: int = 3, backoff: float = 2.0, **kwar
     (4xx/5xx from raise_for_status()) — those are real answers ("fileset
     doesn't exist", "unauthorized"), not blips, and retrying them just
     wastes time hammering a request that will fail the same way again.
+
+    Wall-clock-capped via _requests_get_wall_clock() at 2x whatever
+    per-read `timeout=` the caller passed (or 2x DOWNLOAD_TIMEOUT if none
+    given) — generous headroom for a legitimately large/slow-but-real
+    transfer, while staying comfortably under the external watchdog's
+    300s stall threshold so a hang fails and retries here first.
     """
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
-            return requests.get(url, **kwargs)
+            wall_clock_timeout = kwargs.get("timeout", DOWNLOAD_TIMEOUT) * 2
+            return _requests_get_wall_clock(url, wall_clock_timeout=wall_clock_timeout, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
             if attempt < attempts:
@@ -1738,6 +2077,8 @@ def download_chapter(
     # an upstream 404 on one variant falls back to the next (e.g. text_format
     # when text_plain is missing).
     text_source_tag = None
+    dbt_text_file = None  # set below whenever DBT text landed on disk — the
+    # hook point for _maybe_recover_text()'s post-fetch completeness check.
     if text_fileset and "text" in content_types:
         # Build the ordered candidate list. text_fileset is always tried first;
         # additional candidates fall through if the first one fails.
@@ -1754,6 +2095,7 @@ def download_chapter(
             log(f"  ⊙ Already exists: {book}_{chapter:03d}_{existing}.txt", "INFO")
             stats.already_exists += 1
             text_source_tag = f"dbt:{existing}"
+            dbt_text_file = base_dir / f"{book}_{chapter:03d}_{existing}.txt"
         else:
             text_downloaded = False
             for cand in candidates:
@@ -1768,6 +2110,7 @@ def download_chapter(
                     if cand != text_fileset:
                         log(f"  Used fallback text fileset: {cand}", "INFO")
                     text_source_tag = f"dbt:{cand}"
+                    dbt_text_file = text_file
                     text_downloaded = True
                     break
             if not text_downloaded:
@@ -1805,16 +2148,34 @@ def download_chapter(
             success = False
 
     # Download timing (if requested and available)
+    dbt_timing_file = None
     if timing_available and audio_fileset and "timing" in content_types:
         timing_file = base_dir / f"{book}_{chapter:03d}_{audio_fileset}_timing.json"
-        if not _fetch_with_claim(
+        if _fetch_with_claim(
             timing_file, force, stats, timing_file.name,
             lambda: download_timing(
                 audio_fileset, book, chapter, timing_file,
                 iso, distinct_id, stats, error_logger,
             ),
         ):
+            dbt_timing_file = timing_file
+        else:
             success = False
+
+    # Opportunistic completeness check — DBT's own text and timing exports
+    # for the same chapter/fileset are two independently-produced products
+    # and can genuinely disagree (confirmed 2026-09-15 via a 319-chapter
+    # corpus audit: DBT's "plain" text export drops or merges real verses
+    # in ~8% of chapters, relative to what its own timing file's verse
+    # count implies). Cheap in the common case — only makes a live API
+    # call when a local, filesystem-only count comparison already shows a
+    # shortfall, so most chapters never pay for this at all.
+    if dbt_text_file and dbt_timing_file:
+        recovered_fileset = _maybe_recover_text(
+            dbt_text_file, dbt_timing_file, iso, distinct_id, book, chapter,
+        )
+        if recovered_fileset:
+            text_source_tag = f"dbt:{recovered_fileset} (recovered)"
 
     # Write source.json if we have source info
     audio_source_tag = f"dbt:{audio_fileset}" if audio_fileset else None

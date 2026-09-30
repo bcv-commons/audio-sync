@@ -111,10 +111,11 @@ def has_fallback_corruption(quality_path: Path) -> bool:
 
     Path-agnostic: applies equally to the fusion pipeline's
     *_words_quality.json (source values "mms"/"whisper"/"mms_gap_fill"/
-    "mms_drift_fix") and verse-only mode's (source "local"/"fallback") —
-    both write the same {"summary": {"total_words", "null_count",
-    "avg_score", ...}} shape (align_words.py / align_verse_words.py), and
-    a poisoned context corrupts either pipeline identically.
+    "mms_drift_fix") and verse-only mode's (source
+    "local"/"fallback"/"interpolated") — both write the same
+    {"summary": {"total_words", "null_count", "avg_score", ...}} shape
+    (align_words.py / align_verse_words.py), and a poisoned context
+    corrupts either pipeline identically.
     """
     try:
         with open(quality_path) as f:

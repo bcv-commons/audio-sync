@@ -37,7 +37,16 @@ from quality_report import (
 
 
 def discover_languages(testament=None):
-    """Auto-discover ISO codes with both pipeline timing and downloaded timecode."""
+    """Auto-discover ISO codes with both pipeline timing and downloaded timecode.
+
+    find_all_downloaded_timecode() already knows the current flat download
+    layout (downloads/BB/{canon}/{iso}/{distinct_id}/{book}/*_timing.json,
+    since the repo-split rewrite dropped the old with-timecode/
+    audio-with-timecode category subfolders) — reuse it here instead of
+    re-deriving a stale category-only check, which used to find zero
+    languages even though 80k+ DBT timing files were sitting on disk
+    (confirmed 2026-09-24).
+    """
     canons = _get_canons(testament)
 
     # Collect ISOs with pipeline timing data
@@ -52,16 +61,8 @@ def discover_languages(testament=None):
     # Filter to those that also have downloaded timecode
     result = []
     for iso in sorted(pipeline_isos):
-        found = False
-        for canon in canons:
-            if found:
-                break
-            for cat in TIMECODE_CATEGORIES:
-                cat_dir = DOWNLOADS_DIR / canon / cat / iso
-                if cat_dir.exists() and any(cat_dir.iterdir()):
-                    result.append(iso)
-                    found = True
-                    break
+        if find_all_downloaded_timecode(iso, testament):
+            result.append(iso)
 
     return result
 
@@ -89,6 +90,7 @@ def compare_language(iso, testament=None):
         return None
 
     good = drift = bad = 0
+    corrupt_files = []
     all_mean_deltas = []
     overall_max_delta = 0.0
     chapter_details = []
@@ -97,6 +99,17 @@ def compare_language(iso, testament=None):
         canon, distinct_id, book, chapter_str = key
         dl_verses = load_timing_verses(downloaded_tc[key])
         pl_verses = load_timing_verses(pipeline_by_key[key])
+
+        # A corrupt/unreadable file is a real bug worth surfacing, distinct
+        # from "no common verses" — a genuinely empty or truncated
+        # timing.json should never have been left on disk.
+        if dl_verses is None:
+            corrupt_files.append(str(downloaded_tc[key]))
+            continue
+        if pl_verses is None:
+            corrupt_files.append(str(pipeline_by_key[key]))
+            continue
+
         cmp = compare_verse_timings(dl_verses, pl_verses)
 
         if cmp is None:
@@ -125,7 +138,7 @@ def compare_language(iso, testament=None):
         })
 
     chapters_compared = good + drift + bad
-    if chapters_compared == 0:
+    if chapters_compared == 0 and not corrupt_files:
         return None
 
     return {
@@ -134,7 +147,8 @@ def compare_language(iso, testament=None):
         "good": good,
         "drift": drift,
         "bad": bad,
-        "mean_delta": sum(all_mean_deltas) / len(all_mean_deltas),
+        "corrupt_files": corrupt_files,
+        "mean_delta": sum(all_mean_deltas) / len(all_mean_deltas) if all_mean_deltas else 0.0,
         "max_delta": overall_max_delta,
         "chapter_details": chapter_details,
     }
@@ -202,6 +216,7 @@ def print_summary_table(results):
     t_ch = t_good = t_drift = t_bad = 0
     t_max = 0.0
     t_mean_deltas = []
+    all_corrupt = []
 
     for r in results:
         print(fmt.format(
@@ -213,13 +228,23 @@ def print_summary_table(results):
         t_drift += r["drift"]
         t_bad += r["bad"]
         t_max = max(t_max, r["max_delta"])
-        t_mean_deltas.append(r["mean_delta"])
+        if r["chapters"]:
+            t_mean_deltas.append(r["mean_delta"])
+        all_corrupt.extend(r.get("corrupt_files", []))
 
     print("  " + "-" * 47)
     overall_mean = sum(t_mean_deltas) / len(t_mean_deltas) if t_mean_deltas else 0
     print(fmt.format("ALL", t_ch, t_good, t_drift, t_bad,
                       f"{overall_mean:.2f}s", f"{t_max:.1f}s"))
     print()
+
+    if all_corrupt:
+        print(f"  *** {len(all_corrupt)} corrupt/unreadable timing.json file(s) found (not counted above) ***")
+        for f in all_corrupt[:20]:
+            print(f"    {f}")
+        if len(all_corrupt) > 20:
+            print(f"    ... and {len(all_corrupt) - 20} more")
+        print()
 
 
 def print_detail_table(result):

@@ -171,6 +171,52 @@ def strip_markers(text: str, config: LanguageConfig) -> str:
     return text.strip()
 
 
+def read_verse_texts(text_path: Path, config: LanguageConfig) -> list[str]:
+    """Read a reference text file into one string per verse.
+
+    Replaces the naive "one physical line = one verse" reading previously
+    duplicated across 5 call sites (align_verse_words.py, align_words.py,
+    align_pipeline.py, mms_align_words.py x2). DBT's own ET text exports
+    sometimes spread a single verse across multiple physical lines — an
+    embedded blank line mid-verse, or indented continuation lines used for
+    quoted/poetic material (e.g. an Isaiah quotation set as several
+    indented sub-lines within a Luke verse). Treating each of those extra
+    lines as its own verse silently shifts every later verse in the
+    chapter onto the wrong timestamp for the rest of the chapter — not
+    just a count mismatch, a real misattribution.
+
+    Confirmed 2026-09-15 via a corpus-wide audit against DBT's own
+    verse-count metadata (downloads/BB/.../*_timing.json's own verse_start
+    entries — ground truth for verse count regardless of alignment
+    quality): 2,278 chapters affected this way (median +3 extra verses,
+    worst case 891 vs a real 22 in mai/MAIWBT ACT 1; LUK 3's genealogy —
+    heavily poetic-quotation-formatted — was a repeat offender across
+    several languages).
+
+    Fix: a line beginning with whitespace is a continuation of the verse
+    still being accumulated (its content is appended, not started fresh);
+    a blank line is never itself a verse boundary or content. Validated
+    against the confirmed-mismatch corpus (_obs_verify/validate_merge_
+    heuristic.py): resolves 87.8% of over-split cases to DBT's own verse
+    count exactly. Does NOT address the separate, much rarer under-split
+    pattern (DBT reporting more verses than physical lines exist in our
+    copy of the text) — confirmed that has a different, not-yet-understood
+    cause (e.g. bgq/BGQWBT: no indentation/blank-line pattern at all, just
+    fewer physical lines than DBT's verse count), unaffected by this
+    change either way.
+    """
+    verses: list[str] = []
+    for raw_line in text_path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip():
+            continue
+        if raw_line[:1].isspace():
+            if verses:
+                verses[-1] = f"{verses[-1]} {raw_line.strip()}"
+            continue
+        verses.append(raw_line)
+    return [strip_markers(v, config) for v in verses]
+
+
 def clean_for_alignment(text: str, config: LanguageConfig) -> str:
     """Clean text for forced alignment and word counting.
 

@@ -59,6 +59,7 @@ from check_timing_quality import check_language
 from check_verse_only_fallback import check_language_fallback
 from hw_config import load_hw_config
 from purge_aligned_audio import purge_iso_audio
+from stall_quarantine import clear_tracking_on_success, is_quarantined
 from whisper_transcribe import NT_BOOKS, OT_BOOKS, load_all_template_refs
 
 ALL_BOOKS = {**OT_BOOKS, **NT_BOOKS}
@@ -245,12 +246,29 @@ def main():
     isos = [args.iso] if args.iso else [c.strip().lower() for c in args.iso_list.split(",") if c.strip()]
 
     failed_isos = []
+    quarantined_isos = []
     for iso in isos:
+        # Consecutive-stall quarantine — see tools/stall_quarantine.py's
+        # module docstring for the 2026-09-16 incident that motivated
+        # this (the same iso hanging at two consecutive stall-kills,
+        # blocking every language behind it since a restart always
+        # rescans the full list from #1). Checked BEFORE the "Language:"
+        # banner below so a skip never looks like a genuine attempt in
+        # the log record_stall() parses.
+        if is_quarantined(iso):
+            log(f"[{iso}] Skipped — quarantined after repeated stalls "
+                f"(see _runs/stall_quarantine.json; "
+                f"'python tools/stall_quarantine.py clear {iso}' once investigated)")
+            quarantined_isos.append(iso)
+            continue
+
         log("")
         log(f"===== Language: {iso} =====")
         ok = shard_one_language(iso, dict(base_refs), args.workers, passthrough)
         if not ok:
             failed_isos.append(iso)
+        else:
+            clear_tracking_on_success(iso)
 
         # Read-only quality check — logs a warning if this language has
         # real DUPES/BACKWARDS chapters (DUPES-EMPTY and DUPES-OK are
@@ -325,12 +343,16 @@ def main():
                 log(f"[{iso}] Audio purge failed (non-fatal): {e}")
 
     log("")
+    if quarantined_isos:
+        log(f"Skipped {len(quarantined_isos)}/{len(isos)} quarantined language(s): {quarantined_isos} "
+            f"— see _runs/stall_quarantine.json")
     if failed_isos:
         log(f"Done — {len(failed_isos)}/{len(isos)} language(s) had at least one failed worker: "
             f"{failed_isos}. Rerun the same command to retry (already-done chapters are skipped).")
         sys.exit(1)
 
-    log(f"Done — all {len(isos)} language(s) finished OK.")
+    log(f"Done — all {len(isos) - len(quarantined_isos)} attempted language(s) finished OK"
+        + (f" ({len(quarantined_isos)} quarantined, skipped)" if quarantined_isos else "") + ".")
 
 
 if __name__ == "__main__":

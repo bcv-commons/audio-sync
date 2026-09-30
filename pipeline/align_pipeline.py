@@ -343,7 +343,7 @@ def detect_whisper_header(whisper_path: Path, text_path: Path, config) -> tuple[
     import json
 
     from align_words import detect_audio_header
-    from text_processing import strip_markers
+    from text_processing import read_verse_texts
 
     if not whisper_path.exists() or not text_path.exists():
         return None, None
@@ -354,8 +354,7 @@ def detect_whisper_header(whisper_path: Path, text_path: Path, config) -> tuple[
     if not whisper_words:
         return None, None
 
-    with open(text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
+    verse_texts = read_verse_texts(text_path, config)
 
     return detect_audio_header(whisper_words, verse_texts, config)
 
@@ -531,6 +530,7 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
     vrs_map = {}
     text_source_map = {}
     audio_source_map = {}
+    text_recovery_map = {}
     for r in results:
         iso, did = r.get("iso"), r.get("distinct_id")
         if not iso or not did:
@@ -551,6 +551,31 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
             if info:
                 audio_source_map[key] = info
 
+        # Per-CHAPTER recovery check — independent of text_source_map above,
+        # since recovery (download_language_content.py's
+        # _maybe_recover_text()) only ever touches the specific chapters
+        # where DBT's own "plain" text export came up short against its own
+        # timing file, never the whole edition. Confirmed 2026-09-15 via a
+        # 319-chapter audit: most editions have this for only a handful of
+        # chapters, so folding it into the edition-level text_source_map
+        # would misrepresent every OTHER chapter of that same edition as
+        # using the same non-default source when they don't.
+        canon = r.get("canon")
+        book, chapter = r.get("book"), r.get("chapter")
+        if r.get("status") == "ok" and canon and book and chapter:
+            raw_dir = Path("downloads/BB") / canon / iso / did / book
+            for raw_path in raw_dir.glob(f"{book}_{chapter:03d}_*.raw.json"):
+                try:
+                    raw = json.loads(raw_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if raw.get("recovered"):
+                    text_recovery_map[f"{iso}/{did}/{book}/{chapter}"] = {
+                        "fileset_id": raw["fileset_id"],
+                        "type": raw.get("recovered_type"),
+                    }
+                    break
+
     manifest = {
         "batch_id": batch_id,
         "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -564,6 +589,14 @@ def write_run_manifest(batch_id: str, results: list) -> Path:
         # cares about alignment risk can filter on "verified": false here
         # without re-deriving anything from catalog-overlap.json itself.
         manifest["text_sources"] = text_source_map
+    if text_recovery_map:
+        # Per-chapter, keyed "{iso}/{distinct_id}/{book}/{chapter}" — see
+        # the loop above for why this can't share text_sources' per-edition
+        # shape. Still DBT's own text throughout (never a different
+        # translation — see get_official_filesets()'s docstring for the
+        # safety gate that guarantees that), just a different, officially-
+        # listed fileset of the same edition than that edition's default.
+        manifest["text_source_overrides"] = text_recovery_map
     if audio_source_map:
         # Only present for a manually-imported edition whose results have
         # no "audio_fileset" field (see manual_import_audio_info()'s

@@ -36,6 +36,20 @@ priority directories, not the old flat _batches/<id>.json path. This module
 only does discovery/fetch (checks local dirs, then tries each CDN tier);
 the priority-queue worker loop itself (§7.2 cooperative preemption between
 chapters) is future work, not built yet.
+
+Reality check (2026-09-26): in practice this CDN-tier fetch path
+(BATCH_CDN_QUEUE_BASE / _QUEUE_TIERS below) has never been observed to
+fire — no cached _batches/<id>.json here has a shape suggesting it came
+from that path (they're all hand-authored: priority-fill-both.json,
+priority-fill-phase2.json, sa-priority-2026-09-16.json, etc.), and every
+actual alignment/correction run this whole session went through direct
+--iso/--iso-list CLI invocation or the internal-scripts/ watchdog
+(hardcoded iso-lists), never through load_batch() at all. Core publishing
+to the tiered queue described above may still happen eventually, but
+nothing here should currently assume it does. See CLAUDE.local.md's
+"Batch-manifest contract" section for the actual, current workflow. Kept
+as-is (not deleted) in case Core-side publishing does materialize later —
+this fetch path is cheap to leave dormant.
 """
 
 from __future__ import annotations
@@ -48,7 +62,7 @@ from pathlib import Path
 _BATCH_DIRS = [Path("_batches"), Path("data/_batches")]
 
 BATCH_CDN_QUEUE_BASE = "https://cdn.bibel.wiki/_batches/queue/"
-_QUEUE_TIERS = ("high", "normal", "low")
+_QUEUE_TIERS = ("high", "normal", "low")  # never observed to fire in practice -- see module docstring
 
 
 def load_batch(batch_id: str | None = None) -> dict:

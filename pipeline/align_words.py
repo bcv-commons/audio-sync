@@ -46,7 +46,7 @@ from text_processing import (
     is_aramaic_chapter,
     load_language_config,
     normalize_text,
-    strip_markers,
+    read_verse_texts,
 )
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -1540,10 +1540,7 @@ def process_chapter(item: dict, config: LanguageConfig, mms_components=None) -> 
         return {"error": "No reference text found"}
 
     # Read verse texts, stripping non-spoken markers
-    with open(ref_text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
-    while verse_texts and not verse_texts[-1].strip():
-        verse_texts.pop()
+    verse_texts = read_verse_texts(ref_text_path, config)
 
     verse_count = len(verse_texts)
 

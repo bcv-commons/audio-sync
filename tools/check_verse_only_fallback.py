@@ -67,7 +67,17 @@ def check_chapter_fallback(quality_path: Path) -> dict | None:
     Returns {verses, fallback_verses, fallback_rate, fallback_verse_nums}
     or None if this isn't verse_only_mode output (no "source" field on
     its words — the fusion-mode pipeline's quality files have per-word
-    scores but no per-word "source": "fallback"/"local" tag).
+    scores but no per-word "source": "fallback"/"local"/"interpolated"
+    tag).
+
+    "interpolated" (added 2026-09-24, see align_verse_words.py's
+    _interpolate_fallback_runs()) is a verse that still has no real
+    per-word alignment — same underlying failure as "fallback" — but
+    whose verse-level start/end was corrected to interpolate between the
+    chapter's own nearest real-aligned neighbors instead of being left at
+    the raw whole-chapter pace estimate. Counted the same as "fallback"
+    here: this tool reports how often a real alignment wasn't found at
+    all, regardless of how good the resulting position estimate is.
     """
     try:
         with open(quality_path, encoding="utf-8") as f:
@@ -86,15 +96,16 @@ def check_chapter_fallback(quality_path: Path) -> dict | None:
         if not words:
             continue
         total += 1
-        # verse_only_mode's vocabulary is exactly {"local", "fallback"} —
-        # fusion-mode quality files use a disjoint vocabulary ({"whisper"}
-        # only, or no "source" key at all for the common MMS-wins case),
-        # so this positively identifies verse_only_mode output rather
-        # than just detecting *some* "source" key (which fusion-mode
-        # files can also carry, and did wrongly match here at first).
-        if any(w.get("source") in ("local", "fallback") for w in words):
+        # verse_only_mode's vocabulary is {"local", "fallback",
+        # "interpolated"} — fusion-mode quality files use a disjoint
+        # vocabulary ({"whisper"} only, or no "source" key at all for the
+        # common MMS-wins case), so this positively identifies
+        # verse_only_mode output rather than just detecting *some*
+        # "source" key (which fusion-mode files can also carry, and did
+        # wrongly match here at first).
+        if any(w.get("source") in ("local", "fallback", "interpolated") for w in words):
             saw_source_tag = True
-        if words and all(w.get("source") == "fallback" for w in words):
+        if words and all(w.get("source") in ("fallback", "interpolated") for w in words):
             fallback_verses.append(vnum)
 
     if not saw_source_tag or total == 0:

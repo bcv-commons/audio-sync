@@ -106,15 +106,24 @@ def find_all_downloaded_timecode(iso: str, testament: str = None) -> dict:
     return result
 
 
-def load_timing_verses(path: Path) -> dict:
+def load_timing_verses(path: Path) -> dict | None:
     """Load a timing.json file and return {verse_start: timestamp}.
 
     Handles both our own pipeline output (compact {"pos": [...]}) and
     DBT's original downloaded timecodes under downloads/BB/ (old verbose
     list-of-verse-dicts — an external source that stays in that format).
+
+    Returns None (rather than raising) on a corrupt/empty file — a
+    zero-byte or truncated timing.json is itself a real data-quality bug
+    worth surfacing, not a reason to crash a whole corpus-wide comparison
+    run over one bad file (confirmed 2026-09-24: export/timing-data/nt/
+    xon/XONNVR/LUK/LUK_003_XO1NVRN1DA_timing.json was exactly this).
     """
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
     if isinstance(data, dict) and "pos" in data:
         # pos[i] is verse (i+1)'s timestamp — no verse-0 slot, see
         # align_words.py's write_timing_json() docstring.
@@ -122,8 +131,16 @@ def load_timing_verses(path: Path) -> dict:
     return {str(entry["verse_start"]): entry["timestamp"] for entry in data}
 
 
-def compare_verse_timings(downloaded: dict, pipeline: dict) -> dict:
-    """Compare two verse timing dicts. Returns comparison stats."""
+def compare_verse_timings(downloaded: dict | None, pipeline: dict | None) -> dict | None:
+    """Compare two verse timing dicts. Returns comparison stats.
+
+    None input (a corrupt/unreadable timing.json from load_timing_verses)
+    is treated the same as "no common verses" here — callers that need to
+    tell "corrupt file" apart from "nothing in common" should check
+    load_timing_verses()'s own return value before calling this.
+    """
+    if downloaded is None or pipeline is None:
+        return None
     # Only compare non-zero verses that exist in both
     common_verses = []
     for v in sorted(downloaded.keys(), key=lambda x: int(x)):

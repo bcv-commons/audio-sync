@@ -55,8 +55,9 @@ from text_processing import (
     clean_for_alignment,
     format_verse_id,
     load_language_config,
-    strip_markers,
+    read_verse_texts,
 )
+from vowel_pacing import count_vowels
 
 DOWNLOADS_DIR = Path("downloads/BB")
 OUTPUT_DIR = Path("export/timing-data")
@@ -133,20 +134,28 @@ def verse_anchored_align(
     waveform, sample_rate = load_audio(audio_path, bundle)
     total_duration = waveform.shape[1] / sample_rate
 
-    word_counts = [len(v.split()) for v in non_empty_verses]
-    total_words = sum(word_counts) or 1
+    # Pacing proxy for both the search-window anchor below and
+    # _interpolate_fallback_runs()'s fallback interpolation: vowel count,
+    # not raw word count. Validated 2026-09-26 against 9 real DBT-vs-
+    # pipeline disputes (pipeline/vowel_pacing.py's own docstring) --
+    # vowel-letter count (a long vowel counts twice) tracks a verse's real
+    # spoken duration noticeably better than word count, which treats a
+    # one-syllable and a five-syllable word identically.
+    pace_weights = [count_vowels(uroman.romanize_string(v)) or len(v.split())
+                    for v in non_empty_verses]
+    total_pace_weight = sum(pace_weights) or 1
 
     expected_starts = []
-    cum_words = 0
-    for wc in word_counts:
-        expected_starts.append(total_duration * cum_words / total_words)
-        cum_words += wc
+    cum_weight = 0
+    for w in pace_weights:
+        expected_starts.append(total_duration * cum_weight / total_pace_weight)
+        cum_weight += w
 
     results = []
     floor = 0.0
-    for i, (verse_text, wc) in enumerate(zip(non_empty_verses, word_counts)):
+    for i, (verse_text, wc) in enumerate(zip(non_empty_verses, pace_weights)):
         exp_start = expected_starts[i]
-        exp_dur = total_duration * wc / total_words
+        exp_dur = total_duration * wc / total_pace_weight
         window = max(exp_dur * window_frac, min_window_seconds)
         win_start = max(floor, exp_start - window)
         win_end = min(total_duration, exp_start + exp_dur + window)
@@ -233,6 +242,60 @@ def verse_anchored_align(
                     local_words, local_avg = alt_words, alt_avg
                     used_alt_window = True
 
+        # Cross-check a "local" (accepted) match against the vowel-pacing
+        # search center itself, not just its own confidence score. CTC only
+        # ever searches inside [win_start, win_end], and win_end is widened
+        # past the natural pacing-implied end (exp_start + exp_dur + window)
+        # whenever min_required demands it -- a match that landed in that
+        # WIDENED region was reachable only because of the widening, not
+        # because pacing expected the verse there. That's exactly the
+        # failure mode confirmed 2026-09-26 (mtr/MTRNLC MAT 13:53,
+        # mal/MALNIB JHN 19:41): a genuinely repeated/formulaic phrase
+        # elsewhere in the chapter, phonetically real, CTC-confident, with
+        # totally normal-looking per-word scores -- so the score alone
+        # never flags it, and neither does anything downstream: the
+        # arbiter's own pacing check only ever runs against DBT's timing
+        # after the fact, and only for editions DBT has timing for at all.
+        # This is the only place in the whole pipeline that can catch this
+        # class of error before it's ever written to disk. Excludes the
+        # last verse's own alt-window rescue (used_alt_window) -- that path
+        # already has its own tested, floor-independent rationale (see
+        # above) and re-litigating it here isn't worth the added risk.
+        natural_win_end = exp_start + exp_dur + window
+        if local_words and local_avg >= min_local_score and not used_alt_window:
+            cand_start = local_words[0]["start"]
+            if cand_start > natural_win_end:
+                narrow_start = max(floor, exp_start - window)
+                narrow_end = min(total_duration, natural_win_end)
+                narrow_words, narrow_avg = [], 0.0
+                if narrow_end - narrow_start >= 1.0:
+                    try:
+                        narrow_words = realign_from_point(
+                            waveform, sample_rate, narrow_start, verse_text,
+                            bundle, model, tokenizer, aligner, uroman, end_time=narrow_end,
+                        )
+                    except CudaContextPoisonedError:
+                        raise
+                    except RuntimeError:
+                        narrow_words = []
+                    narrow_scores = [w["score"] for w in narrow_words if w["score"] > 0]
+                    narrow_avg = sum(narrow_scores) / len(narrow_scores) if narrow_scores else 0.0
+                if narrow_words and narrow_avg >= min_local_score:
+                    # A comparably good match exists inside the natural
+                    # pacing window -- prefer it; it doesn't depend on the
+                    # widened search having found something else instead.
+                    local_words, local_avg = narrow_words, narrow_avg
+                else:
+                    # Nothing decent near where pacing expects this verse --
+                    # don't trust the far/wide match either. Falls through
+                    # to the fallback branch below, so
+                    # _interpolate_fallback_runs() places it by vowel-count
+                    # interpolation between real neighbors instead.
+                    log(f"    verse {i + 1}: local match at {cand_start:.2f}s is "
+                        f"{cand_start - natural_win_end:.2f}s beyond the natural pacing window "
+                        f"(narrow re-search found nothing as good) -- treating as fallback", "WARNING")
+                    local_words, local_avg = [], 0.0
+
         if local_words and local_avg >= min_local_score:
             start = local_words[0]["start"]
             end = local_words[-1].get("end", start)
@@ -277,7 +340,7 @@ def verse_anchored_align(
 
         results.append({
             "verse_index": i,
-            "words": wc,
+            "words": len(verse_text.split()),  # genuine word count for diagnostics -- pacing math uses vowel-count pace_weights instead
             "expected_start": round(exp_start, 2),
             "local_score": round(local_avg, 3),
             "start": round(start, 2),
@@ -287,7 +350,64 @@ def verse_anchored_align(
         })
         floor = end
 
+    _interpolate_fallback_runs(results, pace_weights, total_duration)
     return results
+
+
+def _interpolate_fallback_runs(results: list[dict], pace_weights: list[int], total_duration: float) -> None:
+    """Second pass: replace each run of "fallback" verses' start/end with a
+    position interpolated between the nearest REAL (source="local") verse
+    before and after the run, proportional to vowel count (pace_weights)
+    within the run — instead of the whole-chapter uniform-pace estimate the
+    first pass used (max(exp_start, floor), see the loop above). Mutates
+    results in place; relabels handled verses "interpolated".
+
+    Why: the whole-chapter pace assumption is wrong whenever speech pacing
+    varies within the chapter, and a run of consecutive fallbacks
+    compounds it — each one's floor is itself an estimate, not real audio
+    evidence (confirmed 2026-09-24 against xtn/ACT3 and aaa/AAAMLT REV22:
+    both showed 5-9s of drift across a run of several consecutive verses,
+    recovering only once a real anchor reappeared). Interpolating between
+    real neighbors uses only evidence already produced for THIS chapter,
+    so it works identically regardless of whether DBT ships comparison
+    timing for the language at all — unlike anchoring on DBT's own data,
+    which only covers the subset of editions DBT has timing for.
+
+    A run touching either end of the chapter (no real verse before/after)
+    falls back to the chapter boundary (0.0 or total_duration) as that
+    side's anchor — still better than nothing, though less certain than a
+    run with real anchors on both sides.
+    """
+    n = len(results)
+    i = 0
+    while i < n:
+        if results[i]["source"] != "fallback":
+            i += 1
+            continue
+
+        run_start = i
+        while i < n and results[i]["source"] == "fallback":
+            i += 1
+        run_end = i  # exclusive
+
+        prev_anchor = results[run_start - 1]["end"] if run_start > 0 else 0.0
+        next_anchor = results[run_end]["start"] if run_end < n else total_duration
+        if next_anchor < prev_anchor:
+            next_anchor = prev_anchor
+
+        run_weights = pace_weights[run_start:run_end]
+        total_run_weight = sum(run_weights) or 1
+
+        cum = 0
+        for j, wc in zip(range(run_start, run_end), run_weights):
+            frac_start = cum / total_run_weight
+            cum += wc
+            frac_end = cum / total_run_weight
+            v_start = prev_anchor + (next_anchor - prev_anchor) * frac_start
+            v_end = prev_anchor + (next_anchor - prev_anchor) * frac_end
+            results[j]["start"] = round(v_start, 2)
+            results[j]["end"] = round(v_end, 2)
+            results[j]["source"] = "interpolated"
 
 
 def process_chapter_verse_only(
@@ -307,10 +427,7 @@ def process_chapter_verse_only(
     words_path = item["words_path"]
     quality_path = item["quality_path"]
 
-    with open(text_path, "r", encoding="utf-8") as f:
-        verse_texts = [strip_markers(line.rstrip("\n"), config) for line in f]
-    while verse_texts and not verse_texts[-1].strip():
-        verse_texts.pop()
+    verse_texts = read_verse_texts(text_path, config)
 
     cleaned_verses = [clean_for_alignment(v, config) for v in verse_texts]
     non_empty_verses = [v for v in cleaned_verses if v]
@@ -370,7 +487,7 @@ def process_chapter_verse_only(
         word_timing["end"][str(verse_num)] = word_end_times
         quality_verses[str(verse_num)] = verse_quality
 
-        if r["source"] == "fallback":
+        if r["source"] in ("fallback", "interpolated"):
             fallback_count += 1
 
     null_count = sum(
