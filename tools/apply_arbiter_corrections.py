@@ -38,6 +38,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from quality_report import (
@@ -53,6 +54,7 @@ from three_way_arbiter import (
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 from text_processing import load_language_config  # noqa: E402
+from whisper_quality_guard import is_low_whisper_quality_language, HIGH_BAR_MATCH_RATIO  # noqa: E402
 
 def _words_path_for(timing_path: Path) -> Path:
     return timing_path.with_name(timing_path.name.replace("_timing.json", "_words.json"))
@@ -82,95 +84,15 @@ def _build_batches(vnums: list, targets: dict) -> list:
     return batches
 
 
-def correct_chapter(dl_path: Path, pl_path: Path, whisper_path: Path,
-                     text_path: Path | None, config, uroman, apply: bool) -> list[dict]:
-    """Resolve every disputed verse in one chapter, apply any DBT-verdict
-    correction to its on-disk *_timing.json / *_words.json (if apply=True),
-    and return a log of every correction attempted (applied or skipped).
-
-    Corrections are batched by consecutive run of DBT-verdict verses, not
-    applied one verse at a time: the dominant real pattern is a whole
-    stretch of correlated verses that need to move together (e.g. a
-    multi-verse quote or a run of short verses DBT itself mis-timed), and
-    checking each verse sequentially against a not-yet-processed neighbor's
-    stale position produces false "would break monotonicity" conflicts on
-    exactly those cases. Each run's *whole* proposed sequence is checked
-    for internal consistency and compatibility with the nearest hard
-    boundary on either side (a confirmed-good verse, or the edge of the
-    chapter) before any of it is applied — it never crosses a verse already
-    confirmed to agree with DBT.
-
-    (An earlier version of this tool also tried to rescue an isolated
-    AMBIGUOUS blocking neighbor by re-searching it anchored on the run's
-    edge. Removed 2026-09-24: across the full corpus it only ever fired 4
-    times, and direct word-level verification found 3 of those 4 wrong —
-    including one case where it moved an already-correct verse to a worse
-    position. Negligible volume, poor precision, no clean ratio threshold
-    separated the one good case from the bad ones — not worth the risk.)"""
-    dl_verses = load_timing_verses(dl_path)
-    pl_verses = load_timing_verses(pl_path)
-    if dl_verses is None or pl_verses is None:
-        return []
-
-    whisper_rom_words, struct_candidates, ref_verses = prepare_chapter_matching_context(
-        whisper_path, text_path, config, uroman)
-    if struct_candidates is None and ref_verses is None:
-        return []  # truly nothing to arbitrate with
-    drift_gap_windows = _drift_gap_windows_for(pl_path)
-
-    common = sorted((set(dl_verses) & set(pl_verses)) - {"0"}, key=lambda x: int(x))
-    disputed = [v for v in common if abs(dl_verses[v] - pl_verses[v]) >= DISPUTE_THRESHOLD]
-
-    # Same tiered fallback as three_way_arbiter.arbitrate_chapter(): a
-    # chapter-wide vowel-pacing verdict, used only where TEXT_MATCH/
-    # STRUCTURAL either have nothing (no Whisper at all -- verse_only_mode's
-    # normal state) or a confident-but-weak result vowel-pacing actively
-    # contradicts (a stale/unreliable Whisper file that still resolves
-    # something, just not correctly -- see three_way_arbiter's own
-    # docstring update for why gating on "no Whisper file" alone isn't
-    # enough). Mirrors arbitrate_chapter() exactly so this tool's real
-    # corrections and that tool's diagnostics never silently disagree.
-    pacing = None
-    if ref_verses is not None:
-        # strict=True whenever the LANGUAGE is fusion-mode (not
-        # verse_only_mode), not whenever struct_candidates happens to be
-        # non-None for this one chapter -- see three_way_arbiter.py's
-        # arbitrate_chapter() for the full rationale (confirmed 2026-09-30,
-        # ind/INDASV MAT 5:33 + ACT 8:15: a missing per-chapter whisper file
-        # on an otherwise fusion-mode language must not fall back to the
-        # lenient bar). Mirrors arbitrate_chapter() exactly so this tool's
-        # real corrections and that tool's diagnostics never silently
-        # disagree.
-        pacing = resolve_chapter_by_pacing(dl_verses, pl_verses, ref_verses, config, uroman, disputed,
-                                            strict=not getattr(config, "verse_only_mode", False))
-
-    resolved: dict = {}
-    for v in disputed:
-        dl_t, pl_t = dl_verses[v], pl_verses[v]
-        vnum = int(v)
-        if struct_candidates is not None:
-            entry = resolve_verse(v, dl_t, pl_t, ref_verses, whisper_rom_words,
-                                   struct_candidates, config, uroman,
-                                   drift_gap_windows=drift_gap_windows)
-        else:
-            entry = {
-                "verse": v, "dbt_t": dl_t, "ours_t": pl_t,
-                "method": None, "match_t": None, "match_ratio": None,
-                "best_ratio_seen": None, "best_t_seen": None,
-                "dbt_dist": None, "ours_dist": None, "verdict": "AMBIGUOUS",
-            }
-
-        if entry["verdict"] == "AMBIGUOUS" and pacing is not None:
-            entry = {**entry, "method": pacing["method"], "verdict": pacing["verdict"]}
-        elif (entry["verdict"] != "AMBIGUOUS" and pacing is not None and pacing["verdict"] != "AMBIGUOUS"
-              and pacing["verdict"] != entry["verdict"]
-              and (entry["method"] == "STRUCTURAL"
-                   or (entry["method"] == "TEXT_MATCH" and (entry.get("match_ratio") or 1.0) < WEAK_MATCH_RATIO))):
-            entry = {**entry, "verdict": "AMBIGUOUS"}
-
-        resolved[vnum] = entry
-
-    dbt_verses = sorted(vnum for vnum, e in resolved.items() if e["verdict"] == "DBT")
+def _finish_corrections(pl_path: Path, resolved: dict, dbt_verses: list, common: list,
+                         apply: bool, drift_gap_windows: list) -> list[dict]:
+    """Shared tail end of correct_chapter(): given a fully-resolved verdict
+    per verse, patch pos[]/words in place under the usual safety guards
+    (monotonicity, drift/gap window, verse-1 exclusion) and return the
+    correction log. Split out so the normal evidence-based path and the
+    force_dbt short-circuit path share identical patching/safety logic --
+    the only difference between them is how `resolved` got built.
+    """
     if not dbt_verses:
         return []
 
@@ -179,6 +101,15 @@ def correct_chapter(dl_path: Path, pl_path: Path, whisper_path: Path,
     try:
         timing_data = json.loads(pl_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return []
+    # Confirmed 2026-09-30 (spa/SPABDA, ~453 chapters, all its N2DA
+    # fileset): some "pipeline" timing.json files are actually a
+    # passthrough copy of DBT's own raw verbose list-of-verse-dicts
+    # format, not our compact {"pos": [...]} format -- can't patch a
+    # pos[] array that doesn't exist here, so skip cleanly rather than
+    # crash the whole corpus-wide apply run on one file shape we don't
+    # know how to rewrite.
+    if not isinstance(timing_data, dict):
         return []
     pos = timing_data.get("pos")
     if not isinstance(pos, list):
@@ -346,12 +277,205 @@ def correct_chapter(dl_path: Path, pl_path: Path, whisper_path: Path,
     for run in runs:
         _process_run(run)
 
+    # Whole-chapter redirect, same record shape as the force_dbt
+    # short-circuit in correct_chapter() -- but triggered here purely by
+    # the ACTUAL outcome of evidence-based resolution, not by chapter
+    # membership in a known-buggy population. Only counts a verse as
+    # "from DBT" when it was literally copied (evidence == "dbt_timestamp"),
+    # never a TEXT_MATCH verse -- that's our own independently-measured
+    # position (Whisper transcript matched against reference text), not
+    # DBT's data, even though the verdict that led to it was "DBT". If
+    # every verse in `common` (not just the disputed ones) ends up
+    # dbt_timestamp-sourced and actually applied, there is nothing of ours
+    # left in this chapter worth publishing under our own name.
+    #
+    # Verse 1 is excluded from this "every verse" requirement, same as the
+    # force_dbt path -- it's unconditionally skipped a few lines up (DBT's
+    # own verse-1 timestamp is itself known-unreliable), so it can never be
+    # "dbt_timestamp"-sourced regardless of how confident the rest of the
+    # chapter is. Requiring it to count would mean this check could never
+    # fire on any real chapter (virtually all of them contain verse 1).
+    non_v1_common = {int(v) for v in common if v != "1"}
+    relevant_dbt_verses = {v for v in dbt_verses if v != 1}
+    relevant_log = [e for e in log if e["verse"] != 1]
+    all_common_covered = non_v1_common == relevant_dbt_verses
+    all_literal_dbt = all_common_covered and bool(relevant_log) and all(
+        e["status"] in ("APPLIED", "WOULD_APPLY") and e["evidence"] == "dbt_timestamp"
+        for e in relevant_log
+    )
+    if all_literal_dbt:
+        book = pl_path.parent.name
+        distinct_id = pl_path.parent.parent.name
+        iso_k = pl_path.parent.parent.parent.name
+        canon_k = pl_path.parent.parent.parent.parent.name
+        redirect = {
+            "status": "defer_to_dbt",
+            "reason": "every verse in this chapter resolved to DBT's own timing",
+            "canon": canon_k, "iso": iso_k, "distinct_id": distinct_id,
+            "book": book, "chapter": pl_path.name.split("_", 2)[1],
+            "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if apply:
+            pl_path.write_text(json.dumps(redirect, separators=(",", ":")), encoding="utf-8")
+            if words_path.exists():
+                words_path.write_text(json.dumps(redirect, separators=(",", ":")), encoding="utf-8")
+        for e in log:
+            e["scope"] = "whole_chapter_redirect"
+        return log
+
     if apply and any(entry["status"] == "APPLIED" for entry in log):
         pl_path.write_text(json.dumps(timing_data, separators=(",", ":")), encoding="utf-8")
         if words_data is not None:
             words_path.write_text(json.dumps(words_data, separators=(",", ":")), encoding="utf-8")
 
     return log
+
+
+def correct_chapter(dl_path: Path, pl_path: Path, whisper_path: Path,
+                     text_path: Path | None, config, uroman, apply: bool, iso: str | None = None,
+                     force_dbt: bool = False) -> list[dict]:
+    """Resolve every disputed verse in one chapter, apply any DBT-verdict
+    correction to its on-disk *_timing.json / *_words.json (if apply=True),
+    and return a log of every correction attempted (applied or skipped).
+
+    Corrections are batched by consecutive run of DBT-verdict verses, not
+    applied one verse at a time: the dominant real pattern is a whole
+    stretch of correlated verses that need to move together (e.g. a
+    multi-verse quote or a run of short verses DBT itself mis-timed), and
+    checking each verse sequentially against a not-yet-processed neighbor's
+    stale position produces false "would break monotonicity" conflicts on
+    exactly those cases. Each run's *whole* proposed sequence is checked
+    for internal consistency and compatibility with the nearest hard
+    boundary on either side (a confirmed-good verse, or the edge of the
+    chapter) before any of it is applied — it never crosses a verse already
+    confirmed to agree with DBT.
+
+    (An earlier version of this tool also tried to rescue an isolated
+    AMBIGUOUS blocking neighbor by re-searching it anchored on the run's
+    edge. Removed 2026-09-24: across the full corpus it only ever fired 4
+    times, and direct word-level verification found 3 of those 4 wrong —
+    including one case where it moved an already-correct verse to a worse
+    position. Negligible volume, poor precision, no clean ratio threshold
+    separated the one good case from the bad ones — not worth the risk.)"""
+    dl_verses = load_timing_verses(dl_path)
+    pl_verses = load_timing_verses(pl_path)
+    if dl_verses is None or pl_verses is None:
+        return []
+
+    common = sorted((set(dl_verses) & set(pl_verses)) - {"0"}, key=lambda x: int(x))
+
+    if force_dbt:
+        # Temporary, self-expiring defer-to-DBT: used for chapters already
+        # confirmed to need MMS re-alignment (tools/run_gpu_redo.py's own
+        # scope, _runs/gpu_redo_final_report.json) but not yet reprocessed
+        # -- our stored "OURS" value for these is a KNOWN bug, not just
+        # unproven, so don't wait for a dispute margin or run text-match
+        # evidence at all. Rather than copy DBT's own numbers into our
+        # file under our name (republishing DBT's data disguised as ours
+        # -- confirmed 2026-10-01 this is explicitly NOT wanted), replace
+        # the whole chapter's _timing.json/_words.json with a short
+        # redirect record pointing clients at DBT directly. Still self-
+        # expiring exactly as before: process_chapter_verse_only()/the
+        # fusion pipeline rewrites pos[] from scratch the moment the real
+        # redo reaches this chapter, which overwrites this placeholder
+        # with no manual cleanup needed. No TEXT_MATCH/STRUCTURAL/pacing
+        # evidence is computed or needed; this isn't a judgment about
+        # which source is RIGHT, just about which one we currently trust
+        # at all -- and since we currently trust DBT's alone, there's
+        # nothing of ours left worth publishing for this chapter.
+        if not common:
+            return []
+        book = pl_path.parent.name
+        distinct_id = pl_path.parent.parent.name
+        iso_k = pl_path.parent.parent.parent.name
+        canon_k = pl_path.parent.parent.parent.parent.name
+        redirect = {
+            "status": "defer_to_dbt",
+            "reason": "timing not yet independently re-aligned; pending MMS redo",
+            "canon": canon_k, "iso": iso_k, "distinct_id": distinct_id,
+            "book": book, "chapter": pl_path.name.split("_", 2)[1],
+            "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if apply:
+            pl_path.write_text(json.dumps(redirect, separators=(",", ":")), encoding="utf-8")
+            words_path = _words_path_for(pl_path)
+            if words_path.exists():
+                words_path.write_text(json.dumps(redirect, separators=(",", ":")), encoding="utf-8")
+        status = "APPLIED" if apply else "WOULD_APPLY"
+        return [{
+            "verse": None, "dbt_t": None, "ours_t": None,
+            "method": "FORCE_DEFER_PENDING_REDO", "match_t": None, "match_ratio": None,
+            "best_ratio_seen": None, "best_t_seen": None,
+            "dbt_dist": None, "ours_dist": None, "verdict": "DBT",
+            "status": status, "scope": "whole_chapter", "verses_covered": len(common),
+        }]
+
+    whisper_rom_words, struct_candidates, ref_verses = prepare_chapter_matching_context(
+        whisper_path, text_path, config, uroman)
+    if struct_candidates is None and ref_verses is None:
+        return []  # truly nothing to arbitrate with
+    drift_gap_windows = _drift_gap_windows_for(pl_path)
+
+    disputed = [v for v in common if abs(dl_verses[v] - pl_verses[v]) >= DISPUTE_THRESHOLD]
+
+    # Same tiered fallback as three_way_arbiter.arbitrate_chapter(): a
+    # chapter-wide vowel-pacing verdict, used only where TEXT_MATCH/
+    # STRUCTURAL either have nothing (no Whisper at all -- verse_only_mode's
+    # normal state) or a confident-but-weak result vowel-pacing actively
+    # contradicts (a stale/unreliable Whisper file that still resolves
+    # something, just not correctly -- see three_way_arbiter's own
+    # docstring update for why gating on "no Whisper file" alone isn't
+    # enough). Mirrors arbitrate_chapter() exactly so this tool's real
+    # corrections and that tool's diagnostics never silently disagree.
+    pacing = None
+    if ref_verses is not None:
+        # strict=True whenever the LANGUAGE is fusion-mode (not
+        # verse_only_mode), not whenever struct_candidates happens to be
+        # non-None for this one chapter -- see three_way_arbiter.py's
+        # arbitrate_chapter() for the full rationale (confirmed 2026-09-30,
+        # ind/INDASV MAT 5:33 + ACT 8:15: a missing per-chapter whisper file
+        # on an otherwise fusion-mode language must not fall back to the
+        # lenient bar). Mirrors arbitrate_chapter() exactly so this tool's
+        # real corrections and that tool's diagnostics never silently
+        # disagree.
+        pacing = resolve_chapter_by_pacing(dl_verses, pl_verses, ref_verses, config, uroman, disputed,
+                                            strict=not getattr(config, "verse_only_mode", False))
+
+    resolved: dict = {}
+    for v in disputed:
+        dl_t, pl_t = dl_verses[v], pl_verses[v]
+        vnum = int(v)
+        if struct_candidates is not None:
+            entry = resolve_verse(v, dl_t, pl_t, ref_verses, whisper_rom_words,
+                                   struct_candidates, config, uroman,
+                                   drift_gap_windows=drift_gap_windows)
+        else:
+            entry = {
+                "verse": v, "dbt_t": dl_t, "ours_t": pl_t,
+                "method": None, "match_t": None, "match_ratio": None,
+                "best_ratio_seen": None, "best_t_seen": None,
+                "dbt_dist": None, "ours_dist": None, "verdict": "AMBIGUOUS",
+            }
+
+        if entry["verdict"] == "AMBIGUOUS" and pacing is not None:
+            entry = {**entry, "method": pacing["method"], "verdict": pacing["verdict"]}
+        elif (entry["verdict"] != "AMBIGUOUS" and pacing is not None and pacing["verdict"] != "AMBIGUOUS"
+              and pacing["verdict"] != entry["verdict"]
+              and (entry["method"] == "STRUCTURAL"
+                   or (entry["method"] == "TEXT_MATCH" and (entry.get("match_ratio") or 1.0) < WEAK_MATCH_RATIO))):
+            entry = {**entry, "verdict": "AMBIGUOUS"}
+
+        if (iso is not None and is_low_whisper_quality_language(iso)
+                and entry["verdict"] != "DBT"
+                and not (entry["method"] == "TEXT_MATCH" and (entry.get("match_ratio") or 0.0) >= HIGH_BAR_MATCH_RATIO)):
+            # Mirrors three_way_arbiter.py's arbitrate_chapter() exactly --
+            # see its comment for the full rationale (confirmed 2026-10-01,
+            # acd/ACDWBT MAT 22: 3 "OURS" verdicts at ratio 0.53-0.66 were
+            # all wrong by direct ear verification).
+            entry = {**entry, "verdict": "DBT"}
+
+        resolved[vnum] = entry
+    return _finish_corrections(pl_path, resolved, sorted(vnum for vnum, e in resolved.items() if e["verdict"] == "DBT"), common, apply, drift_gap_windows)
 
 
 def main():
@@ -364,7 +488,29 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Actually write corrections (default: dry-run)")
     parser.add_argument("--progress-every", type=int, default=200)
     parser.add_argument("--report", type=str, default=None, help="Write full per-chapter correction log as JSON")
+    parser.add_argument("--force-dbt", action="store_true",
+                         help="Skip evidence-based arbitration entirely -- every verse in scope where DBT "
+                              "has a timestamp gets parked on DBT's value. For a known-buggy, not-yet-"
+                              "redone population (see --chapters-file), not a general-purpose mode.")
+    parser.add_argument("--chapters-file", type=str, default=None,
+                         help="With --force-dbt: a JSON file with a top-level 'chapters' list of "
+                              "{'path': '<pipeline timing.json path>'} entries (e.g. "
+                              "_runs/gpu_redo_final_report.json) -- restricts --force-dbt to exactly "
+                              "this chapter set instead of every chapter in --iso/--testament scope.")
     args = parser.parse_args()
+
+    force_dbt_keys = None
+    if args.chapters_file:
+        chapters_data = json.loads(Path(args.chapters_file).read_text())
+        force_dbt_keys = set()
+        for entry in chapters_data["chapters"]:
+            p = Path(entry["path"])
+            book = p.parent.name
+            distinct_id = p.parent.parent.name
+            iso_k = p.parent.parent.parent.name
+            canon_k = p.parent.parent.parent.parent.name
+            chapter_str = p.name.replace("_timing.json", "").split("_", 2)[1]
+            force_dbt_keys.add((canon_k, iso_k, distinct_id, book, chapter_str))
 
     from uroman import Uroman
     uroman = Uroman()
@@ -392,6 +538,8 @@ def main():
     verses_skipped_drift_gap = 0
     verses_skipped_verse_one = 0
     verses_would_apply = 0
+    chapters_redirected_applied = 0
+    chapters_redirected_would_apply = 0
     all_results = []
 
     for iso in isos:
@@ -415,21 +563,36 @@ def main():
                 key = (c, distinct_id, book, chapter_str)
                 if key not in downloaded_tc:
                     continue
-                whisper_path = _whisper_path_for(tf)
-                if whisper_path is None:
-                    continue
-                text_path = _reference_text_path_for(tf)
+
+                if args.force_dbt:
+                    if force_dbt_keys is not None and (c, iso, distinct_id, book, chapter_str) not in force_dbt_keys:
+                        continue
+                    whisper_path = None
+                    text_path = None
+                else:
+                    whisper_path = _whisper_path_for(tf)
+                    if whisper_path is None:
+                        continue
+                    text_path = _reference_text_path_for(tf)
 
                 chapters_checked += 1
                 if args.progress_every and chapters_checked % args.progress_every == 0:
                     print(f"  ... checked {chapters_checked} chapters, currently at "
                           f"{iso}/{distinct_id} {book} {chapter_str}", file=sys.stderr)
 
-                log = correct_chapter(downloaded_tc[key], tf, whisper_path, text_path, config, uroman, args.apply)
+                log = correct_chapter(downloaded_tc[key], tf, whisper_path, text_path, config, uroman, args.apply,
+                                       iso=iso, force_dbt=args.force_dbt)
                 if not log:
                     continue
                 chapters_with_corrections += 1
+                is_redirect = any(e.get("scope") in ("whole_chapter", "whole_chapter_redirect") for e in log)
                 for entry in log:
+                    if is_redirect:
+                        if entry["status"] == "APPLIED":
+                            chapters_redirected_applied += 1
+                        elif entry["status"] == "WOULD_APPLY":
+                            chapters_redirected_would_apply += 1
+                        continue
                     if entry["status"] == "APPLIED":
                         verses_applied += 1
                     elif entry["status"] == "WOULD_APPLY":
@@ -449,8 +612,10 @@ def main():
     print(f"Chapters with at least one correction: {chapters_with_corrections}")
     if args.apply:
         print(f"Verses corrected: {verses_applied}")
+        print(f"Chapters REDIRECTED to DBT (whole _timing.json/_words.json replaced): {chapters_redirected_applied}")
     else:
         print(f"Verses that WOULD be corrected (dry-run): {verses_would_apply}")
+        print(f"Chapters that WOULD be redirected to DBT (dry-run): {chapters_redirected_would_apply}")
     print(f"Verses skipped for safety (would break monotonicity): {verses_skipped_nonmono}")
     print(f"Verses skipped (inside a chapter's own drift/gap-fix window): {verses_skipped_drift_gap}")
     print(f"Verses skipped (verse 1 — DBT's own timestamp untrustworthy there): {verses_skipped_verse_one}")

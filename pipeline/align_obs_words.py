@@ -371,10 +371,12 @@ def process_story(
         # looked like real output. Skip outright rather than write a
         # _timing.json that would misrepresent itself as real alignment;
         # these languages' actual per-story positions come from
-        # tools/detect_obs_video_segments.py instead (export/timing-data/
-        # obs-video/), which doesn't depend on narration text at all.
+        # detect_obs_video_segments.py instead, which doesn't depend on
+        # narration text at all. That tool moved to its own repo,
+        # bcv-commons/video-sync, on 2026-10-02 (it never imported
+        # anything from this repo).
         return {"error": "video-only placeholder text (source=OBS-OBS4All) — "
-                          "no real narration to align; see export/timing-data/obs-video/ instead"}
+                          "no real narration to align; see bcv-commons/video-sync instead"}
 
     segments = parse_story_md(raw_md)
     if not segments:

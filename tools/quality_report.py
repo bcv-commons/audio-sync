@@ -128,7 +128,12 @@ def load_timing_verses(path: Path) -> dict | None:
         # pos[i] is verse (i+1)'s timestamp — no verse-0 slot, see
         # align_words.py's write_timing_json() docstring.
         return {str(i + 1): t for i, t in enumerate(data["pos"]) if t is not None}
-    return {str(entry["verse_start"]): entry["timestamp"] for entry in data}
+    if isinstance(data, list):
+        return {str(entry["verse_start"]): entry["timestamp"] for entry in data}
+    # Neither shape — e.g. a {"status": "defer_to_dbt", ...} redirect record
+    # (apply_arbiter_corrections.py's whole-chapter-redirect mechanism), or
+    # some other non-timing dict. Not corrupt, just not verse timing at all.
+    return None
 
 
 def compare_verse_timings(downloaded: dict | None, pipeline: dict | None) -> dict | None:

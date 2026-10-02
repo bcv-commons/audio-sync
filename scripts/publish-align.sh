@@ -127,18 +127,13 @@ python3 tools/pre_publish_check.py --out "$QUARANTINE_FILE"
 #     don't get published on a future run.
 #   *_words.json for verse-only-aligned chapters — see VERSE_ONLY_EXCLUDES
 #     above. Their _timing.json still publishes normally.
-#   obs-video/ — export/timing-data/obs-video/ is a structurally different
-#     tree (video-frame-detected position markers, no canon/version/BOOK
-#     breakdown, no _words.json — see scripts/publish-obs-video.sh's own
-#     header comment) that happens to live as a subdirectory here so
-#     tools/detect_obs_video_segments.py can share the local "timing-data"
-#     root, but it must never be swept into align/ itself — that would
-#     misrepresent it to any consumer expecting real word/verse timing.
-#     It has its own publish script + CDN root (cdn.bibel.wiki/obs-video/).
-#     Confirmed 2026-09-15 this exclude was missing since whenever
-#     obs-video/ was first added — 599 files were already live at
-#     align/obs-video/ from a past run; cleaned up separately, this
-#     exclude just stops it recurring.
+#   obs-video/ — the video-sync tool that wrote this subtree (video-frame-
+#     detected position markers, structurally unlike real word/verse timing)
+#     moved out to its own bcv-commons/video-sync repo on 2026-10-02 and no
+#     longer shares this repo's "timing-data" root, so nothing writes here
+#     anymore. Kept as a harmless guard in case any old on-disk leftovers
+#     reappear (confirmed 2026-09-15 this exclude was missing for a while —
+#     599 files were already live at align/obs-video/ from a past run).
 echo "── Publishing $TIMING_SOURCE_DIR -> cdn.bibel.wiki/${CDN_PREFIX}/ ..."
 rclone copy "$TIMING_SOURCE_DIR" "$REMOTE" \
     --header-upload "Cache-Control: max-age=3600" \

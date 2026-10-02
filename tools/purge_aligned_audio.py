@@ -38,6 +38,7 @@ Usage:
 """
 
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -51,9 +52,29 @@ def log(message: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {message}")
 
 
+def _has_real_timing(timing_path: Path) -> bool:
+    """True only if timing_path holds actual pos[] alignment data, not a
+    defer_to_dbt redirect placeholder (apply_arbiter_corrections.py's
+    whole-chapter-redirect mechanism) or any other non-timing shape.
+
+    Confirmed 2026-10-01: the old check (file exists + words.json exists)
+    would also purge audio for a just-redirected "pending real MMS redo"
+    chapter -- exactly the audio someone would want kept for re-alignment
+    or for comparing against DBT later, not safe-to-discard source
+    material at all. A redirect record existing at this path means we
+    have NOTHING of our own here, the opposite of "already aligned."
+    """
+    try:
+        data = json.loads(timing_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and "pos" in data
+
+
 def purge_iso_audio(iso: str, dry_run: bool = False) -> tuple[int, int]:
     """Delete downloads/BB/{nt,ot}/{iso}/**/*.mp3 for chapters whose
-    _timing.json and _words.json both already exist.
+    _timing.json and _words.json both already exist AND hold real
+    alignment data (not a defer_to_dbt redirect placeholder).
 
     Returns (files_deleted, bytes_freed). Never raises on an individual
     file's OSError (e.g. a concurrent worker still has it open) — logs a
@@ -74,8 +95,10 @@ def purge_iso_audio(iso: str, dry_run: bool = False) -> tuple[int, int]:
             _iso, distinct_id, book, fname = parts
             stem = fname[:-4]
             out_dir = EXPORT_ROOT / canon / _iso / distinct_id / book
-            if not ((out_dir / f"{stem}_timing.json").exists()
-                    and (out_dir / f"{stem}_words.json").exists()):
+            timing_path = out_dir / f"{stem}_timing.json"
+            if not (timing_path.exists() and (out_dir / f"{stem}_words.json").exists()):
+                continue
+            if not _has_real_timing(timing_path):
                 continue
             sz = mp3.stat().st_size
             if dry_run:
@@ -96,22 +119,37 @@ def main():
     lang_group = parser.add_mutually_exclusive_group(required=True)
     lang_group.add_argument("--iso", type=str, help="Single language ISO code")
     lang_group.add_argument("--iso-list", type=str, help="Comma-separated ISO codes")
+    lang_group.add_argument("--all", action="store_true",
+        help="Every iso currently under downloads/BB/ -- same per-chapter safety "
+             "check as a single --iso run, just scoped corpus-wide in one call.")
     parser.add_argument("--dry-run", action="store_true", help="Report what would be deleted, delete nothing")
     args = parser.parse_args()
 
-    isos = [args.iso] if args.iso else [c.strip() for c in args.iso_list.split(",") if c.strip()]
+    if args.all:
+        isos = set()
+        for canon in CANONS:
+            d = DOWNLOADS_ROOT / canon
+            if d.exists():
+                isos.update(p.name for p in d.iterdir() if p.is_dir())
+        isos = sorted(isos)
+    else:
+        isos = [args.iso] if args.iso else [c.strip() for c in args.iso_list.split(",") if c.strip()]
 
     total_files = 0
     total_bytes = 0
+    isos_with_deletions = 0
     for iso in isos:
         deleted, freed = purge_iso_audio(iso, dry_run=args.dry_run)
-        verb = "would delete" if args.dry_run else "deleted"
-        log(f"[{iso}] {verb} {deleted} file(s), {freed / 1e9:.2f} GB")
+        if deleted:
+            isos_with_deletions += 1
+            verb = "would delete" if args.dry_run else "deleted"
+            log(f"[{iso}] {verb} {deleted} file(s), {freed / 1e9:.2f} GB")
         total_files += deleted
         total_bytes += freed
 
     verb = "Would free" if args.dry_run else "Freed"
-    log(f"{verb} {total_bytes / 1e9:.2f} GB across {total_files} file(s), {len(isos)} language(s)")
+    log(f"{verb} {total_bytes / 1e9:.2f} GB across {total_files} file(s) "
+        f"in {isos_with_deletions} language(s) ({len(isos)} scanned)")
 
 
 if __name__ == "__main__":

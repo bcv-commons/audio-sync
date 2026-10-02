@@ -54,8 +54,10 @@ language look bad does the backfill stop spending GPU time on it.
 """
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Below this, a chapter is flagged as suspect (see module docstring for the
 # calibration data this came from -- good chapters: 1.52-2.31 w/s;
@@ -120,6 +122,65 @@ def assess_chapter(words: list[dict], duration: float) -> ChapterQuality:
         word_count=n_words, duration=duration, words_per_second=round(wps, 3),
         repetition_ratio_3gram=round(rep, 3), flagged=bool(reasons), reasons=reasons,
     )
+
+
+# Language-level trust gate for the ARBITER (not the backfill itself --
+# see tools/arbiter_sweep_watcher.py and tools/three_way_arbiter.py's
+# arbitrate_chapter()/apply_arbiter_corrections.py's correct_chapter()).
+#
+# Confirmed 2026-09-30/10-01 (acd/ACDWBT MAT 22 verses 8, 24, 25): a
+# language whose Whisper transcripts were already broadly bad enough to
+# trip the backfill's own per-chapter quality guard can still produce a
+# TEXT_MATCH verdict that *looks* confident (ratio 0.53-0.66, comfortably
+# above WEAK_MATCH_RATIO) but is flat wrong by direct ear verification --
+# all 3 of acd's "OURS, leave it alone" verdicts in this sample were
+# actually DBT by ear, on top of acd's already-known 30-DBT-vs-3-OURS
+# imbalance. The backfill already computed the exact signal that predicts
+# this (its own flagged/ok ratio for that language) as a side effect of
+# transcribing it -- this just reuses it instead of inventing a second
+# detector. Per-chapter WEAK_MATCH_RATIO downgrades to AMBIGUOUS; this
+# gate is deliberately stronger and goes straight to DBT, because for a
+# language this unreliable, "no evidence" and "wrong evidence" cost the
+# same if left uncorrected (DBT's own timing sits right there, unused).
+LOW_QUALITY_LANG_FLAGGED_FRACTION = 0.3   # >= this fraction flagged by the backfill...
+LOW_QUALITY_LANG_MIN_CHAPTERS = 4          # ...over at least this many judged chapters
+HIGH_BAR_MATCH_RATIO = 0.85                # ...means only an overwhelming TEXT_MATCH
+                                             # ratio is trusted over DBT at all; anything
+                                             # below (including AMBIGUOUS) defaults to DBT.
+
+_low_quality_cache: dict[str, bool] = {}
+
+
+def is_low_whisper_quality_language(iso: str, report_path: str = "_runs/whisper_backfill_full_report.json") -> bool:
+    """True if the Whisper backfill's own per-language stats for `iso`
+    show broadly unreliable transcription -- see module-level constants
+    above for the exact bar. False (the safe/default direction) whenever
+    the report doesn't exist, doesn't mention this iso, or doesn't have
+    enough judged chapters to decide -- a language never touched by the
+    backfill (already had full Whisper coverage from before, e.g. the
+    original August run) gets no opinion here, not an assumption of
+    distrust it never earned.
+    """
+    if iso in _low_quality_cache:
+        return _low_quality_cache[iso]
+
+    result = False
+    try:
+        report = json.loads(Path(report_path).read_text())
+        info = report.get("isos", {}).get(iso)
+        if info:
+            ok, flagged = info.get("ok", 0), info.get("flagged", 0)
+            judged = ok + flagged
+            if info.get("aborted") or (
+                judged >= LOW_QUALITY_LANG_MIN_CHAPTERS
+                and flagged / judged >= LOW_QUALITY_LANG_FLAGGED_FRACTION
+            ):
+                result = True
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    _low_quality_cache[iso] = result
+    return result
 
 
 @dataclass

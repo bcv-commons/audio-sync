@@ -916,6 +916,16 @@ Examples:
     proc_group.add_argument("--check-audio", action="store_true", help="Only report audio availability")
     proc_group.add_argument("--no-download", action="store_true",
         help="Skip auto-download, only process already-downloaded files")
+    proc_group.add_argument("--purge-audio", action="store_true",
+        help="Purge each processed iso's cached source audio (downloads/BB/) "
+             "once this run finishes, same as run_gpu_redo.py/whisper_backfill.py "
+             "already do -- align_pipeline.py has no purge step by default, "
+             "which is fine for one-off/interactive use but leaves audio "
+             "accumulating for bulk disk-constrained jobs. Uses "
+             "purge_aligned_audio.py's own safety check: only ever deletes an "
+             "mp3 whose _timing.json/_words.json both hold real pos[] data, "
+             "never a defer_to_dbt redirect placeholder (chapters pending a "
+             "real re-alignment keep their source audio).")
     proc_group.add_argument("--publish", action="store_true",
         help="Publish timing-data + run manifest to cdn.bibel.wiki/align/ "
              "after the pipeline finishes (calls scripts/publish-align.sh). "
@@ -1755,6 +1765,18 @@ Examples:
             # fileset just silently produces zero log lines, which reads
             # like something went wrong rather than "nothing to do."
             log("All chapters already processed")
+
+    # ── Purge source audio for every iso this run touched (opt-in) ──
+    if args.purge_audio and not args.dry_run:
+        sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+        from purge_aligned_audio import purge_iso_audio
+        for iso in sorted(total_stats["languages_processed"]):
+            try:
+                deleted, freed = purge_iso_audio(iso)
+                if deleted:
+                    log(f"  purged {deleted} now-aligned mp3(s) for {iso}, {freed / 1e9:.2f} GB freed")
+            except Exception as e:
+                log(f"  purge failed for {iso} (non-fatal): {e}")
 
     # ── Summary ──
 

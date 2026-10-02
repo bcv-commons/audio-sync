@@ -63,7 +63,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from quality_report import TIMING_DIR, DOWNLOADS_DIR  # noqa: E402
+from quality_report import TIMING_DIR, DOWNLOADS_DIR, find_all_downloaded_timecode  # noqa: E402
 from three_way_arbiter import _whisper_path_for  # noqa: E402
 from whisper_transcribe import (  # noqa: E402
     DEFAULT_MODEL_FASTER, load_whisper_model, transcribe_audio, build_word_timeline,
@@ -88,7 +88,8 @@ def rejected_marker_path(whisper_words_path: Path) -> Path:
     return Path(str(whisper_words_path).replace("_whisper_words.json", "_whisper_rejected.json"))
 
 
-def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None = None) -> dict[str, list[Path]]:
+def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None = None,
+                                   dispute_free_only: bool = False) -> dict[str, list[Path]]:
     """Returns {iso: [pipeline_timing_path, ...]} for fusion-mode isos with
     a timing.json but no whisper_words.json AND no prior rejection marker.
 
@@ -96,6 +97,17 @@ def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None 
     (still applies the same verse_only_mode/missing-file filtering) --
     used by --iso/--iso-list to scope a single-language pilot run instead
     of scanning the whole corpus.
+
+    `dispute_free_only`, when True, additionally drops any chapter where
+    DBT already has its own downloaded timecode -- confirmed 2026-10-01
+    (acd): roughly 59% of this backlog is chapters where our new Whisper
+    evidence would have to compete with DBT's own timing (and often loses,
+    per the low-whisper-quality-language gate in
+    pipeline/whisper_quality_guard.py), vs. the other ~41% where DBT has
+    no timing at all and Whisper is simply, unambiguously additive -- no
+    dispute possible, so no risk of the extra effort being wasted or
+    actively harmful. Re-prioritization call: do the dispute-free
+    population first, defer the dispute-relevant one.
     """
     result = defaultdict(list)
     base = TIMING_DIR / testament
@@ -112,6 +124,9 @@ def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None 
             continue
         if getattr(config, "verse_only_mode", False):
             continue
+
+        dbt_keys = find_all_downloaded_timecode(iso, testament) if dispute_free_only else None
+
         for tf in iso_dir.rglob("*_timing.json"):
             wp = _whisper_path_for(tf)
             if wp is None:
@@ -120,6 +135,12 @@ def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None 
                 continue
             if rejected_marker_path(wp).exists():
                 continue
+            if dbt_keys is not None:
+                rel = tf.relative_to(TIMING_DIR)
+                canon, distinct_id, book = rel.parts[0], rel.parts[2], rel.parts[3]
+                chapter_str = tf.name.replace("_timing.json", "").split("_", 2)[1]
+                if (canon, distinct_id, book, chapter_str) in dbt_keys:
+                    continue  # DBT has its own timing here -- dispute-relevant, deferred
             result[iso].append(tf)
     return result
 
@@ -147,6 +168,9 @@ def main():
     parser.add_argument("--iso", type=str, default=None, help="Scope to a single iso (pilot run)")
     parser.add_argument("--iso-list", type=str, default=None, help="Comma-separated isos")
     parser.add_argument("--dry-run", action="store_true", help="Report scope only, no GPU work")
+    parser.add_argument("--dispute-free-only", action="store_true",
+                         help="Skip any chapter where DBT already has its own timing "
+                              "(defers the dispute-relevant population to a later pass)")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N chapters (smoke test)")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_FASTER)
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
@@ -158,7 +182,7 @@ def main():
         isos = [args.iso]
     elif args.iso_list:
         isos = [c.strip() for c in args.iso_list.split(",")]
-    missing = find_missing_whisper_chapters(args.testament, isos=isos)
+    missing = find_missing_whisper_chapters(args.testament, isos=isos, dispute_free_only=args.dispute_free_only)
     total_chapters = sum(len(v) for v in missing.values())
     log(f"Scope: {total_chapters} chapters missing whisper_words.json across {len(missing)} fusion-mode isos")
 

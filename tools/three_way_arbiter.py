@@ -62,6 +62,7 @@ from quality_report import (
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 from text_processing import read_verse_texts, clean_for_alignment, load_language_config  # noqa: E402
 from vowel_pacing import verse_vowel_counts, compare_pacing, detect_repeated_phrases  # noqa: E402
+from whisper_quality_guard import is_low_whisper_quality_language, HIGH_BAR_MATCH_RATIO  # noqa: E402
 
 WORD_TIMING_DIR = Path("word-timing-data")
 
@@ -505,10 +506,16 @@ def resolve_chapter_by_pacing(dl_verses: dict, pl_verses: dict, ref_verses: list
 
 
 def arbitrate_chapter(dl_path: Path, pl_path: Path, whisper_path: Path,
-                       text_path: Path | None, config, uroman) -> dict | None:
+                       text_path: Path | None, config, uroman, iso: str | None = None) -> dict | None:
     """Returns {verses_disputed, votes: {OURS, DBT, AMBIGUOUS}, detail: [...]}
     or None if there's nothing to arbitrate (no dispute, or no evidence of
     any kind -- no Whisper AND no usable reference text).
+
+    `iso`, when given, gates every verdict through
+    whisper_quality_guard.is_low_whisper_quality_language() -- see that
+    function's docstring (confirmed 2026-10-01 on acd/ACDWBT MAT 22: a
+    language the backfill already flagged as broadly unreliable can still
+    produce a TEXT_MATCH verdict that LOOKS confident but is wrong by ear).
     """
     dl_verses = load_timing_verses(dl_path)
     pl_verses = load_timing_verses(pl_path)
@@ -595,6 +602,20 @@ def arbitrate_chapter(dl_path: Path, pl_path: Path, whisper_path: Path,
                      "pacing_reason": f"downgraded: {entry['method']} said {entry['verdict']}, "
                                        f"pacing said {pacing['verdict']} ({pacing['reason']})"}
 
+        if (iso is not None and is_low_whisper_quality_language(iso)
+                and entry["verdict"] != "DBT"
+                and not (entry["method"] == "TEXT_MATCH" and (entry.get("match_ratio") or 0.0) >= HIGH_BAR_MATCH_RATIO)):
+            # This language's own Whisper output was already broadly
+            # unreliable per the backfill's quality guard -- don't let a
+            # merely-moderate TEXT_MATCH/STRUCTURAL/pacing verdict (or no
+            # verdict at all) override DBT's own timing. Confirmed
+            # 2026-10-01: acd's 3 "OURS" verdicts at ratio 0.53-0.66 were
+            # all wrong by direct ear verification.
+            entry = {**entry, "verdict": "DBT",
+                     "pacing_reason": f"low-whisper-quality language override: "
+                                       f"{entry['method']} said {entry['verdict']} "
+                                       f"(ratio={entry.get('match_ratio')}), defaulting to DBT"}
+
         votes[entry["verdict"]] += 1
         detail.append(entry)
 
@@ -670,7 +691,7 @@ def main():
                     print(f"  ... checked {chapters_checked} chapters ({chapters_arbitrated} arbitrated), "
                           f"currently at {iso}/{distinct_id} {book} {chapter_str}, "
                           f"{elapsed:.0f}s elapsed", file=sys.stderr)
-                result = arbitrate_chapter(downloaded_tc[key], tf, whisper_path, text_path, config, uroman)
+                result = arbitrate_chapter(downloaded_tc[key], tf, whisper_path, text_path, config, uroman, iso=iso)
                 if result is None:
                     continue
                 chapters_arbitrated += 1

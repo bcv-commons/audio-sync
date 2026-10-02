@@ -58,10 +58,45 @@ def main():
     parser.add_argument("--report", type=str, default="_runs/gpu_redo_final_report.json")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N chapters (smoke test)")
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
+    parser.add_argument("--no-download", action="store_true",
+                         help="Skip ensure_chapter_ready() entirely -- only process chapters whose "
+                             "audio is ALREADY local, under whatever fileset happens to be there. "
+                             "discover_chapter_files() never downloads on its own, so this guarantees "
+                             "zero new fetches; a chapter with no local audio at all is just skipped. "
+                             "Use when the --report's whole point is 'audio already downloaded, no "
+                             "more fetching' (e.g. sparse-list editions we don't want expanded).")
+    parser.add_argument("--keep-fusion-mode-audio", action="store_true",
+                         help="Don't purge audio for fusion-mode (not verse_only_mode) isos -- this "
+                             "job only ever writes MMS-only output (process_chapter_verse_only()), "
+                             "never Whisper, so a fusion-mode chapter still needs a later Whisper "
+                             "backfill pass before it's truly done. Purging right after MMS for those "
+                             "means re-downloading the same audio again when that pass eventually "
+                             "runs -- confirmed 2026-10-01: a real, avoidable re-fetch cost, not just "
+                             "a theoretical one. verse_only_mode isos are unaffected -- MMS-only genuinely "
+                             "is their final state, so purging them immediately is still correct.")
+    parser.add_argument("--inflight-marker", type=str, default=None,
+                         help="Path to overwrite with {timing_path, iso, distinct_id, book, chapter} "
+                             "before each chapter's actual alignment call -- lets a supervisor process "
+                             "identify which chapter was running if this process dies to a signal "
+                             "(SIGSEGV from a native library can't be caught or logged from Python). "
+                             "See tools/run_gpu_redo_supervisor.py.")
+    parser.add_argument("--exclude-chapters-file", type=str, default=None,
+                         help="JSON file with a top-level 'chapters' list of {'path': ...} entries "
+                             "(same shape as --report) to skip entirely -- e.g. chapters a previous "
+                             "supervised run already confirmed crash this process. Resumable for free "
+                             "via needs_run() otherwise, but a chapter that crashes BEFORE writing any "
+                             "output needs an explicit exclude or it would be retried forever.")
     args = parser.parse_args()
 
     redo = json.loads(Path(args.report).read_text())
     chapters = redo["chapters"]
+    if args.exclude_chapters_file:
+        exclude_data = json.loads(Path(args.exclude_chapters_file).read_text())
+        excluded = {e["path"] if isinstance(e, dict) else e for e in exclude_data["chapters"]}
+        before = len(chapters)
+        chapters = [c for c in chapters if (c["path"] if isinstance(c, dict) else c) not in excluded]
+        if before - len(chapters) > 0:
+            log(f"Excluded {before - len(chapters)} chapter(s) via --exclude-chapters-file")
     if args.limit:
         chapters = chapters[: args.limit]
 
@@ -99,8 +134,9 @@ def main():
                 config_cache[iso] = load_language_config("default")
         config = config_cache[iso]
 
-        for ch in sorted(chapter_nums):
-            ensure_chapter_ready(iso, canon, distinct_id, book, ch)
+        if not args.no_download:
+            for ch in sorted(chapter_nums):
+                ensure_chapter_ready(iso, canon, distinct_id, book, ch)
 
         required = {book: chapter_nums}
         found, _skipped = discover_chapter_files(iso, canon, distinct_id, OUTPUT_DIR, force=True, required_chapters=required)
@@ -127,6 +163,15 @@ def main():
                 "audio_path": chapter["audio_path"], "text_path": chapter["text_path"],
                 "timing_path": timing_path, "words_path": words_path, "quality_path": quality_path,
             }
+            # Overwritten per chapter (never appended) -- the supervisor's
+            # only way to know which chapter was in-flight if this process
+            # dies to a SIGSEGV, which bypasses Python's exception handling
+            # entirely and can't be logged from inside the try/except below.
+            # See tools/run_gpu_redo_supervisor.py.
+            if args.inflight_marker:
+                Path(args.inflight_marker).write_text(json.dumps(
+                    {"timing_path": str(timing_path), "iso": iso, "distinct_id": distinct_id,
+                     "book": book, "chapter": ch_num}))
             try:
                 stats = process_chapter_verse_only(item, bundle, model, tokenizer, aligner, uroman, config)
             except Exception as e:
@@ -144,6 +189,9 @@ def main():
             log(f"... {gi + 1}/{len(group_items)} groups done "
                 f"(ok={total_ok}, failed={total_failed}, skipped={total_skipped})")
             for iso in isos_touched_since_purge:
+                if args.keep_fusion_mode_audio and not getattr(config_cache.get(iso), "verse_only_mode", False):
+                    log(f"  keeping audio for {iso} (fusion-mode, still needs a later Whisper pass)")
+                    continue
                 try:
                     deleted, freed = purge_iso_audio(iso)
                     if deleted:
