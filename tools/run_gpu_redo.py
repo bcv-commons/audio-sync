@@ -214,7 +214,7 @@ def main():
                     # Already redone (e.g. before a restart) but the prefetch
                     # just downloaded its audio again -- nothing else will
                     # purge it if this whole language is skipped.
-                    if prefetch is not None and getattr(config, "verse_only_mode", False):
+                    if prefetch is not None and (getattr(config, "verse_only_mode", False) or not args.keep_fusion_mode_audio):
                         Path(chapter["audio_path"]).unlink(missing_ok=True)
                     continue
             elif not needs_run(timing_path, force=False):
@@ -258,7 +258,7 @@ def main():
             # With prefetch, a big language's purge can be deferred for many
             # groups (see the purge block below); drop this chapter's audio
             # now so disk use stays bounded by the prefetch window.
-            if prefetch is not None and getattr(config, "verse_only_mode", False):
+            if prefetch is not None and (getattr(config, "verse_only_mode", False) or not args.keep_fusion_mode_audio):
                 Path(chapter["audio_path"]).unlink(missing_ok=True)
 
         if (gi + 1) % 50 == 0 or gi == len(group_items) - 1:

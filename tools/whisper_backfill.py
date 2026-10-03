@@ -89,7 +89,8 @@ def rejected_marker_path(whisper_words_path: Path) -> Path:
 
 
 def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None = None,
-                                   dispute_free_only: bool = False) -> dict[str, list[Path]]:
+                                   dispute_free_only: bool = False,
+                                   skip_dramatized: bool = False) -> dict[str, list[Path]]:
     """Returns {iso: [pipeline_timing_path, ...]} for fusion-mode isos with
     a timing.json but no whisper_words.json AND no prior rejection marker.
 
@@ -135,6 +136,11 @@ def find_missing_whisper_chapters(testament: str = "nt", isos: list[str] | None 
                 continue
             if rejected_marker_path(wp).exists():
                 continue
+            if skip_dramatized and ("2DA" in tf.name or "2SA" in tf.name):
+                # Dramatized filesets are aligned without Whisper (padded
+                # verse-only path, tools/run_gpu_redo.py); Whisper on music +
+                # multiple voices is mostly rejected by the quality guard.
+                continue
             if dbt_keys is not None:
                 rel = tf.relative_to(TIMING_DIR)
                 canon, distinct_id, book = rel.parts[0], rel.parts[2], rel.parts[3]
@@ -171,6 +177,9 @@ def main():
     parser.add_argument("--dispute-free-only", action="store_true",
                          help="Skip any chapter where DBT already has its own timing "
                               "(defers the dispute-relevant population to a later pass)")
+    parser.add_argument("--skip-dramatized", action="store_true",
+                         help="Leave out dramatized (2DA/2SA) filesets -- they are re-aligned by "
+                              "the verse-only redo instead (no Whisper).")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N chapters (smoke test)")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_FASTER)
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
@@ -182,7 +191,8 @@ def main():
         isos = [args.iso]
     elif args.iso_list:
         isos = [c.strip() for c in args.iso_list.split(",")]
-    missing = find_missing_whisper_chapters(args.testament, isos=isos, dispute_free_only=args.dispute_free_only)
+    missing = find_missing_whisper_chapters(args.testament, isos=isos, dispute_free_only=args.dispute_free_only,
+                                            skip_dramatized=args.skip_dramatized)
     total_chapters = sum(len(v) for v in missing.values())
     log(f"Scope: {total_chapters} chapters missing whisper_words.json across {len(missing)} fusion-mode isos")
 
