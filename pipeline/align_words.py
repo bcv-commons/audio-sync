@@ -43,7 +43,6 @@ from text_processing import (
     clean_for_alignment,
     format_verse_id,
     is_aramaic_chapter,
-    load_language_config,
     normalize_text,
     read_verse_texts,
 )
@@ -52,6 +51,11 @@ from text_processing import (
 
 DOWNLOADS_DIR = Path("downloads/BB")
 OUTPUT_DIR = Path("export/timing-data")
+
+# <star> padding for fusion's gap-fill and drift-correction re-alignments,
+# which align a few words inside a window that also holds neighbouring
+# speech. Off until measured (see alignment-fix-rollout-plan).
+FUSION_REALIGN_STAR_EDGES = False
 WORD_TIMING_DIR = Path("word-timing-data")
 
 WHISPER_MATCH_THRESHOLD = 0.5
@@ -1062,6 +1066,7 @@ def fuse_words_per_word(
                         audio_path, segment_text,
                         segment_start, segment_end,
                         bundle, model, tokenizer, aligner_obj, uroman,
+                        star_edges=FUSION_REALIGN_STAR_EDGES,
                     )
 
                     if gap_results and len(gap_results) >= 1:
@@ -1213,7 +1218,7 @@ def fuse_words_per_word(
                 new_results = realign_from_point(
                     waveform, sample_rate, restart_time, gap_text,
                     bundle, model, tokenizer, aligner_obj, uroman_obj,
-                    end_time=segment_end_time,
+                    end_time=segment_end_time, star_edges=FUSION_REALIGN_STAR_EDGES,
                 )
             except CudaContextPoisonedError:
                 raise
@@ -1398,96 +1403,6 @@ def fuse_words_per_word(
 
 
 # ─── Work Item Discovery ───────────────────────────────────────────────────
-
-def discover_work_items(
-    iso: str,
-    testament: str | None = None,
-    force: bool = False,
-    redo_no_quality: bool = False,
-    book_filter: str | None = None,
-    chapter_filter: int | None = None,
-) -> list[dict]:
-    """Find chapters that have word timing data (MMS and/or Whisper).
-
-    Scans word-timing-data/{canon}/{iso}/{distinct_id}/{book}/ for
-    *_mms_words.json and *_whisper_words.json files.
-    Groups by (book, chapter, audio_fileset).
-    """
-    items = []
-
-    canons = []
-    if testament in (None, "ot", "both"):
-        canons.append("ot")
-    if testament in (None, "nt", "both"):
-        canons.append("nt")
-
-    for canon in canons:
-        canon_dir = WORD_TIMING_DIR / canon / iso
-        if not canon_dir.exists():
-            continue
-
-        # Collect all word timing files
-        file_groups = {}  # (book, chapter_str, fileset) -> {mms_path, whisper_path}
-
-        for word_file in sorted(canon_dir.rglob("*_mms_words.json")):
-            key = _parse_word_file(word_file, "_mms_words")
-            if key:
-                file_groups.setdefault(key, {})["mms_path"] = word_file
-
-        for word_file in sorted(canon_dir.rglob("*_whisper_words.json")):
-            key = _parse_word_file(word_file, "_whisper_words")
-            if key:
-                file_groups.setdefault(key, {})["whisper_path"] = word_file
-
-        for (book, chapter_str, audio_fileset), paths in sorted(file_groups.items()):
-            try:
-                chapter_num = int(chapter_str)
-            except ValueError:
-                continue
-
-            if book_filter and book != book_filter:
-                continue
-            if chapter_filter is not None and chapter_num != chapter_filter:
-                continue
-
-            # Extract distinct_id from path
-            sample_path = paths.get("mms_path") or paths.get("whisper_path")
-            distinct_id = sample_path.parent.parent.name
-
-            # Find reference text
-            ref_path = _find_reference_text(canon, iso, distinct_id, book, chapter_str)
-
-            # Build output paths
-            out_book_dir = OUTPUT_DIR / canon / iso / distinct_id / book
-            timing_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_timing.json"
-            words_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_words.json"
-
-            if timing_path.exists() and not force:
-                if redo_no_quality:
-                    quality_path = Path(str(words_path).replace("_words.json", "_words_quality.json"))
-                    if quality_path.exists():
-                        continue  # already has quality — skip
-                    # no quality file — include for re-fusion
-                else:
-                    continue
-
-            items.append({
-                "mms_path": paths.get("mms_path"),
-                "whisper_path": paths.get("whisper_path"),
-                "ref_text_path": ref_path,
-                "timing_path": timing_path,
-                "words_path": words_path,
-                "book": book,
-                "chapter": chapter_num,
-                "chapter_str": chapter_str,
-                "canon": canon,
-                "iso": iso,
-                "distinct_id": distinct_id,
-                "audio_fileset": audio_fileset,
-            })
-
-    return items
-
 
 def _parse_word_file(path: Path, suffix: str) -> tuple[str, str, str] | None:
     """Parse a word timing filename into (book, chapter_str, audio_fileset)."""

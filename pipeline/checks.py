@@ -9,6 +9,14 @@ missing or malformed file.
 import json
 from pathlib import Path
 
+from timing_files import (
+    _parse_timing_path,
+    find_all_downloaded_timecode,
+    find_pipeline_timing_files,
+    find_quality_files,
+    load_quality,
+)
+
 
 def load_verse_starts(timing_path) -> list[tuple[str, float]] | None:
     """(verse number, start time) pairs from a chapter timing file, verse 0
@@ -225,3 +233,239 @@ def check_chapter_fallback(quality_path: Path) -> dict | None:
         "fallback_rate": len(fallback_verses) / total,
         "fallback_verse_nums": fallback_verses,
     }
+
+
+# ── Per-language checks (align_pipeline.py's end-of-language step; the
+# CLIs in tools/check_timing_quality.py and tools/check_verse_only_fallback.py) ──
+
+def analyze_chapter_words(words_path):
+    """Check a words.json for null timestamps and duplicate word times.
+
+    Returns dict with {nulls, word_dupes, total_words} or None.
+    """
+    if not words_path.exists():
+        return None
+
+    with open(words_path) as f:
+        data = json.load(f)
+
+    verses = data.get("beg", {})
+    nulls = word_dupes = total_words = 0
+
+    for vnum, timestamps in verses.items():
+        if not timestamps:
+            continue
+        prev = None
+        for ts in timestamps:
+            total_words += 1
+            if ts is None:
+                nulls += 1
+            else:
+                if prev is not None and ts == prev:
+                    word_dupes += 1
+                prev = ts
+
+    return {"nulls": nulls, "word_dupes": word_dupes, "total_words": total_words}
+
+
+def check_language(iso, testament=None):
+    """Run all quality checks for one language.
+
+    Returns dict with aggregate stats and per-chapter details, or None.
+    """
+    pipeline_files = find_pipeline_timing_files(iso, testament)
+    downloaded_tc = find_all_downloaded_timecode(iso, testament)
+    quality_files = find_quality_files(iso, testament)
+
+    if not pipeline_files:
+        return None
+
+    # Build quality lookup: (canon, distinct_id, book, chapter_str) -> quality data
+    quality_by_key = {}
+    for canon, qf in quality_files:
+        data = load_quality(qf)
+        distinct_id = qf.parent.parent.name
+        book = data["book"]
+        parts = qf.stem.replace("_words_quality", "").split("_", 2)
+        ch = parts[1] if len(parts) >= 2 else None
+        if ch:
+            quality_by_key[(canon, distinct_id, book, ch)] = data
+
+    chapters = []
+    for canon, tf in pipeline_files:
+        distinct_id, book, chapter_str = _parse_timing_path(tf)
+        if not chapter_str:
+            continue
+
+        key = (canon, distinct_id, book, chapter_str)
+
+        # Verse-level analysis (generated)
+        gen_timing = analyze_chapter_timing(tf)
+        if gen_timing is None:
+            continue
+
+        # Word-level analysis
+        words_path = tf.parent / tf.name.replace("_timing.json", "_words.json")
+        word_stats = analyze_chapter_words(words_path)
+
+        # Quality score
+        q_data = quality_by_key.get(key)
+        avg_score = q_data["summary"]["avg_score"] if q_data else None
+        low_q = q_data["summary"]["low_quality_count"] if q_data else 0
+
+        # Compare with original if available
+        orig_better = False
+        if key in downloaded_tc:
+            dl_timing = analyze_chapter_timing(downloaded_tc[key])
+            if dl_timing:
+                gen_issues = gen_timing["dupes"] + gen_timing["backwards"]
+                dl_issues = dl_timing["dupes"] + dl_timing["backwards"]
+                if dl_issues < gen_issues and gen_issues > 0:
+                    orig_better = True
+
+        # Build flags
+        flags = []
+        if gen_timing["dupes"] > 0:
+            # A dupe verse with zero words in words.json's "beg" list is a
+            # verse that cleaned down to nothing (e.g. a lone leftover
+            # punctuation mark on its own reference-text line — confirmed
+            # for real 2026-09-02 across 673 sampled DUPES chapters in 28
+            # languages: 100% were this exact case, not an alignment
+            # failure). align_words.py deliberately reuses the previous
+            # verse's timestamp for these (nothing to time), so this is
+            # expected, unfixable-at-the-alignment-level output, not an
+            # issue — distinct from DUPES-OK's "two verses genuinely
+            # spoken back-to-back" case below, but equally benign.
+            empty_dupe_verses = set()
+            if word_stats is not None:
+                try:
+                    with open(words_path, encoding="utf-8") as wf:
+                        beg_by_verse = json.load(wf).get("beg", {})
+                    empty_dupe_verses = {
+                        vnum for vnum in gen_timing["dupe_verses"]
+                        if not beg_by_verse.get(vnum)
+                    }
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            if empty_dupe_verses and len(empty_dupe_verses) == len(gen_timing["dupe_verses"]):
+                flags.append("DUPES-EMPTY")
+            else:
+                # Cross-reference the specific dupe verses' word scores to
+                # tell a real alignment failure (0.0-score fallback) apart
+                # from two verses genuinely spoken back-to-back with no gap
+                # (high-confidence). Only the former is an actual issue —
+                # see analyze_chapter_timing()'s docstring for how this was
+                # found. Empty-verse dupes are excluded from this average
+                # (they have no words/score by definition, which would
+                # otherwise drag dupe_avg down or leave it undefined).
+                dupe_scores = []
+                if q_data:
+                    for vnum in gen_timing["dupe_verses"]:
+                        if vnum in empty_dupe_verses:
+                            continue
+                        for w in q_data["verses"].get(vnum, []):
+                            dupe_scores.append(w["score"])
+                dupe_avg = sum(dupe_scores) / len(dupe_scores) if dupe_scores else None
+                if dupe_avg is not None and dupe_avg >= 0.5:
+                    flags.append("DUPES-OK")
+                else:
+                    flags.append("DUPES")
+        if gen_timing["backwards"] > 0:
+            flags.append("BACKWARDS")
+        if gen_timing["tiny"] >= 3:
+            flags.append("TINY-STEPS")
+        if gen_timing["gaps"] > 0:
+            flags.append("GAPS")
+        if word_stats and word_stats["nulls"] >= 3:
+            flags.append("NULLS")
+        if avg_score is not None and avg_score < 0.5:
+            flags.append("LOW-SCORE")
+        if orig_better:
+            flags.append("ORIG-BETTER")
+
+        chapters.append({
+            "canon": canon,
+            "distinct_id": distinct_id,
+            "book": book,
+            "chapter": chapter_str,
+            "dupes": gen_timing["dupes"],
+            "backwards": gen_timing["backwards"],
+            "tiny": gen_timing["tiny"],
+            "gaps": gen_timing["gaps"],
+            "nulls": word_stats["nulls"] if word_stats else 0,
+            "low_q": low_q,
+            "avg_score": avg_score,
+            "orig_better": orig_better,
+            "flags": flags,
+        })
+
+    if not chapters:
+        return None
+
+    # DUPES-OK and DUPES-EMPTY are both informational, not an issue (see
+    # check_language()'s DUPES/DUPES-OK/DUPES-EMPTY split above) — a
+    # chapter flagged with ONLY those shouldn't count toward has_issues,
+    # and their dupe counts shouldn't inflate total_dupes (which "how many
+    # chapters actually need attention" tooling, e.g.
+    # tools/requeue_dupes_chapters.py, reads).
+    BENIGN_DUPE_FLAGS = ("DUPES-OK", "DUPES-EMPTY")
+    has_issues = sum(
+        1 for c in chapters
+        if any(f not in BENIGN_DUPE_FLAGS for f in c["flags"])
+    )
+    return {
+        "iso": iso,
+        "chapters": len(chapters),
+        "has_issues": has_issues,
+        "total_dupes": sum(c["dupes"] for c in chapters if "DUPES" in c["flags"]),
+        "total_dupes_ok": sum(c["dupes"] for c in chapters if "DUPES-OK" in c["flags"]),
+        "total_dupes_empty": sum(c["dupes"] for c in chapters if "DUPES-EMPTY" in c["flags"]),
+        "total_backwards": sum(c["backwards"] for c in chapters),
+        "total_nulls": sum(c["nulls"] for c in chapters),
+        "total_low_q": sum(c["low_q"] for c in chapters),
+        "orig_better_count": sum(1 for c in chapters if c["orig_better"]),
+        "chapter_details": chapters,
+    }
+
+
+
+DEFAULT_THRESHOLD = 0.2
+
+
+def check_language_fallback(iso: str, testament: str | None = None, threshold: float = DEFAULT_THRESHOLD) -> dict | None:
+    """Fallback-rate summary for one language across all its chapters.
+
+    Returns None if this language has no verse_only_mode-shaped quality
+    output at all (either it hasn't been aligned yet, or every chapter
+    found is fusion-mode output).
+    """
+    chapters = []
+    for canon, qf in find_quality_files(iso, testament):
+        stats = check_chapter_fallback(qf)
+        if stats is None:
+            continue
+        distinct_id, book, chapter_str = _parse_timing_path(qf)
+        chapters.append({
+            "canon": canon, "distinct_id": distinct_id, "book": book, "chapter": chapter_str,
+            **stats,
+            "flagged": stats["fallback_rate"] >= threshold,
+        })
+
+    if not chapters:
+        return None
+
+    flagged = [c for c in chapters if c["flagged"]]
+    total_verses = sum(c["verses"] for c in chapters)
+    total_fallback = sum(c["fallback_verses"] for c in chapters)
+
+    return {
+        "iso": iso,
+        "chapters": len(chapters),
+        "flagged_chapters": len(flagged),
+        "total_verses": total_verses,
+        "total_fallback_verses": total_fallback,
+        "overall_fallback_rate": total_fallback / total_verses if total_verses else 0.0,
+        "chapter_details": chapters,
+    }
+

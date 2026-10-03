@@ -70,7 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from quality_report import TIMING_DIR, DOWNLOADS_DIR, find_all_downloaded_timecode  # noqa: E402
+from timing_files import TIMING_DIR, DOWNLOADS_DIR, find_all_downloaded_timecode  # noqa: E402
 from three_way_arbiter import _whisper_path_for  # noqa: E402
 from whisper_transcribe import (  # noqa: E402
     DEFAULT_MODEL_FASTER, load_whisper_model, transcribe_audio, build_word_timeline,

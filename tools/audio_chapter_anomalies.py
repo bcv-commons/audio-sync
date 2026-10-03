@@ -23,7 +23,7 @@ reports:
 
 EXPECTED comes from the edition's declared text versification shape
 (_vrs/<scheme>.vrs). ACTUAL is reconstructed from durable evidence, because
-source audio is purged after a language completes (tools/purge_aligned_audio
+source audio is purged after a language completes (pipeline/purge_aligned_audio
 .py) so counting mp3s on disk would under-report almost everywhere. In
 preference order per book:
 

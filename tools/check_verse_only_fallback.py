@@ -40,13 +40,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 from text_processing import load_language_config  # noqa: E402
-from quality_report import find_quality_files, _parse_timing_path  # noqa: E402
-from checks import check_chapter_fallback  # noqa: E402
+from checks import DEFAULT_THRESHOLD, check_language_fallback  # noqa: E402
 
 CONFIG_DIR = Path(__file__).parent.parent / "pipeline" / "config" / "languages"
-DEFAULT_THRESHOLD = 0.2
-
-
 def discover_verse_only_languages() -> list[str]:
     """ISO codes with verse_only_mode = true in their config file."""
     isos = []
@@ -59,43 +55,6 @@ def discover_verse_only_languages() -> list[str]:
         except Exception:
             continue
     return isos
-
-
-def check_language_fallback(iso: str, testament: str | None = None, threshold: float = DEFAULT_THRESHOLD) -> dict | None:
-    """Fallback-rate summary for one language across all its chapters.
-
-    Returns None if this language has no verse_only_mode-shaped quality
-    output at all (either it hasn't been aligned yet, or every chapter
-    found is fusion-mode output).
-    """
-    chapters = []
-    for canon, qf in find_quality_files(iso, testament):
-        stats = check_chapter_fallback(qf)
-        if stats is None:
-            continue
-        distinct_id, book, chapter_str = _parse_timing_path(qf)
-        chapters.append({
-            "canon": canon, "distinct_id": distinct_id, "book": book, "chapter": chapter_str,
-            **stats,
-            "flagged": stats["fallback_rate"] >= threshold,
-        })
-
-    if not chapters:
-        return None
-
-    flagged = [c for c in chapters if c["flagged"]]
-    total_verses = sum(c["verses"] for c in chapters)
-    total_fallback = sum(c["fallback_verses"] for c in chapters)
-
-    return {
-        "iso": iso,
-        "chapters": len(chapters),
-        "flagged_chapters": len(flagged),
-        "total_verses": total_verses,
-        "total_fallback_verses": total_fallback,
-        "overall_fallback_rate": total_fallback / total_verses if total_verses else 0.0,
-        "chapter_details": chapters,
-    }
 
 
 def print_summary(results: list[dict]):

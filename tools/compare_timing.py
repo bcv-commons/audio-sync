@@ -23,7 +23,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from quality_report import (
+sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
+from timing_files import (
     TIMING_DIR,
     DOWNLOADS_DIR,
     TIMECODE_CATEGORIES,

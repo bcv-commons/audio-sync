@@ -518,7 +518,7 @@ def generate_work_items(
                 # published catalog which editions actually have audio here.
                 #
                 # This is the normal state for any language whose audio has
-                # been purged (tools/purge_aligned_audio.py runs after every
+                # been purged (pipeline/purge_aligned_audio.py runs after every
                 # language): the directory survives, still named e.g. HAKTHV,
                 # but has_local_audio is False so the branch above skips it,
                 # and the edition's name is lost even though it's sitting in

@@ -1,9 +1,10 @@
 """Shared "is this chapter done?" classifier.
 
 Consolidates align_pipeline.py's needs_run() and _chapter_output_exists(),
-tools/purge_aligned_audio.py's _has_real_timing(), and the equivalent ad
-hoc checks duplicated across whisper_transcribe.py, mms_align_words.py,
-and align_words.py's own discover_work_items() functions -- all of them
+pipeline/purge_aligned_audio.py's _has_real_timing(), and the equivalent ad
+hoc checks once duplicated across whisper_transcribe.py, mms_align_words.py
+and align_words.py (the latter two's discover_work_items() were removed
+2026-10-03 with the step-only CLIs that used them) -- all of them
 were independently answering "does this chapter already have real output"
 with slightly different rules (see single-pipeline-plan-2026-10-02.md
 for the full inventory of 7 separate implementations this replaces).
@@ -36,7 +37,7 @@ def has_real_timing(timing_path: Path) -> bool:
     """True only if timing_path holds actual pos[] alignment data -- not
     a defer_to_dbt redirect, not a legacy list-format file (pre-Aug-12
     redesign), not anything else. Moved here from
-    tools/purge_aligned_audio.py's own _has_real_timing() (2026-10-01) --
+    pipeline/purge_aligned_audio.py's own _has_real_timing() (2026-10-01) --
     same logic, now the one shared source of truth.
     """
     try:

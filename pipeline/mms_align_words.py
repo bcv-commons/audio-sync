@@ -53,11 +53,8 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 import torchaudio
-from align_words import detect_audio_header
-from batch_manifest import get_template_chapters_from_batch, load_batch
 from gpu_health import CudaContextPoisonedError, note_alignment_success, wrap_if_poisoned
-from hw_config import load_hw_config
-from text_processing import clean_for_alignment, load_language_config, read_verse_texts
+from text_processing import clean_for_alignment, read_verse_texts
 from uroman import Uroman
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -820,6 +817,7 @@ def align_segment(
     tokenizer,
     aligner,
     uroman,
+    star_edges: bool = False,
 ) -> list[dict]:
     """Run MMS_FA on a segment of the audio between start_time and end_time.
 
@@ -830,7 +828,7 @@ def align_segment(
     return realign_from_point(
         waveform, sample_rate, start_time, text,
         bundle, model, tokenizer, aligner, uroman,
-        end_time=end_time,
+        end_time=end_time, star_edges=star_edges,
     )
 
 
@@ -939,153 +937,9 @@ def write_mms_words_json(
 
 # ─── Template Helpers ─────────────────────────────────────────────────────
 
-def get_template_chapters(template_ids: list[str]) -> set:
-    """Return (BOOK, chapter_int) pairs from the current batch manifest."""
-    batch = load_batch()
-    return get_template_chapters_from_batch(batch, template_ids)
-
-
 # ─── Collapse Detection for Existing Output ──────────────────────────────
 
-def has_null_collapse(mms_path: Path) -> bool:
-    """Check if an existing MMS output file has the null-collapse pattern.
-
-    Returns True if >30% of words in the second half have score <= 0.1.
-    """
-    try:
-        with open(mms_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        words = data.get("words", [])
-        if len(words) < 4:
-            return False
-        half = len(words) // 2
-        second_half = words[half:]
-        bad = sum(1 for w in second_half if w.get("score", 0) <= 0.1)
-        return bad / len(second_half) > 0.3
-    except Exception:
-        return False
-
-
 # ─── Work Item Discovery ───────────────────────────────────────────────────
-
-def discover_work_items(
-    iso: str | None = None,
-    testament: str | None = None,
-    force: bool = False,
-    redo_collapsed: bool = False,
-    book_filter: str | None = None,
-    chapter_filter: int | None = None,
-    template_chapters: set | None = None,
-) -> list[dict]:
-    """Find all audio+text pairs for a language (or all languages) and build work items.
-
-    Scans downloads/BB/{canon}/{category}/{iso}/{distinct_id}/{book}/
-    for .mp3 files with matching .txt reference text.
-    If iso is None, scans all language directories.
-    """
-    items = []
-
-    canons = []
-    if testament in (None, "ot", "both"):
-        canons.append("ot")
-    if testament in (None, "nt", "both"):
-        canons.append("nt")
-
-    for canon in canons:
-        # Search in category subdirs and also directly under canon
-        search_bases = []
-        for category in AUDIO_TEXT_CATEGORIES:
-            cat_dir = DOWNLOADS_DIR / canon / category
-            if cat_dir.exists():
-                search_bases.append(cat_dir)
-        # Also search direct language dirs (downloads/BB/{canon}/{iso}/)
-        direct_dir = DOWNLOADS_DIR / canon
-        if direct_dir.exists():
-            if iso:
-                direct_iso = direct_dir / iso
-                # Only add if it's a language dir (not a category dir)
-                if (direct_iso.exists() and direct_iso.is_dir()
-                        and direct_iso.name not in AUDIO_TEXT_CATEGORIES):
-                    search_bases.append(direct_dir)
-            else:
-                search_bases.append(direct_dir)
-
-        for base_dir in search_bases:
-            if iso:
-                iso_dirs = [base_dir / iso] if (base_dir / iso).exists() else []
-            else:
-                iso_dirs = sorted(d for d in base_dir.iterdir()
-                                  if d.is_dir() and d.name not in AUDIO_TEXT_CATEGORIES)
-
-            for iso_dir in iso_dirs:
-                lang_iso = iso_dir.name
-
-                for distinct_dir in sorted(iso_dir.iterdir()):
-                    if not distinct_dir.is_dir():
-                        continue
-                    distinct_id = distinct_dir.name
-
-                    for book_dir in sorted(distinct_dir.iterdir()):
-                        if not book_dir.is_dir():
-                            continue
-                        book = book_dir.name
-
-                        if book_filter and book != book_filter:
-                            continue
-
-                        for audio_path in sorted(book_dir.glob("*.mp3")):
-                            stem = audio_path.stem
-                            parts = stem.split("_", 2)
-                            if len(parts) < 3:
-                                continue
-
-                            book_code = parts[0]
-                            chapter_str = parts[1]
-                            audio_fileset = parts[2]
-
-                            try:
-                                chapter_num = int(chapter_str)
-                            except ValueError:
-                                continue
-
-                            if chapter_filter is not None and chapter_num != chapter_filter:
-                                continue
-
-                            if template_chapters and (book_code, chapter_num) not in template_chapters:
-                                continue
-
-                            # Find matching text file
-                            txt_candidates = list(book_dir.glob(f"{book_code}_{chapter_str}_*.txt"))
-                            if not txt_candidates:
-                                continue
-                            text_path = txt_candidates[0]
-
-                            # Build output path
-                            out_book_dir = WORD_TIMING_DIR / canon / lang_iso / distinct_id / book_code
-                            mms_path = out_book_dir / f"{book_code}_{chapter_str}_{audio_fileset}_mms_words.json"
-
-                            # Skip if already aligned
-                            if mms_path.exists() and not force:
-                                if redo_collapsed and has_null_collapse(mms_path):
-                                    pass  # include — needs redo
-                                else:
-                                    continue
-
-                            items.append({
-                                "audio_path": audio_path,
-                                "text_path": text_path,
-                                "mms_path": mms_path,
-                                "book": book_code,
-                                "chapter": chapter_num,
-                                "chapter_str": chapter_str,
-                                "canon": canon,
-                                "iso": lang_iso,
-                                "distinct_id": distinct_id,
-                                "audio_fileset": audio_fileset,
-                            })
-
-    return items
-
 
 # ─── Chapter Processing ────────────────────────────────────────────────────
 

@@ -792,7 +792,6 @@ def run_obs_scope(args) -> None:
     content -- that stays an open question, not something this
     integration should quietly decide by routing through one or the other.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
     from stall_quarantine import clear_tracking_on_success, is_quarantined
     from align_obs_words import process_story, write_run_manifest as write_obs_run_manifest
     from obs_batch_manifest import get_stories, load_obs_batch
@@ -1126,17 +1125,16 @@ Examples:
     # (2026-10-02, removing that script's own parallelism per H3, but
     # this per-language lifecycle check has nothing to do with sharding
     # and belongs in the one driver regardless). See
-    # tools/stall_quarantine.py's own docstring for the 2026-09-16
+    # pipeline/stall_quarantine.py's own docstring for the 2026-09-16
     # incident that motivated this: the same iso hanging at two
     # consecutive stall-kills blocked every language behind it, since a
     # restart always rescans the full list from #1.
-    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
     from stall_quarantine import is_quarantined
     quarantined = [lang["iso"] for lang in languages if is_quarantined(lang["iso"])]
     if quarantined:
         log(f"Skipping {len(quarantined)} quarantined language(s) after repeated stalls: "
             f"{quarantined} (see _runs/stall_quarantine.json; "
-            f"'python tools/stall_quarantine.py clear <iso>' once investigated)")
+            f"'python pipeline/stall_quarantine.py clear <iso>' once investigated)")
         languages = [lang for lang in languages if lang["iso"] not in quarantined]
 
     log(f"Languages selected: {len(languages)}")
@@ -1874,10 +1872,8 @@ Examples:
         failed_isos_this_run = {
             r["iso"] for r in run_results if r.get("status") in ("failed", "error")
         }
-        sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
         from stall_quarantine import clear_tracking_on_success
-        from check_timing_quality import check_language
-        from check_verse_only_fallback import check_language_fallback
+        from checks import check_language, check_language_fallback
 
         for iso in sorted(total_stats["languages_processed"]):
             if iso not in failed_isos_this_run:

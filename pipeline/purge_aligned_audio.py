@@ -32,9 +32,9 @@ same logic, wired into pipeline/align_pipeline.py so it runs automatically
 after each language finishes, instead of needing another manual sweep.
 
 Usage:
-    python tools/purge_aligned_audio.py --iso fra
-    python tools/purge_aligned_audio.py --iso-list fra,deu,spa
-    python tools/purge_aligned_audio.py --iso fra --dry-run
+    python pipeline/purge_aligned_audio.py --iso fra
+    python pipeline/purge_aligned_audio.py --iso-list fra,deu,spa
+    python pipeline/purge_aligned_audio.py --iso fra --dry-run
 """
 
 import argparse
@@ -55,8 +55,6 @@ def log(message: str, level: str = "INFO"):
 # -- same logic, now the one shared source of truth used by both purge
 # and the pipeline's own chapter-state classifier. Re-imported under its
 # old name so nothing else in this file needs to change.
-import sys as _sys  # noqa: E402
-_sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 from chapter_state import has_real_timing as _has_real_timing  # noqa: E402
 
 

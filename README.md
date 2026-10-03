@@ -211,7 +211,8 @@ make check      # confirms python/torch/torchaudio are importable,
   `requirements-cuda.txt`, `hw.local.json.example` (and your own gitignored
   `hw.local.json`, see Setup above)
 - `tools/` — long-running jobs (redo, Whisper backfill, fusion watcher),
-  checks and reports; `tools/diag/` holds investigation scripts
+  reports and command-line wrappers; `tools/diag/` holds investigation
+  scripts. `pipeline/` never imports from `tools/`
 - `tests/` — pytest suite (`make test`); no model or GPU needed. Real-audio
   fixtures under `tests/fixtures/` are kept locally, not in git
 - `scripts/` — shell scripts (`publish-align.sh`)

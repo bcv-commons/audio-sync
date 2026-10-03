@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
-from quality_report import load_timing_verses, DOWNLOADS_DIR  # noqa: E402
+from timing_files import load_timing_verses, DOWNLOADS_DIR  # noqa: E402
 from text_processing import read_verse_texts, load_language_config  # noqa: E402
 from vowel_pacing import verse_vowel_counts, fingerprint, detect_repeated_phrases  # noqa: E402
 

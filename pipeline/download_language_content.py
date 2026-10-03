@@ -248,7 +248,7 @@ def audio_distinct_ids_from_catalog(iso: str, canon: str) -> list[str]:
     generate_work_items() (whisper_transcribe.py) identifies an edition by
     scanning downloads/BB/ for a directory containing at least one .mp3 and
     taking that directory's NAME as the distinct_id. But
-    tools/purge_aligned_audio.py deletes the mp3s once a language finishes,
+    pipeline/purge_aligned_audio.py deletes the mp3s once a language finishes,
     keeping only text — so afterwards the directory still exists, still
     named e.g. HAKTHV, and is skipped anyway for having no audio in it. With
     no local metadata either, the work item falls through to a
@@ -1456,7 +1456,7 @@ def _requests_get_wall_clock(url: str, *, wall_clock_timeout: float, **kwargs):
     the whole worker until the external stall-watchdog's 300s no-progress
     check finally killed the ENTIRE process tree and forced a full
     restart-from-the-start-of-the-iso-list (see watchdog-align.sh
-    + tools/stall_quarantine.py) — a single slow download costing far
+    + pipeline/stall_quarantine.py) — a single slow download costing far
     more than just that one chapter.
 
     Runs the real requests.get() in a throwaway single-use thread (a

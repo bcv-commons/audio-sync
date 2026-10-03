@@ -41,7 +41,8 @@ import sys
 import time
 from pathlib import Path
 
-from quality_report import (
+sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
+from timing_files import (
     TIMING_DIR, find_all_downloaded_timecode, find_pipeline_timing_files,
     load_timing_verses, _parse_timing_path, _get_canons,
 )
