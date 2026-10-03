@@ -75,6 +75,21 @@ OUTPUT_DIR = Path("export/timing-data")
 # (all by a few verses).
 WINDOW_FRAC = 2.0
 MIN_WINDOW_SECONDS = 20.0
+
+# Every verse is also aligned in a narrow window (the pre-padding size) and
+# the better candidate kept: higher alignment score, minus WINDOW_GAP_PENALTY
+# per second between the candidate's start and the previous verse's end. No
+# external reference is involved. The wide window alone sometimes lets a verse
+# match 10-30 s late (inside the next verse) and drags the following verses
+# with it; the narrow candidate then scores higher and starts closer to where
+# the previous verse ended. Measured against DBT (graded only, never used to
+# choose) on 340 chapters / 12,349 verses / 154 languages: wide only 6.6% of
+# verses >1 s off and worse than narrow in 7 languages; this rule 6.3% and
+# worse in 1 (by one verse). Seven other DBT-free rules were tested (pace,
+# continuity only, score only, model-transcript onset match, ...); none did
+# better. Retrying low-score verses with a floor-free window added nothing.
+ALT_WINDOW = (0.8, 8.0)
+WINDOW_GAP_PENALTY = 0.01
 MIN_LOCAL_SCORE = 0.35
 
 # Written to every chapter's quality file (summary.method). Bump it whenever
@@ -83,7 +98,9 @@ MIN_LOCAL_SCORE = 0.35
 #   anchored-star-v1 (2026-10-03): wildcard-padded windows, emission once
 #   per chapter, two-sided chunk context, chapter gate.
 #   anchored-star-v2 (2026-10-03): wide search windows (see WINDOW_FRAC).
-ALIGNMENT_METHOD = "anchored-star-v2"
+#   anchored-star-v3 (2026-10-03): wide + narrow candidate per verse
+#   (see ALT_WINDOW).
+ALIGNMENT_METHOD = "anchored-star-v3"
 
 # Chapter gate (decided 2026-10-03 from a 121-language DBT comparison): a
 # chapter where more than GATE_MAX_LOW_SHARE of its verses score below
@@ -145,8 +162,9 @@ def verse_anchored_align(
     window_frac: float = WINDOW_FRAC,
     min_window_seconds: float = MIN_WINDOW_SECONDS,
     min_local_score: float = MIN_LOCAL_SCORE,
-    alt_window: tuple[float, float] | None = None,
+    alt_window: tuple[float, float] | None = ALT_WINDOW,
     choose_window=None,
+    reanchor_below: float | None = None,
 ) -> list[dict]:
     """Align each verse independently within a window anchored to an
     expected-pace position. Adapted from align_obs_words.py's
@@ -190,9 +208,9 @@ def verse_anchored_align(
     for i, (verse_text, wc) in enumerate(zip(non_empty_verses, pace_weights)):
         exp_start = expected_starts[i]
         exp_dur = total_duration * wc / total_pace_weight
-        def _try_window(frac, min_sec):
+        def _try_window(frac, min_sec, lower=None):
             w = max(exp_dur * frac, min_sec)
-            ws = max(floor, exp_start - w)
+            ws = max(floor if lower is None else lower, exp_start - w)
             we = min(total_duration, exp_start + exp_dur + w)
             if we - ws < min_required:
                 we = min(total_duration, ws + min_required)
@@ -216,10 +234,9 @@ def verse_anchored_align(
         min_required = exp_dur * 1.3 + 2.0
         window, win_start, win_end, local_words = _try_window(window_frac, min_window_seconds)
         if alt_window is not None:
-            # Same verse, second window size; keep the better of the two.
-            # Default rule: whichever the aligner itself is more confident
-            # about (no external reference involved). choose_window can
-            # replace that rule (returns True to take the alternative).
+            # Same verse, second window size; keep the better of the two
+            # (default rule: see ALT_WINDOW / WINDOW_GAP_PENALTY).
+            # choose_window can replace that rule (True = take the alternative).
             alt = _try_window(*alt_window)
             if choose_window is not None:
                 take_alt = choose_window(
@@ -228,9 +245,22 @@ def verse_anchored_align(
                     emission=emission, total_duration=total_duration,
                 )
             else:
-                take_alt = _avg(alt[3]) > _avg(local_words)
+                def _merit(words):
+                    if not words or words[0]["start"] is None:
+                        return 0.0
+                    return _avg(words) - WINDOW_GAP_PENALTY * abs(words[0]["start"] - floor)
+                take_alt = bool(alt[3]) and (not local_words or _merit(alt[3]) > _merit(local_words))
             if take_alt:
                 window, win_start, win_end, local_words = alt
+        if reanchor_below is not None and _avg(local_words) < reanchor_below and results:
+            # Low confidence usually means the floor (the previous verse's
+            # end) is already past this verse -- an earlier overshoot that
+            # would otherwise drag every following verse late. Retry with the
+            # window allowed to start back at the previous verse's START.
+            retry = _try_window(*(alt_window or (window_frac, min_window_seconds)),
+                                lower=results[-1]["start"])
+            if _avg(retry[3]) > _avg(local_words):
+                window, win_start, win_end, local_words = retry
 
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0

@@ -78,7 +78,9 @@ There are two modes, chosen per language (`verse_only_mode` in
 - **Verse-only mode** (languages Whisper can't handle, set automatically
   for 175+ languages, and every dramatized `2DA`/`2SA` recording): each
   verse is aligned on its own inside a search window around where reading
-  pace says it should be (`align_verse_words.py`). The verse's text is
+  pace says it should be (`align_verse_words.py`) — twice, in a wide and a
+  narrow window, keeping the better candidate (alignment score, small
+  penalty for a gap after the previous verse). The verse's text is
   padded with MMS's `<star>` wildcard so the neighbouring verses' speech in
   the window is absorbed instead of smearing the verse. The model runs once
   per chapter and each window is a slice of that output. OBS stories use
@@ -103,8 +105,10 @@ Verse-only output carries a few extra safeguards:
 
 Long-running jobs are started from `tools/` (`run_gpu_redo.py` with
 `run_gpu_redo_supervisor.py`, `whisper_backfill.py` with
-`fusion_sweep_watcher.py`); `tools/diag/redo_spot_check.py` summarizes a
-running redo per language. Plans and measurements behind all of this:
+`fusion_sweep_watcher.py`); `tools/redo_hang_watch.py` restarts a redo
+worker whose current chapter has made no progress for 30 minutes (the
+supervisor quarantines that chapter), and `tools/diag/redo_spot_check.py`
+summarizes a running redo per language. Plans and measurements behind all of this:
 `internal-docs/alignment-fix-rollout-plan-2026-10-02.md` and
 `internal-docs/single-pipeline-plan-2026-10-02.md`.
 

@@ -101,13 +101,17 @@ def main():
                 f"{len(quarantined)} chapter(s) permanently quarantined.")
             break
 
-        if result.returncode == -11 or result.returncode == 139:
+        # SIGUSR1 (-10) = killed by tools/redo_hang_watch.py because the
+        # in-flight chapter stopped making progress: same handling as a
+        # native crash (quarantine that chapter, restart, resume).
+        if result.returncode in (-11, 139, -10):
+            why = "HANG" if result.returncode == -10 else "SIGSEGV"
             if inflight_path.exists():
                 try:
                     bad = json.loads(inflight_path.read_text())
-                    quarantined.append({"path": bad["timing_path"], "reason": "SIGSEGV"})
+                    quarantined.append({"path": bad["timing_path"], "reason": why})
                     save_quarantine(quarantine_path, quarantined)
-                    log(f"SIGSEGV -- quarantining {bad['timing_path']} "
+                    log(f"{why} -- quarantining {bad['timing_path']} "
                         f"({bad['iso']}/{bad['distinct_id']} {bad['book']} {bad['chapter']})")
                     consecutive_crashes = 0  # made real progress: identified a new bad chapter
                 except (OSError, json.JSONDecodeError, KeyError) as e:

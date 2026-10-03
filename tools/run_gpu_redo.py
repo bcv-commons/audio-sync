@@ -102,6 +102,9 @@ def main():
                          help="Before overwriting a chapter's existing _timing/_words/_words_quality "
                              "files, copy them here (same relative layout under export/timing-data). "
                              "An existing backup is never overwritten, so re-runs keep the original.")
+    parser.add_argument("--gpu-memory-fraction", type=float, default=None,
+                         help="Cap this process's share of GPU memory (e.g. 0.3) so several GPU "
+                             "jobs can share the card safely.")
     parser.add_argument("--prefetch-groups", type=int, default=3,
                          help="Download this many upcoming (iso/canon/distinct_id/book) groups in a "
                              "background thread while the current one aligns, so downloading and GPU "
@@ -111,6 +114,10 @@ def main():
     # Same machine tuning align_pipeline.py applies (conf/hw.local.json) --
     # without it this job ran with the built-in 2-minute model passes and
     # took ~6.5 GB of an 8 GB card shared with the Whisper backfill.
+    if args.gpu_memory_fraction:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, 0)
     hw = load_hw_config()
     if hw.get("mms_cpu"):
         mms_align_words._MMS_FORCE_CPU = True
@@ -131,6 +138,15 @@ def main():
         chapters = [c for c in chapters if (c["path"] if isinstance(c, dict) else c) not in excluded]
         if before - len(chapters) > 0:
             log(f"Excluded {before - len(chapters)} chapter(s) via --exclude-chapters-file")
+    if args.redo_older_method:
+        # Drop chapters already done with the current method up front, so a
+        # restart doesn't re-download their audio only to skip them.
+        before = len(chapters)
+        chapters = [c for c in chapters if alignment_method(
+            Path((c["path"] if isinstance(c, dict) else c).replace("_timing.json", "_words_quality.json"))
+        ) != ALIGNMENT_METHOD]
+        if before - len(chapters):
+            log(f"Skipping {before - len(chapters)} chapter(s) already aligned with {ALIGNMENT_METHOD}")
     if args.limit:
         chapters = chapters[: args.limit]
 
