@@ -156,7 +156,8 @@ def main():
     total_skipped = 0
     isos_touched_since_purge = set()
 
-    group_items = sorted(groups.items())
+    # Report order is the processing order (callers put priority work first).
+    group_items = list(groups.items())
 
     # One background thread (not several: download_job() shares module-level
     # stats and catalog caches) fetching the next few groups while the GPU
