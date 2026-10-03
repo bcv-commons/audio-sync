@@ -69,13 +69,15 @@ import os
 import re
 import sys
 import time
+
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mms_align_words import (
+    align_window,
+    compute_file_emission,
     load_audio,
     load_mms_model,
-    realign_from_point,
     select_device,
 )
 from obs_batch_manifest import fetch_story_text, get_stories, load_obs_batch
@@ -191,6 +193,16 @@ def segment_anchored_align(
     """
     waveform, sample_rate = load_audio(audio_path, bundle)
     total_duration = waveform.shape[1] / sample_rate
+    # One model pass for the whole story; every segment window below is a
+    # slice of this (see compute_file_emission).
+    emission = compute_file_emission(waveform, model)
+    del waveform
+    if next(model.parameters()).device.type == "mps":
+        try:
+            import torch
+            torch.mps.empty_cache()
+        except Exception:
+            pass
 
     word_counts = [len(s.split()) for s in segments]
     total_words = sum(word_counts) or 1
@@ -249,9 +261,9 @@ def segment_anchored_align(
             local_words = []
         else:
             try:
-                local_words = realign_from_point(
-                    waveform, sample_rate, win_start, seg_text,
-                    bundle, model, tokenizer, aligner, uroman, end_time=win_end,
+                local_words = align_window(
+                    emission, total_duration, win_start, win_end, seg_text,
+                    bundle, tokenizer, aligner, uroman,
                 )
             except RuntimeError as e:
                 # CTC forced-align raises (not returns a low score) when the
@@ -265,19 +277,6 @@ def segment_anchored_align(
                 # segment's edge case crash the whole story.
                 log(f"    segment {i + 1}: CTC align failed ({e}), using fallback", "WARNING")
                 local_words = []
-        # Release cached MPS memory after every windowed call — this loop
-        # runs up to ~50x per story (once per segment). process_chapter()
-        # in mms_align_words.py does this once per whole chapter; that's
-        # not enough here since we're not going through process_chapter()
-        # at all. Skipping this exhausted unified memory on a real sweep
-        # run (2026-08-05) — confirmed the fix, not just a guess.
-        if next(model.parameters()).device.type == "mps":
-            try:
-                import torch
-                torch.mps.empty_cache()
-            except Exception:
-                pass
-
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0
 

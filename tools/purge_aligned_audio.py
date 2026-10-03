@@ -38,7 +38,6 @@ Usage:
 """
 
 import argparse
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -52,23 +51,13 @@ def log(message: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {message}")
 
 
-def _has_real_timing(timing_path: Path) -> bool:
-    """True only if timing_path holds actual pos[] alignment data, not a
-    defer_to_dbt redirect placeholder (apply_arbiter_corrections.py's
-    whole-chapter-redirect mechanism) or any other non-timing shape.
-
-    Confirmed 2026-10-01: the old check (file exists + words.json exists)
-    would also purge audio for a just-redirected "pending real MMS redo"
-    chapter -- exactly the audio someone would want kept for re-alignment
-    or for comparing against DBT later, not safe-to-discard source
-    material at all. A redirect record existing at this path means we
-    have NOTHING of our own here, the opposite of "already aligned."
-    """
-    try:
-        data = json.loads(timing_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and "pos" in data
+# _has_real_timing() moved to chapter_state.has_real_timing() (2026-10-02)
+# -- same logic, now the one shared source of truth used by both purge
+# and the pipeline's own chapter-state classifier. Re-imported under its
+# old name so nothing else in this file needs to change.
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
+from chapter_state import has_real_timing as _has_real_timing  # noqa: E402
 
 
 def purge_iso_audio(iso: str, dry_run: bool = False) -> tuple[int, int]:

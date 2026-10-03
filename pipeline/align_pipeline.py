@@ -631,52 +631,14 @@ def publish_run():
 
 # ─── MMS work item builder ──────────────────────────────────────────────
 
-def needs_run(output_path: Path | None, *input_paths: Path | None, force: bool = False) -> bool:
-    """True if a step should (re-)run: its output is missing, --force was
-    passed, or any given input is newer than the output (stale).
-
-    Replaces three near-duplicate exists/force/staleness checks (Whisper/
-    MMS/Fusion) that grew independently in the main loop — Whisper and
-    MMS only ever checked existence (call with no input_paths); Fusion
-    also checks staleness against its MMS/Whisper inputs.
-    """
-    if output_path is None or not output_path.exists():
-        return True
-    if force:
-        return True
-    out_mtime = output_path.stat().st_mtime
-    return any(p and p.exists() and p.stat().st_mtime > out_mtime for p in input_paths)
-
-
-def _chapter_output_exists(
-    output_dir: Path, canon: str, iso: str, distinct_id: str, book: str, chapter: int,
-) -> bool:
-    """True if this chapter's alignment is already fully done — both
-    _timing.json and _words.json exist in export/timing-data/, for some
-    fileset. Glob-based rather than a reconstructed filename, same
-    approach tools/purge_aligned_audio.py already uses for its own
-    "is this chapter done" check, since the audio_fileset suffix varies
-    per edition and isn't known here without already having fetched the
-    chapter at least once.
-
-    Checked in the prefetch worker below, BEFORE ensure_chapter_ready(),
-    so a broader/later re-run (e.g. --books ALL after an earlier narrower
-    --books run already covered some chapters) doesn't re-download audio
-    that purge_aligned_audio.py already deleted for chapters there is no
-    further reason to touch. Without this, needs_run() still correctly
-    skips re-aligning such a chapter — but only after an unnecessary
-    network fetch already happened (confirmed real 2026-09-07: the fetch
-    layer only checks local file presence, not alignment completion).
-    """
-    book_dir = output_dir / canon / iso / distinct_id / book
-    if not book_dir.is_dir():
-        return False
-    prefix = f"{book}_{chapter:03d}_"
-    for timing_path in book_dir.glob(f"{prefix}*_timing.json"):
-        words_path = timing_path.with_name(timing_path.name.replace("_timing.json", "_words.json"))
-        if words_path.exists():
-            return True
-    return False
+# needs_run() / _chapter_output_exists() moved to chapter_state.py
+# (2026-10-02) -- re-exported here unchanged so every existing caller
+# (this module, tools/run_gpu_redo.py, shard_align.py, ...) keeps working
+# with no change at its own call site. chapter_state.py also adds the
+# DEFERRED state (a defer_to_dbt redirect) these two never had to
+# recognize on their own before -- see that module's own docstring.
+from chapter_state import chapter_fully_done as _chapter_output_exists  # noqa: E402,F401
+from chapter_state import needs_run  # noqa: E402,F401
 
 
 def _source_type_for(canon: str, iso: str, distinct_id: str) -> str:
@@ -809,7 +771,108 @@ def build_verse_item(chapter: dict, canon: str, iso: str, distinct_id: str, outp
 
 # ─── Main Pipeline ───────────────────────────────────────────────────────
 
+def run_obs_scope(args) -> None:
+    """OBS narration: a scope type of this same driver, not a separate
+    tool (2026-10-02, single-pipeline-plan.md's Phase 5). Shares model
+    loading, device selection, and the quarantine skip/clear hooks the
+    Bible chapter path already has. Deliberately does NOT share the
+    Bible path's template/batch/discovery machinery (door43 story
+    manifests have nothing in common with DBT templates/books) or its
+    checks/purge (check_timing_quality.py's is_legacy_format() already
+    excludes export/timing-data/obs/ on purpose -- OBS's pos/score/source
+    shape isn't the thing those checks look for; OBS audio lives under
+    downloads/obs/, a separate tree purge_aligned_audio.py never touches).
+
+    The alignment algorithm itself -- align_obs_words.py's
+    segment_anchored_align() -- is intentionally UNCHANGED and kept
+    separate from the Bible path's verse_anchored_align(). A pilot
+    (single-pipeline-plan-2026-10-02.md) found swapping them produces a
+    real, non-trivial timestamp divergence (up to ~5s on real data) with
+    no ground truth available to judge which is more correct for OBS
+    content -- that stays an open question, not something this
+    integration should quietly decide by routing through one or the other.
+    """
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from stall_quarantine import clear_tracking_on_success, is_quarantined
+    from align_obs_words import process_story, write_run_manifest as write_obs_run_manifest
+    from obs_batch_manifest import get_stories, load_obs_batch
+    from mms_align_words import load_mms_model, select_device
+
+    isos = [args.iso] if args.iso else [c.strip().lower() for c in args.iso_list.split(",") if c.strip()]
+
+    quarantined = [iso for iso in isos if is_quarantined(iso)]
+    if quarantined:
+        log(f"Skipping {len(quarantined)} quarantined language(s): {quarantined} "
+            f"(see _runs/stall_quarantine.json)")
+        isos = [iso for iso in isos if iso not in quarantined]
+    if not isos:
+        log("Nothing to do -- every requested iso is quarantined.")
+        return
+
+    log("=" * 70)
+    log("OBS Narration Alignment")
+    log("=" * 70)
+    log(f"OBS scope: {len(isos)} language(s){f', story {args.story}' if args.story else ''}")
+
+    bundle, model, tokenizer, aligner, uroman = load_mms_model(select_device(args.device))
+
+    run_results = []
+    failed_isos = set()
+    for iso in isos:
+        try:
+            batch = load_obs_batch(iso)
+        except Exception as e:
+            log(f"[{iso}] Could not load OBS batch: {e}", "ERROR")
+            failed_isos.add(iso)
+            continue
+
+        stories = get_stories(batch)
+        if args.story:
+            if args.story not in stories:
+                log(f"[{iso}] Story {args.story} not in batch", "ERROR")
+                failed_isos.add(iso)
+                continue
+            stories = {args.story: stories[args.story]}
+
+        config = load_language_config(iso)
+        log(f"[{iso}] {len(stories)} story/stories (source={batch.get('source_repo')}, "
+            f"license={batch.get('license')})")
+
+        for story_id in sorted(stories):
+            story_job = stories[story_id]
+            try:
+                stats = process_story(
+                    iso, story_id, story_job, batch, config,
+                    bundle, model, tokenizer, aligner, uroman, force=args.force,
+                )
+            except Exception as e:
+                log(f"[{iso}][{story_id}] ERROR: {e}", "ERROR")
+                run_results.append({"iso": iso, "story": story_id, "status": "failed", "error": str(e)})
+                failed_isos.add(iso)
+                continue
+            if stats.get("skipped"):
+                continue
+            if "error" in stats:
+                log(f"[{iso}][{story_id}] {stats['error']}", "WARN")
+                run_results.append({"iso": iso, "story": story_id, "status": "skipped", **stats})
+            else:
+                log(f"[{iso}][{story_id}] {stats['segments']} segments, "
+                    f"avg_score={stats['avg_score']}, fallbacks={stats['fallbacks']}")
+                run_results.append({"iso": iso, "story": story_id, "status": "ok", **stats})
+
+        if iso not in failed_isos:
+            clear_tracking_on_success(iso)
+
+    manifest_path = write_obs_run_manifest(run_results)
+    log(f"Run manifest written: {manifest_path} ({len(run_results)} result(s))")
+    log(f"Done -- {len(isos) - len(failed_isos)}/{len(isos)} language(s) OK"
+        + (f", {len(failed_isos)} had error(s)" if failed_isos else "") + ".")
+
+
 def main():
+
+
+
     hw = load_hw_config()
 
     parser = argparse.ArgumentParser(
@@ -851,6 +914,16 @@ Examples:
     )
     scope_group.add_argument("--book", type=str, default=None, help="Filter to a specific book (e.g. GEN)")
     scope_group.add_argument("--chapter", type=int, default=None, help="Filter to a specific chapter number")
+    scope_group.add_argument(
+        "--obs", action="store_true",
+        help="OBS narration scope instead of Bible chapters -- --iso/--iso-list select "
+             "OBS languages (from _obs_batches/<iso>.json) instead, and --story filters "
+             "to one story id. Same driver, same model load, same quarantine-skip/clear; "
+             "the alignment algorithm itself (segment_anchored_align) is intentionally "
+             "unchanged and separate from the Bible chapter path's verse_anchored_align "
+             "-- see single-pipeline-plan-2026-10-02.md's pilot finding for why.",
+    )
+    scope_group.add_argument("--story", type=str, default=None, help="With --obs: filter to one story id (e.g. 01)")
     scope_group.add_argument(
         "--exclude-distinct-id", type=str, default=None,
         help="Comma-separated distinct_id(s) to skip regardless of --iso/--iso-list "
@@ -979,6 +1052,15 @@ Examples:
     if not any([args.iso, args.iso_list, args.tier is not None, args.all]):
         parser.error("Specify at least one of: --iso, --iso-list, --tier, --all")
 
+    # OBS narration is a different scope entirely (door43 story manifests,
+    # not DBT templates/books) -- branch before any of the Bible-specific
+    # template/batch machinery below, which wouldn't make sense for it.
+    if args.obs:
+        if not (args.iso or args.iso_list):
+            parser.error("--obs requires --iso or --iso-list")
+        run_obs_scope(args)
+        return
+
     log("=" * 70)
     log("Unified Bible Audio Alignment Pipeline")
     log("=" * 70)
@@ -1039,6 +1121,24 @@ Examples:
 
     all_languages = load_priority_languages()
     languages = resolve_languages(args, all_languages)
+
+    # Consecutive-stall quarantine -- absorbed from shard_align.py
+    # (2026-10-02, removing that script's own parallelism per H3, but
+    # this per-language lifecycle check has nothing to do with sharding
+    # and belongs in the one driver regardless). See
+    # tools/stall_quarantine.py's own docstring for the 2026-09-16
+    # incident that motivated this: the same iso hanging at two
+    # consecutive stall-kills blocked every language behind it, since a
+    # restart always rescans the full list from #1.
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from stall_quarantine import is_quarantined
+    quarantined = [lang["iso"] for lang in languages if is_quarantined(lang["iso"])]
+    if quarantined:
+        log(f"Skipping {len(quarantined)} quarantined language(s) after repeated stalls: "
+            f"{quarantined} (see _runs/stall_quarantine.json; "
+            f"'python tools/stall_quarantine.py clear <iso>' once investigated)")
+        languages = [lang for lang in languages if lang["iso"] not in quarantined]
+
     log(f"Languages selected: {len(languages)}")
     for lang in languages:
         log(f"  {lang['iso']} ({lang['language']}) - tier {lang['tier']}")
@@ -1766,17 +1866,69 @@ Examples:
             # like something went wrong rather than "nothing to do."
             log("All chapters already processed")
 
-    # ── Purge source audio for every iso this run touched (opt-in) ──
-    if args.purge_audio and not args.dry_run:
+    # ── Per-language lifecycle: quality checks, quarantine-clear, purge ──
+    # Absorbed from shard_align.py (2026-10-02) along with the quarantine
+    # skip above -- same rationale, these never had anything to do with
+    # that script's parallelism, they were just bundled with it.
+    if not args.dry_run:
+        failed_isos_this_run = {
+            r["iso"] for r in run_results if r.get("status") in ("failed", "error")
+        }
         sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
-        from purge_aligned_audio import purge_iso_audio
+        from stall_quarantine import clear_tracking_on_success
+        from check_timing_quality import check_language
+        from check_verse_only_fallback import check_language_fallback
+
         for iso in sorted(total_stats["languages_processed"]):
+            if iso not in failed_isos_this_run:
+                clear_tracking_on_success(iso)
+
+            # Read-only quality check -- logs a warning if this language
+            # has real DUPES/BACKWARDS chapters (DUPES-EMPTY/-OK are
+            # benign, see check_timing_quality.py's check_language()).
+            # Deliberately does not auto-fix: not every flagged chapter
+            # is fixable by simply re-running (a genuine CTC-infeasible
+            # text/audio mismatch fails the same way every time,
+            # confirmed 2026-09-02 across por/bul/tur/kaz).
             try:
-                deleted, freed = purge_iso_audio(iso)
-                if deleted:
-                    log(f"  purged {deleted} now-aligned mp3(s) for {iso}, {freed / 1e9:.2f} GB freed")
+                result = check_language(iso, testament=None)
             except Exception as e:
-                log(f"  purge failed for {iso} (non-fatal): {e}")
+                log(f"  [{iso}] Quality check failed (non-fatal): {e}")
+            else:
+                if result and result["has_issues"]:
+                    log(f"  [{iso}] Quality check: {result['has_issues']}/{result['chapters']} "
+                        f"chapter(s) flagged (dupes={result['total_dupes']}, "
+                        f"backwards={result['total_backwards']}, low-score={result['total_low_q']}) "
+                        f"-- see 'python tools/check_timing_quality.py --iso {iso}' for detail")
+
+            # Verse-only-mode fallback check -- goes by actual output
+            # shape ("local"/"fallback" per-word source tags), which
+            # catches both a permanently-configured language and one
+            # align_pipeline.py auto-switched into it mid-run for just a
+            # few hard chapters. Confirmed 2026-09-03: a chapter can
+            # average a fine-looking score while whole verses are pure
+            # pace-estimates, invisible to the dupes/low-score check above.
+            try:
+                vo_result = check_language_fallback(iso, testament=None)
+            except Exception as e:
+                log(f"  [{iso}] Verse-only fallback check failed (non-fatal): {e}")
+            else:
+                if vo_result and vo_result["flagged_chapters"]:
+                    log(f"  [{iso}] Verse-only fallback check: {vo_result['flagged_chapters']}/"
+                        f"{vo_result['chapters']} chapter(s) at/above 20% fallback (overall "
+                        f"{vo_result['overall_fallback_rate']:.1%} of {vo_result['total_verses']} "
+                        f"verses) -- see 'python tools/check_verse_only_fallback.py --iso {iso}'")
+
+        # Purge source audio for every iso this run touched (opt-in).
+        if args.purge_audio:
+            from purge_aligned_audio import purge_iso_audio
+            for iso in sorted(total_stats["languages_processed"]):
+                try:
+                    deleted, freed = purge_iso_audio(iso)
+                    if deleted:
+                        log(f"  purged {deleted} now-aligned mp3(s) for {iso}, {freed / 1e9:.2f} GB freed")
+                except Exception as e:
+                    log(f"  purge failed for {iso} (non-fatal): {e}")
 
     # ── Summary ──
 

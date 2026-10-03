@@ -73,14 +73,13 @@ BATCH_ID=<id> make align            # steps 1–3 in one go
 BATCH_ID=<id> make align ARGS="--publish"   # ...and publish when done
 ```
 
-Or run the stages separately (useful for debugging or splitting work
-across steps):
+Or run just one stage (useful for debugging): `align_pipeline.py` takes
+`--skip-whisper`/`--skip-mms`/`--skip-fusion` flags directly, e.g.
+`BATCH_ID=<id> make align ARGS="--skip-mms --skip-fusion"` for transcription
+only. There's no separate step-only CLI -- one driver, one process, same
+model-loading cost either way.
 
 ```bash
-BATCH_ID=<id> make align-whisper    # step 1a: transcription only
-BATCH_ID=<id> make align-mms        # step 1b: forced alignment only
-BATCH_ID=<id> make align-fuse       # step 2:  fuse into final timing
-
 make publish-align                  # publish whatever's in export/ + _runs/
 make publish-align-dry              # same, but don't actually upload
 ```
@@ -177,7 +176,7 @@ Every machine tends to need different GPU/CPU tuning (Whisper model size,
 MMS chunk size, forcing CPU when VRAM is tight, ...). Rather than passing
 those as flags on every invocation, copy `conf/hw.local.json.example` to
 `conf/hw.local.json` (gitignored, machine-specific) and set them there —
-`make align`/`align-whisper`/`align-mms` all pick it up automatically, and
+`make align` picks it up automatically, and
 any CLI flag you do pass still overrides it for that one run. See the
 `_notes` block in the example file for what each setting does.
 

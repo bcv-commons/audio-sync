@@ -37,7 +37,7 @@ Usage:
     python align_verse_words.py --iso hin --book 1TH
 """
 
-import argparse
+import json
 import sys
 import time
 from datetime import datetime
@@ -46,9 +46,10 @@ from pathlib import Path
 from align_words import write_quality_json, write_timing_json, write_word_timing_json
 from gpu_health import CudaContextPoisonedError
 from mms_align_words import (
+    align_window,
+    compute_file_emission,
     load_audio,
     load_mms_model,
-    realign_from_point,
     select_device,
 )
 from text_processing import (
@@ -76,39 +77,57 @@ WINDOW_FRAC = 0.8
 MIN_WINDOW_SECONDS = 8.0
 MIN_LOCAL_SCORE = 0.35
 
-# torch.cuda.empty_cache() every single verse (~25.6 verses/chapter on
-# average here) is ~25x more frequent than the standard whole-chapter
-# path's once-per-chapter clear (mms_align_words.py's process_chapter()).
-# That per-window frequency was empirically justified on MPS (Apple
-# Silicon's unified memory, shared with the whole process including
-# Whisper's model — a real sweep run on 2026-08-05 confirmed exhaustion
-# without it; see align_obs_words.py's segment_anchored_align(), the
-# origin of this pattern) but was only ever extended to CUDA by caution,
-# not separately proven necessary at that frequency — CUDA has dedicated
-# VRAM, not memory shared with the rest of the process.
-#
-# A GPU-wedge cluster on this CUDA box (2026-08-13, internal-docs/
-# gpu-wedge-forensics.md Incidents 11-14) correlates suspiciously well
-# with this frequency: historical whole-chapter runs (this constant
-# doesn't apply to, once-per-chapter only) went 14-29+ hours before their
-# first wedge; this verse-only-mode workload wedged every 20-90 minutes —
-# roughly the same order of magnitude as the ~25x call-frequency gap.
-# Correlation, not proven causation — this constant makes it a real,
-# revertible experiment: clear every Nth verse instead of every verse,
-# bounding worst-case unreleased allocation the same way regardless of
-# chapter length (a fixed count, not "once per chapter", specifically
-# because OT chapter length varies enormously — PSA 117 is 2 verses, PSA
-# 119 is 176 — so tying the interval to chapter boundaries would leave
-# long outlier chapters accumulating far more unreleased allocations
-# before their first clear than short ones, the opposite of what a
-# fragmentation guard should do). CUDA only — MPS keeps clearing every
-# verse, since that's the frequency actually confirmed necessary.
-CUDA_EMPTY_CACHE_EVERY_N_VERSES = 25
+# Chapter gate (decided 2026-10-03 from a 121-language DBT comparison): a
+# chapter where more than GATE_MAX_LOW_SHARE of its verses score below
+# GATE_LOW_SCORE is not published as our own timing. In that sample, chapters
+# with no such verses had 3.5% of verses >1 s off DBT; chapters with 10-25%
+# had 28.5%, and above 25% had 55-72%. Raising the per-verse
+# MIN_LOCAL_SCORE to 0.5 instead was measured too and made things slightly
+# worse (interpolated verses are rarely right), so it stays at 0.35.
+GATE_LOW_SCORE = 0.5
+GATE_MAX_LOW_SHARE = 0.10
+
+
+def _usable_dbt_timing(audio_path: Path) -> bool:
+    """DBT's own verse timing for this exact audio fileset, if it is on disk
+    and plausible (non-zero, never going backwards)."""
+    dbt_path = audio_path.with_name(audio_path.stem + "_timing.json")
+    try:
+        entries = json.loads(dbt_path.read_text())
+        ts = [float(e["timestamp"]) for e in entries
+              if str(e.get("verse_start", "")).isdigit() and int(e["verse_start"]) >= 1]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return len(ts) >= 2 and max(ts) > 0 and all(b >= a for a, b in zip(ts, ts[1:]))
+
+
+def _defer_record(timing_path: Path, reason: str) -> dict:
+    p = timing_path
+    return {
+        "status": "defer_to_dbt", "reason": reason,
+        "canon": p.parent.parent.parent.parent.name, "iso": p.parent.parent.parent.name,
+        "distinct_id": p.parent.parent.name, "book": p.parent.name,
+        "chapter": p.name.split("_", 2)[1],
+        "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
 
 
 def log(message: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
+
+
+def _release_device_cache(model) -> None:
+    """Hand cached GPU memory back after the chapter's single model pass."""
+    device_type = next(model.parameters()).device.type
+    try:
+        import torch
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+        elif device_type == "mps":
+            torch.mps.empty_cache()
+    except Exception:
+        pass
 
 
 def verse_anchored_align(
@@ -133,6 +152,11 @@ def verse_anchored_align(
     """
     waveform, sample_rate = load_audio(audio_path, bundle)
     total_duration = waveform.shape[1] / sample_rate
+    # One model pass for the whole chapter; every verse window below is a
+    # slice of this (see compute_file_emission).
+    emission = compute_file_emission(waveform, model)
+    del waveform
+    _release_device_cache(model)
 
     # Pacing proxy for both the search-window anchor below and
     # _interpolate_fallback_runs()'s fallback interpolation: vowel count,
@@ -168,35 +192,15 @@ def verse_anchored_align(
             local_words = []
         else:
             try:
-                local_words = realign_from_point(
-                    waveform, sample_rate, win_start, verse_text,
-                    bundle, model, tokenizer, aligner, uroman, end_time=win_end,
+                local_words = align_window(
+                    emission, total_duration, win_start, win_end, verse_text,
+                    bundle, tokenizer, aligner, uroman,
                 )
             except CudaContextPoisonedError:
                 raise
             except RuntimeError as e:
                 log(f"    verse {i + 1}: CTC align failed ({e}), using fallback", "WARNING")
                 local_words = []
-
-        device_type = next(model.parameters()).device.type
-        if device_type == "mps":
-            try:
-                import torch
-                torch.mps.empty_cache()
-            except Exception:
-                pass
-        elif device_type == "cuda":
-            # Every Nth verse, not every verse — see
-            # CUDA_EMPTY_CACHE_EVERY_N_VERSES's docstring. Always clears on
-            # the chapter's last verse too, so a short final stretch never
-            # goes uncleared into the next chapter's allocations.
-            is_last_verse = i == len(non_empty_verses) - 1
-            if (i + 1) % CUDA_EMPTY_CACHE_EVERY_N_VERSES == 0 or is_last_verse:
-                try:
-                    import torch
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
 
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0
@@ -228,9 +232,9 @@ def verse_anchored_align(
                 alt_win_end = min(total_duration, alt_win_start + min_required)
             if alt_win_end - alt_win_start >= 1.0 and (alt_win_start, alt_win_end) != (win_start, win_end):
                 try:
-                    alt_words = realign_from_point(
-                        waveform, sample_rate, alt_win_start, verse_text,
-                        bundle, model, tokenizer, aligner, uroman, end_time=alt_win_end,
+                    alt_words = align_window(
+                        emission, total_duration, alt_win_start, alt_win_end, verse_text,
+                        bundle, tokenizer, aligner, uroman,
                     )
                 except CudaContextPoisonedError:
                     raise
@@ -270,9 +274,9 @@ def verse_anchored_align(
                 narrow_words, narrow_avg = [], 0.0
                 if narrow_end - narrow_start >= 1.0:
                     try:
-                        narrow_words = realign_from_point(
-                            waveform, sample_rate, narrow_start, verse_text,
-                            bundle, model, tokenizer, aligner, uroman, end_time=narrow_end,
+                        narrow_words = align_window(
+                            emission, total_duration, narrow_start, narrow_end, verse_text,
+                            bundle, tokenizer, aligner, uroman,
                         )
                     except CudaContextPoisonedError:
                         raise
@@ -514,8 +518,21 @@ def process_chapter_verse_only(
         },
     }
 
-    write_timing_json(timing, timing_path)
-    write_word_timing_json(word_timing, words_path)
+    low_share = sum(1 for r in results if r["local_score"] < GATE_LOW_SCORE) / len(results)
+    gate = "pass"
+    if low_share > GATE_MAX_LOW_SHARE:
+        gate = "defer_to_dbt" if _usable_dbt_timing(Path(audio_path)) else "held_back"
+    word_quality["summary"]["low_score_share"] = round(low_share, 3)
+    word_quality["summary"]["gate"] = gate
+
+    if gate == "defer_to_dbt":
+        record = _defer_record(Path(timing_path), f"chapter gate: {low_share:.0%} of verses scored below {GATE_LOW_SCORE}")
+        Path(timing_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(timing_path).write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+        Path(words_path).write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+    else:
+        write_timing_json(timing, timing_path)
+        write_word_timing_json(word_timing, words_path)
     write_quality_json(word_quality, quality_path)
 
     local_scores = [r["local_score"] for r in results if r["source"] == "local"]
@@ -524,71 +541,5 @@ def process_chapter_verse_only(
         "avg_score": round(sum(local_scores) / len(local_scores), 3) if local_scores else 0.0,
         "fallbacks": fallback_count,
         "elapsed": round(elapsed, 1),
+        "gate": gate,
     }
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Verse-anchored MMS-only alignment (no Whisper)")
-    parser.add_argument("--iso", required=True, help="Language ISO 639-3 code (e.g. hin)")
-    parser.add_argument("--distinct-id", required=True, help="Fileset distinct_id (e.g. HINBIB)")
-    parser.add_argument("--book", required=True, help="Book code (e.g. 1TH)")
-    parser.add_argument("--canon", type=str, default="nt", choices=["nt", "ot"])
-    parser.add_argument("--chapter", type=int, default=None, help="Single chapter number (default: all in book)")
-    parser.add_argument("--force", action="store_true", help="Re-align even if output exists")
-    parser.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
-    args = parser.parse_args()
-
-    from align_pipeline import needs_run
-    from whisper_transcribe import discover_chapter_files
-
-    config = load_language_config(args.iso)
-    bundle, model, tokenizer, aligner, uroman = load_mms_model(select_device(args.device))
-
-    required = {args.book: {args.chapter}} if args.chapter is not None else {args.book: set(range(1, 200))}
-    chapters, _skipped = discover_chapter_files(
-        args.iso, args.canon, args.distinct_id, OUTPUT_DIR, force=args.force, required_chapters=required,
-    )
-    if not chapters:
-        log(f"No chapters discovered for {args.iso}/{args.canon}/{args.distinct_id}/{args.book} "
-            "— check downloads/BB/ for this edition", "ERROR")
-        sys.exit(1)
-
-    run_results = []
-    for chapter in chapters:
-        book = chapter["book"]
-        ch_num = chapter["chapter"]
-        chapter_str = chapter["chapter_str"]
-        audio_fileset = chapter["audio_fileset"]
-        canon = args.canon
-        iso = args.iso
-        distinct_id = args.distinct_id
-
-        out_book_dir = OUTPUT_DIR / canon / iso / distinct_id / book
-        timing_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_timing.json"
-        words_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_words.json"
-        quality_path = Path(str(words_path).replace("_words.json", "_words_quality.json"))
-
-        if not needs_run(timing_path, force=args.force):
-            log(f"{book} {ch_num}: skipped (exists)")
-            continue
-
-        item = {
-            "book": book, "chapter": ch_num, "chapter_str": chapter_str,
-            "audio_path": chapter["audio_path"], "text_path": chapter["text_path"],
-            "timing_path": timing_path, "words_path": words_path, "quality_path": quality_path,
-        }
-        log(f"{book} {ch_num}: aligning (verse-only, MMS)...")
-        stats = process_chapter_verse_only(item, bundle, model, tokenizer, aligner, uroman, config)
-        if "error" in stats:
-            log(f"{book} {ch_num}: ERROR: {stats['error']}", "ERROR")
-            run_results.append({"book": book, "chapter": ch_num, "status": "failed", "error": stats["error"]})
-            continue
-        log(f"{book} {ch_num}: {stats['verses']} verses, avg_score={stats['avg_score']}, "
-            f"fallbacks={stats['fallbacks']}, {stats['elapsed']}s")
-        run_results.append({"book": book, "chapter": ch_num, "status": "ok", **stats})
-
-    log(f"Done: {len(run_results)} chapter(s) processed")
-
-
-if __name__ == "__main__":
-    main()

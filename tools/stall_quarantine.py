@@ -120,9 +120,11 @@ def is_quarantined(iso: str) -> bool:
 
 
 def clear_tracking_on_success(iso: str) -> None:
-    """Call from shard_align.py right after an iso finishes OK — a
-    language that's since proven it can complete shouldn't have an old,
-    resolved stall count held against it indefinitely."""
+    """Call right after an iso finishes OK (align_pipeline.py's own
+    per-language lifecycle block, since 2026-10-02 -- previously only
+    shard_align.py called this) -- a language that's since proven it can
+    complete shouldn't have an old, resolved stall count held against it
+    indefinitely."""
     tracking = _load(TRACKING_PATH)
     if iso in tracking:
         del tracking[iso]

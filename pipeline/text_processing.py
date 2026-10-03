@@ -9,6 +9,7 @@ Language-specific rules (pronunciation maps, marker patterns, character
 replacements) are loaded from TOML config files in config/languages/.
 """
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -171,6 +172,101 @@ def strip_markers(text: str, config: LanguageConfig) -> str:
     return text.strip()
 
 
+def _is_sofria_json(raw: str) -> bool:
+    """True if raw looks like a Proskomma "sofria" nested-USJ document
+    rather than plain line-per-verse text.
+
+    Confirmed 2026-10-02: DBT's JSON/USX text filesets are downloaded and
+    written verbatim as the ".txt" file by download_language_content.py's
+    download_text() (type == "path" branch) -- no extraction ever
+    happened. 1,365 chapters across 10 isos (adx, bpx, fuh, hak, kmh, mai,
+    por, sdq, syl, tzm) carry this raw JSON under a .txt extension today,
+    named with a telltale "-json" fileset-tag suffix. Without this check,
+    read_verse_texts() below silently misreads the whole JSON blob as
+    "one giant verse" (its schema/metadata keys leaking in as "text"),
+    which is exactly what produced a ~29,000-character pseudo-verse for
+    adx/ADXNVS PSA 119 -- windowed against the full chapter's audio, that
+    fed CTC forced_align() a cells count large enough to segfault
+    (confirmed via PYTHONFAULTHANDLER=1). Root cause was the missing
+    parse, not chapter length.
+    """
+    stripped = raw.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    constraints = data.get("schema", {}).get("constraints", [])
+    return any(c.get("name") == "sofria" for c in constraints if isinstance(c, dict))
+
+
+def _parse_sofria_json(raw: str) -> dict[str, str]:
+    """Extract {verse_number_str: plain_text} from a sofria/USJ document.
+
+    Walks the nested block/wrapper/mark/graft tree (see Proskomma's own
+    "sofria" schema): a "wrapper" with subtype "verses" opens at a nested
+    "mark" with subtype "verses_label" (atts.number is the verse number)
+    and its own plain-string content is that verse's text. A "graft" --
+    footnotes, headings, cross-references -- is always a SEPARATE
+    sub-sequence, never part of the enclosing verse's spoken text, so it
+    is skipped entirely rather than descended into. A combined-verse
+    label (e.g. "3-4") files its text under the first number in the
+    range -- not yet confirmed against a real example, kept simple until
+    one surfaces.
+
+    This is a focused verse-text extractor, not a full renderer. For the
+    authoritative, more complete walk of this same schema (handles
+    tables, milestones, meta_content -- none seen in this corpus so far),
+    see bcv-commons/bcv-query's node_modules/proskomma-json-tools
+    (render/renderers/SofriaRenderFromJson.js) -- a generic Node.js event
+    walker over the identical block/content/graft/mark shape this
+    function reads. Reconcile against it if a chapter's extracted verse
+    text ever looks wrong in a way this function's simpler rules don't
+    explain.
+    """
+    verses: dict[str, list[str]] = {}
+    current_verse: str | None = None
+
+    def walk_content(items) -> None:
+        nonlocal current_verse
+        for item in items:
+            if isinstance(item, str):
+                if current_verse is not None and item.strip():
+                    verses.setdefault(current_verse, []).append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "graft":
+                continue
+            if item_type == "mark":
+                if item.get("subtype") == "verses_label":
+                    number = str(item.get("atts", {}).get("number", ""))
+                    current_verse = number.split("-")[0] or None
+                continue
+            if "content" in item:
+                walk_content(item["content"])
+
+    def walk_blocks(blocks) -> None:
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "graft":
+                continue
+            if "content" in block:
+                walk_content(block["content"])
+            elif "blocks" in block:
+                walk_blocks(block["blocks"])
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    walk_blocks(data.get("sequence", {}).get("blocks", []))
+    return {k: " ".join(v).strip() for k, v in verses.items() if v}
+
+
 def read_verse_texts(text_path: Path, config: LanguageConfig) -> list[str]:
     """Read a reference text file into one string per verse.
 
@@ -205,8 +301,15 @@ def read_verse_texts(text_path: Path, config: LanguageConfig) -> list[str]:
     fewer physical lines than DBT's verse count), unaffected by this
     change either way.
     """
+    raw = text_path.read_text(encoding="utf-8")
+
+    if _is_sofria_json(raw):
+        by_number = _parse_sofria_json(raw)
+        ordered = sorted(by_number.items(), key=lambda kv: int(kv[0]))
+        return [strip_markers(v, config) for _, v in ordered]
+
     verses: list[str] = []
-    for raw_line in text_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in raw.splitlines():
         if not raw_line.strip():
             continue
         if raw_line[:1].isspace():

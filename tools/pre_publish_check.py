@@ -152,6 +152,17 @@ def is_legacy_format(timing_path: Path) -> bool:
     return isinstance(data, list)
 
 
+def is_held_back(quality_path: Path) -> bool:
+    """True if the verse-only chapter gate held this chapter back (too many
+    low-score verses and no usable DBT timing to defer to) -- see
+    align_verse_words.py's GATE_LOW_SCORE / GATE_MAX_LOW_SHARE."""
+    try:
+        with open(quality_path) as f:
+            return (json.load(f).get("summary") or {}).get("gate") == "held_back"
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
@@ -174,6 +185,11 @@ def main():
         for qf in sorted(TIMING_DIR.rglob("*_words_quality.json"))
         if has_fallback_corruption(qf)
     ]
+    held_stems = [
+        qf.stem.replace("_words_quality", "")
+        for qf in sorted(TIMING_DIR.rglob("*_words_quality.json"))
+        if is_held_back(qf)
+    ]
     legacy_stems = [
         tf.stem.replace("_timing", "")
         for tf in sorted(TIMING_DIR.rglob("*_timing.json"))
@@ -182,7 +198,7 @@ def main():
 
     # Union — a chapter can in principle trip more than one check; the
     # exclude list only needs each stem once regardless of how many reasons.
-    all_stems = sorted(set(backwards_stems) | set(fallback_stems) | set(legacy_stems))
+    all_stems = sorted(set(backwards_stems) | set(fallback_stems) | set(legacy_stems) | set(held_stems))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # One glob pattern per chapter, matches all its output files
@@ -200,6 +216,8 @@ def main():
         _print_flagged("a backwards timestamp jump", backwards_stems)
     if fallback_stems:
         _print_flagged("fallback/failure collapse (near-total null/zero-score alignment)", fallback_stems)
+    if held_stems:
+        _print_flagged("too many low-score verses (chapter gate, no DBT timing to defer to)", held_stems)
     if legacy_stems:
         _print_flagged("legacy pre-compact-format timing.json", legacy_stems)
 

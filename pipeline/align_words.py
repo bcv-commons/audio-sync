@@ -33,7 +33,6 @@ Usage:
     python align_words.py --iso heb --book GEN --chapter 17
 """
 
-import argparse
 import difflib
 import json
 from datetime import datetime
@@ -1628,93 +1627,3 @@ def process_chapter(item: dict, config: LanguageConfig, mms_components=None) -> 
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Fuse Whisper + MMS word timelines into verse timing",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    parser.add_argument("--iso", type=str, default="heb", help="ISO 639-3 code (default: heb)")
-    parser.add_argument("--testament", type=str, choices=["nt", "ot", "both"], default=None,
-                        help="Which testament to process (default: all available)")
-    parser.add_argument("--book", type=str, default=None, help="Filter to a specific book (e.g. GEN)")
-    parser.add_argument("--chapter", type=int, default=None, help="Filter to a specific chapter number")
-    parser.add_argument("--force", action="store_true", help="Re-align even if output exists")
-    parser.add_argument("--redo-no-quality", action="store_true",
-                        help="Re-fuse only chapters that have timing but no quality file")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
-
-    args = parser.parse_args()
-
-    log("=" * 60)
-    log(f"Word Alignment Fusion — {args.iso}")
-    log("=" * 60)
-
-    config = load_language_config(args.iso)
-
-    items = discover_work_items(
-        iso=args.iso,
-        testament=args.testament,
-        force=args.force,
-        redo_no_quality=args.redo_no_quality,
-        book_filter=args.book,
-        chapter_filter=args.chapter,
-    )
-
-    if not items:
-        log("No chapters to process (no word timing data or all done)")
-        return
-
-    log(f"Found {len(items)} chapter(s) to align")
-
-    if args.dry_run:
-        for item in items:
-            sources = []
-            if item["mms_path"]:
-                sources.append("MMS")
-            if item["whisper_path"]:
-                sources.append("Whisper")
-            ref_status = "OK" if item["ref_text_path"] else "MISSING ref"
-            log(f"  {item['book']} {item['chapter']} ({item['distinct_id']}) — "
-                f"sources: {'+'.join(sources)}, ref: {ref_status}")
-        return
-
-    processed = 0
-    failed = 0
-
-    for idx, item in enumerate(items):
-        book = item["book"]
-        ch = item["chapter"]
-        label = f"[{idx + 1}/{len(items)}] {book} {ch}"
-
-        try:
-            stats = process_chapter(item, config)
-            if "error" in stats:
-                log(f"{label} — {stats['error']}", "ERROR")
-                failed += 1
-            else:
-                parts = [f"{stats['verses']} verses", f"source={stats['source']}"]
-                if stats["mms_score"] is not None:
-                    parts.append(f"mms_score={stats['mms_score']}")
-                if stats.get("whisper_score") is not None:
-                    parts.append(f"whisper_score={stats['whisper_score']}")
-                if stats.get("fusion"):
-                    fs = stats["fusion"]
-                    parts.append(
-                        f"fusion: {fs['from_whisper']}/{fs['total_words']} from whisper (fallback)"
-                    )
-                    if fs.get("mono_fixes", 0) > 0:
-                        parts.append(f"{fs['mono_fixes']} mono fixes")
-                log(f"{label} — {', '.join(parts)}")
-                processed += 1
-        except Exception as e:
-            log(f"{label} — Failed: {e}", "ERROR")
-            failed += 1
-
-    log("")
-    log(f"Done: {processed} aligned, {failed} failed")
-
-
-if __name__ == "__main__":
-    main()

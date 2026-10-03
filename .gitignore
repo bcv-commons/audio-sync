@@ -72,3 +72,11 @@ hays_audio/
 # not source.
 *.deb
 _compare/
+
+# Nested worktree for the single-pipeline refactor (moved in from a sibling
+# dir 2026-10-02 so Claude's sandboxed Read/Edit tools, scoped to the
+# primary working directory, can reach it directly).
+/.worktrees/
+
+# Real-audio test fixtures (~18 MB) -- kept locally for manual re-verification, not in git.
+tests/fixtures/

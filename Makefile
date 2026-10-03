@@ -3,11 +3,11 @@ PIPELINE := pipeline
 CONF := conf
 TOOLS := tools
 
-.PHONY: all align align-whisper align-mms align-fuse \
+.PHONY: all align align-obs stage-obs \
         import-contrib prepare-cross-source \
         publish-align publish-align-dry \
         quality-check quality-compare quality-report \
-        install check help
+        install check clean help
 
 help: ## Show available targets
 	@echo "audio-sync — Bible audio alignment pipeline"
@@ -17,12 +17,9 @@ help: ## Show available targets
 	@echo ""
 	@echo "  Alignment pipeline"
 	@echo "  ──────────────────"
-	@echo "  make align          Full pipeline (whisper → mms → fuse)"
-	@echo "  make align-parallel Full pipeline, sharded across N workers by chapter count"
-	@echo "                      (N = conf/hw.local.json's parallel_workers, default 1)"
-	@echo "  make align-whisper  Step 1a: Whisper transcription"
-	@echo "  make align-mms      Step 1b: MMS forced alignment"
-	@echo "  make align-fuse     Step 2:  Fuse Whisper + MMS into final timing"
+	@echo "  make align          Full pipeline (whisper -> mms -> fuse)"
+	@echo "  make align-obs      OBS narration batch -- stage new languages, align all"
+	@echo "  make stage-obs      Stage/refresh _obs_batches/<iso>.json manifests from Door43"
 	@echo ""
 	@echo "  Content preparation"
 	@echo "  ────────────────────"
@@ -47,7 +44,7 @@ help: ## Show available targets
 	@echo ""
 	@echo "  Pass extra args via ARGS, e.g.:"
 	@echo "    make align ARGS=\"--iso heb\""
-	@echo "    make align-whisper ARGS=\"--iso heb --template John\""
+	@echo "    make align ARGS=\"--iso heb --template John --skip-mms --skip-fusion\""
 
 # ---------------------------------------------------------------------------
 # Alignment pipeline
@@ -55,18 +52,6 @@ help: ## Show available targets
 
 align: ## Full alignment pipeline (whisper → mms → fuse)
 	$(PYTHON) $(PIPELINE)/align_pipeline.py $(ARGS)
-
-align-parallel: ## Full pipeline, sharded across N workers (see conf/hw.local.json's parallel_workers)
-	$(PYTHON) $(PIPELINE)/shard_align.py $(ARGS)
-
-align-whisper: ## Step 1a: Whisper transcription
-	$(PYTHON) $(PIPELINE)/whisper_transcribe.py $(ARGS)
-
-align-mms: ## Step 1b: MMS forced alignment
-	$(PYTHON) $(PIPELINE)/mms_align_words.py $(ARGS)
-
-align-fuse: ## Step 2: Fuse Whisper + MMS into final timing
-	$(PYTHON) $(PIPELINE)/align_words.py $(ARGS)
 
 align-obs: ## OBS narration batch — stage new languages, align all sequentially
 	internal-scripts/run-obs-batch.sh
