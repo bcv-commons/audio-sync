@@ -34,6 +34,13 @@ tracker pattern, but deliberately does NOT touch any config/languages/
 than this backfill's job (add Whisper evidence where it's missing) and
 stays a human call.
 
+Non-DBT editions (config/helloao.toml, e.g. eng/ENGBSBHAY = helloAO BSB
+read by Hays): audio and text come from helloAO instead of DBT, into
+downloads/helloao/aligned/; their audio is deleted right after transcription
+(purge_iso_audio() only sweeps downloads/BB), the text is kept for fusion.
+Added 2026-10-03 after all 260 ENGBSBHAY chapters failed with "no audio
+available".
+
 Disk safety: mirrors tools/run_gpu_redo.py -- audio for this population
 was already purged once (that's WHY it needs re-download at all; MMS
 alignment completed for all of it already), so purge each language's
@@ -75,6 +82,13 @@ from whisper_quality_guard import (  # noqa: E402
 from download_language_content import ensure_chapter_ready  # noqa: E402
 from text_processing import load_language_config  # noqa: E402
 from purge_aligned_audio import purge_iso_audio  # noqa: E402
+from remote_audio import ensure_chapter_audio, manual_import_audio_info  # noqa: E402
+
+# Editions whose audio is not a DBT fileset (config/helloao.toml, e.g.
+# eng/ENGBSBHAY = helloAO "BSB" read by Hays) live here, same layout as
+# whisper_transcribe._find_base_dir() expects. DBT's fetch can never find
+# them, so they take the helloAO route below instead.
+NON_DBT_BASE = Path("downloads/helloao/aligned")
 
 WORD_TIMING_DIR = Path("word-timing-data")
 
@@ -159,6 +173,8 @@ def audio_and_text_paths(tf: Path, testament: str) -> tuple[Path | None, Path | 
     parts = stem.split("_", 2)
     chapter_str = parts[1]
     book_dir = DOWNLOADS_DIR / canon / iso / distinct_id / book
+    if manual_import_audio_info(distinct_id):
+        book_dir = NON_DBT_BASE / canon / iso / distinct_id / book
     audio_matches = list(book_dir.glob(f"{book}_{chapter_str}_*.mp3")) if book_dir.exists() else []
     text_matches = list(book_dir.glob(f"{book}_{chapter_str}_*.txt")) if book_dir.exists() else []
     return (
@@ -166,6 +182,24 @@ def audio_and_text_paths(tf: Path, testament: str) -> tuple[Path | None, Path | 
         text_matches[0] if text_matches else None,
         canon, distinct_id, book, chapter_str,
     )
+
+
+def _fetch_non_dbt_chapter(info: dict, canon: str, iso: str, distinct_id: str,
+                           book: str, chapter_str: str) -> bool:
+    """Audio + text for an edition served by helloAO instead of DBT.
+    Text is written as {BOOK}_{CCC}_{TRANSLATION}_ET.txt next to the audio,
+    where fusion_only_redo.py / discover_chapter_files() look for it."""
+    from download_language_content import _fetch_helloao_chapter
+    book_dir = NON_DBT_BASE / canon / iso / distinct_id / book
+    book_dir.mkdir(parents=True, exist_ok=True)
+    ch = int(chapter_str)
+    audio_ok = ensure_chapter_audio(book_dir / f"{book}_{chapter_str}_{distinct_id}.mp3", book, ch)
+    text_ok = _fetch_helloao_chapter(info["translation"], book, ch,
+                                     book_dir / f"{book}_{chapter_str}_{info['translation']}_ET.txt")
+    if not (audio_ok and text_ok):
+        log(f"  {iso}/{distinct_id} {book} {chapter_str}: helloAO fetch failed "
+            f"(audio={audio_ok}, text={text_ok})")
+    return audio_ok and text_ok
 
 
 def main():
@@ -231,7 +265,13 @@ def main():
                 break
 
             audio_path, text_path, canon, distinct_id, book, chapter_str = audio_and_text_paths(tf, args.testament)
-            if audio_path is None:
+            non_dbt = manual_import_audio_info(distinct_id)
+            if audio_path is None and non_dbt:
+                fetched = _fetch_non_dbt_chapter(non_dbt, canon, iso, distinct_id, book, chapter_str)
+                audio_path, text_path, *_ = audio_and_text_paths(tf, args.testament)
+                if not fetched:
+                    audio_path = None
+            elif audio_path is None:
                 try:
                     ensure_chapter_ready(iso, canon, distinct_id, book, int(chapter_str))
                 except Exception as e:
@@ -280,6 +320,10 @@ def main():
                 write_whisper_words_json(words, book, chapter_str, wp)
                 total_ok += 1
                 iso_ok += 1
+            if non_dbt:
+                # purge_iso_audio() only sweeps downloads/BB; fusion needs the
+                # text (kept), not the audio.
+                audio_path.unlink(missing_ok=True)
 
             processed += 1
 

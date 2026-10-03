@@ -63,18 +63,18 @@ from vowel_pacing import count_vowels
 DOWNLOADS_DIR = Path("downloads/BB")
 OUTPUT_DIR = Path("export/timing-data")
 
-# WINDOW_FRAC/MIN_LOCAL_SCORE reused as-is from align_obs_words.py's sweep —
-# both are shape-invariant (proportional windowing; confidence threshold).
-# MIN_WINDOW_SECONDS is NOT reused as-is: OBS segments are multi-sentence
-# narration beats where exp_dur*0.8 usually already exceeds 20s, so the
-# floor rarely binds. A short Bible verse's exp_dur*0.8 is often far below
-# that, so a 20s floor would dominate for most verses — oversized windows
-# relative to verse length, risking the exact adjacent-window-collision
-# failure mode the causal floor exists to prevent. Needs a real sweep
-# against Hindi verse-length audio (see pending work) before being trusted;
-# this starting value is a placeholder, not a calibrated result.
-WINDOW_FRAC = 0.8
-MIN_WINDOW_SECONDS = 8.0
+# Search window around each verse's pace-estimated position. Wide on
+# purpose (2026-10-03): with wildcard-padded alignment the neighbours' speech
+# inside the window is absorbed by <star> instead of smearing this verse, so
+# a wide window costs nothing -- while a narrow one silently fails whenever
+# the reading runs ahead of the pace estimate and the window starts after the
+# verse does (acn ACT 9: eight verses 4-12 s late). Measured against DBT on
+# 340 chapters / 12,349 verses / 154 languages: verses >1 s off went from
+# 11.7% (0.8 / 8 s, the pre-padding values) to 6.6% (2.0 / 20 s); chapters
+# failing the chapter gate 55 -> 26; better in 67 languages, worse in 7
+# (all by a few verses).
+WINDOW_FRAC = 2.0
+MIN_WINDOW_SECONDS = 20.0
 MIN_LOCAL_SCORE = 0.35
 
 # Written to every chapter's quality file (summary.method). Bump it whenever
@@ -82,7 +82,8 @@ MIN_LOCAL_SCORE = 0.35
 # (tools/run_gpu_redo.py --redo-older-method) selects on it.
 #   anchored-star-v1 (2026-10-03): wildcard-padded windows, emission once
 #   per chapter, two-sided chunk context, chapter gate.
-ALIGNMENT_METHOD = "anchored-star-v1"
+#   anchored-star-v2 (2026-10-03): wide search windows (see WINDOW_FRAC).
+ALIGNMENT_METHOD = "anchored-star-v2"
 
 # Chapter gate (decided 2026-10-03 from a 121-language DBT comparison): a
 # chapter where more than GATE_MAX_LOW_SHARE of its verses score below

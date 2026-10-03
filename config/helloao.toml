@@ -34,5 +34,16 @@
 # edition already follows. export/timing-data/{nt,ot}/eng/ already
 # renamed to match (align/ republished under the new path, old BSBHAY
 # path retired).
+#
+# Non-DBT audio: every tool that fetches audio must take the helloAO route
+# for editions listed here -- DBT's fetch (download_language_content.py
+# ensure_chapter_ready) can never find them. Confirmed 2026-10-03: the
+# Whisper backfill failed all 260 ENGBSBHAY NT chapters ("no audio
+# available") until tools/whisper_backfill.py learned this route
+# (remote_audio.manual_import_audio_info -> ensure_chapter_audio +
+# helloAO text into downloads/helloao/aligned/{canon}/{iso}/{distinct_id}/).
+# align_pipeline.py already handles it (remote_audio.ensure_chapter_audio);
+# tools/run_gpu_redo.py does not (it only redoes verse-only/dramatized
+# output, which this edition is not).
 [translations.BSB.readers.hays]
 distinct_id = "ENGBSBHAY"
