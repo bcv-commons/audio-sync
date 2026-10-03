@@ -43,8 +43,9 @@ core (elsewhere) → batch manifest → this repo → CDN
 
    There is currently no automatic "keep pulling the next manifest off the
    queue" loop — you (or a cron job / shell loop, see below) need to supply
-   a `BATCH_ID` each time. Picking up whatever is next in the queue
-   automatically is planned but not built yet.
+   a `BATCH_ID` each time. In practice every run so far has been started
+   directly with `--iso` / `--iso-list` (or from a hand-written
+   `_batches/<name>.json`); core has not yet published to the CDN queue.
 
 2. **Fetch audio + text.** For each job in the manifest,
    `download_language_content.py` fetches the DBT audio/text fileset for
@@ -57,6 +58,7 @@ core (elsewhere) → batch manifest → this repo → CDN
 3. **Align.** `align_pipeline.py` runs Whisper transcription, MMS forced
    alignment, and fusion for every chapter in the batch, writing
    `_timing.json`/`_words.json` files to `export/timing-data/`.
+   See "How chapters are aligned" below for the two modes.
 
 4. **Publish.** The pipeline writes a run manifest to `_runs/<batch_id>.json`
    (per-chapter status, alignment scores) and — if asked to — uploads both
@@ -65,6 +67,46 @@ core (elsewhere) → batch manifest → this repo → CDN
 
 Once published, this repo's job for that batch is done. Nothing here
 needs to stay running for the results to be usable.
+
+## How chapters are aligned
+
+There are two modes, chosen per language (`verse_only_mode` in
+`pipeline/config/languages/<iso>.toml`) and per recording:
+
+- **Fusion mode** (default): Whisper transcribes the chapter, MMS
+  force-aligns the whole chapter's text, and fusion merges the two.
+- **Verse-only mode** (languages Whisper can't handle, set automatically
+  for 175+ languages, and every dramatized `2DA`/`2SA` recording): each
+  verse is aligned on its own inside a search window around where reading
+  pace says it should be (`align_verse_words.py`). The verse's text is
+  padded with MMS's `<star>` wildcard so the neighbouring verses' speech in
+  the window is absorbed instead of smearing the verse. The model runs once
+  per chapter and each window is a slice of that output. OBS stories use
+  the same approach per segment (`align_obs_words.py`).
+
+Verse-only output carries a few extra safeguards:
+
+- **Chapter gate.** If more than 10% of a chapter's verses score below 0.5,
+  the chapter is not published as our own timing. If DBT has usable timing
+  for the same recording, the chapter is written as a `defer_to_dbt`
+  record pointing clients at DBT; otherwise it is written but marked
+  `gate: held_back`, and `tools/pre_publish_check.py` keeps it off the CDN.
+- **Method tag.** Each chapter's local `_words_quality.json` records the
+  method that produced it (`summary.method`, see `ALIGNMENT_METHOD` in
+  `align_verse_words.py`). Bump it when a change makes old output worth
+  redoing; `tools/run_gpu_redo.py --redo-older-method` then re-aligns
+  exactly the chapters with an older tag (backing up the old files with
+  `--backup-dir`), so long redo runs can be stopped and resumed freely.
+- **Non-DBT audio.** Editions listed in `config/helloao.toml` (e.g. BSB read
+  by Hays, `eng/ENGBSBHAY`) get their audio from helloAO, not DBT; every
+  tool that fetches audio must take that route for them.
+
+Long-running jobs are started from `tools/` (`run_gpu_redo.py` with
+`run_gpu_redo_supervisor.py`, `whisper_backfill.py` with
+`fusion_sweep_watcher.py`); `tools/diag/redo_spot_check.py` summarizes a
+running redo per language. Plans and measurements behind all of this:
+`internal-docs/alignment-fix-rollout-plan-2026-10-02.md` and
+`internal-docs/single-pipeline-plan-2026-10-02.md`.
 
 ## Running one batch
 
@@ -110,50 +152,6 @@ your SSH session ending. (The `curl .../latest.json` endpoint above is
 illustrative — check with core/`internal-docs/audio-sync-interface.md` in
 MONO for whatever the actual "give me the next batch" convention is before
 wiring this up for real.)
-
-## Rented GPU deployment
-
-For batches too large for a CPU-only box, this repo ships a `Dockerfile`
-for running on rented GPU compute (Vast.ai, RunPod, etc), plus a
-`scripts/fetch-remote-run.sh` helper for pulling results back afterward.
-
-**Security design — deliberately excludes R2 publish credentials from the
-rented box.** Rented GPU marketplaces (Vast.ai especially) are individually
--owned machines with a fundamentally different trust model than a managed
-cloud — the host operator has root on the hardware your container runs on.
-Baking secrets into an image is always recoverable from layer history, and
-even runtime-injected env vars are readable by a hostile host root. So:
-
-- The image never contains `.env` (excluded via `.dockerignore`) and is
-  never built with R2 credentials.
-- The container runs `align_pipeline.py` **without `--publish`** — it only
-  ever produces `export/timing-data/` + `_runs/*.json` *inside the rented
-  container*, nothing gets uploaded from there.
-- `BIBLE_API_KEY` is the only secret the rented box needs (to fetch DBT
-  audio/text at runtime) — inject it via the platform's env-var mechanism
-  at pod launch, never bake it into the image.
-- Whisper + MMS model weights (~4GB) are baked into the image **at build
-  time, on a trusted machine** — so the rented box needs no Hugging Face
-  access at all, and `HF_TOKEN` never has to leave the machine you build on.
-- After the run, pull results back to a machine that *does* hold the R2
-  credentials, and publish from there:
-
-```bash
-docker build --build-arg HF_TOKEN=$HF_TOKEN -t audio-sync .
-# ... push to a registry, or deploy directly per your GPU provider's flow ...
-# ... run the container on the rented box with BIBLE_API_KEY set, e.g.:
-#     docker run -e BIBLE_API_KEY=... audio-sync --iso eng --books "GEN:1-3"
-
-# Back on a trusted machine, once the remote run finishes:
-make fetch-remote-run HOST=user@<rented-box-ip> PORT=<ssh-port>
-make publish-align-dry   # review first
-make publish-align
-```
-
-`fetch-remote-run.sh` rsyncs `export/timing-data/` and `_runs/` from the
-container's `/app` over SSH into this repo's local directories — after
-that, `publish-align.sh` behaves exactly like a local run, since it only
-ever looks at what's on disk.
 
 ## Setup
 
@@ -208,20 +206,22 @@ make check      # confirms python/torch/torchaudio are importable,
 - `conf/` — dependency + machine tuning files: `requirements-whisper.txt`,
   `requirements-cuda.txt`, `hw.local.json.example` (and your own gitignored
   `hw.local.json`, see Setup above)
-- `tests/` — standalone diagnostic scripts (`python tests/test_mms_fa.py`,
-  not a pytest suite)
-- `scripts/` — shell scripts (`publish-align.sh`, `fetch-remote-run.sh`)
-- `scripts-bak/` — older/specialized one-off scripts kept locally for
-  reference, gitignored, not part of the maintained pipeline
+- `tools/` — long-running jobs (redo, Whisper backfill, fusion watcher),
+  checks and reports; `tools/diag/` holds investigation scripts
+- `tests/` — pytest suite (`make test`); no model or GPU needed. Real-audio
+  fixtures under `tests/fixtures/` are kept locally, not in git
+- `scripts/` — shell scripts (`publish-align.sh`)
+- `config/helloao.toml` — editions whose audio/text come from helloAO
 - `export/timing-data/` — final output, mirrors the CDN layout
   (`<canon>/<iso>/<version>/<BOOK>/`)
 - `_runs/<batch_id>.json` — one run manifest per batch (status + scores)
 - `downloads/` — fetched audio/text, working storage (not published)
 - `api-cache/` — cached copies of CDN catalogs/queue manifests
 - `_batches/` — cached/hand-crafted batch manifests
+- `internal-docs/` — plans, measurements, correspondence (gitignored)
 
-None of these need to be committed to git — they're all working state,
-not source.
+Apart from `pipeline/`, `tools/`, `tests/`, `scripts/`, `conf/` and `config/`, none of
+these are committed to git — they're working state, not source.
 
 ## Three-repo split
 

@@ -145,6 +145,8 @@ def verse_anchored_align(
     window_frac: float = WINDOW_FRAC,
     min_window_seconds: float = MIN_WINDOW_SECONDS,
     min_local_score: float = MIN_LOCAL_SCORE,
+    alt_window: tuple[float, float] | None = None,
+    choose_window=None,
 ) -> list[dict]:
     """Align each verse independently within a window anchored to an
     expected-pace position. Adapted from align_obs_words.py's
@@ -188,27 +190,47 @@ def verse_anchored_align(
     for i, (verse_text, wc) in enumerate(zip(non_empty_verses, pace_weights)):
         exp_start = expected_starts[i]
         exp_dur = total_duration * wc / total_pace_weight
-        window = max(exp_dur * window_frac, min_window_seconds)
-        win_start = max(floor, exp_start - window)
-        win_end = min(total_duration, exp_start + exp_dur + window)
-
-        min_required = exp_dur * 1.3 + 2.0
-        if win_end - win_start < min_required:
-            win_end = min(total_duration, win_start + min_required)
-
-        if win_end - win_start < 1.0:
-            local_words = []
-        else:
+        def _try_window(frac, min_sec):
+            w = max(exp_dur * frac, min_sec)
+            ws = max(floor, exp_start - w)
+            we = min(total_duration, exp_start + exp_dur + w)
+            if we - ws < min_required:
+                we = min(total_duration, ws + min_required)
+            if we - ws < 1.0:
+                return w, ws, we, []
             try:
-                local_words = align_window(
-                    emission, total_duration, win_start, win_end, verse_text,
+                return w, ws, we, align_window(
+                    emission, total_duration, ws, we, verse_text,
                     bundle, tokenizer, aligner, uroman,
                 )
             except CudaContextPoisonedError:
                 raise
             except RuntimeError as e:
                 log(f"    verse {i + 1}: CTC align failed ({e}), using fallback", "WARNING")
-                local_words = []
+                return w, ws, we, []
+
+        def _avg(words):
+            sc = [x["score"] for x in words if x["score"] > 0]
+            return sum(sc) / len(sc) if sc else 0.0
+
+        min_required = exp_dur * 1.3 + 2.0
+        window, win_start, win_end, local_words = _try_window(window_frac, min_window_seconds)
+        if alt_window is not None:
+            # Same verse, second window size; keep the better of the two.
+            # Default rule: whichever the aligner itself is more confident
+            # about (no external reference involved). choose_window can
+            # replace that rule (returns True to take the alternative).
+            alt = _try_window(*alt_window)
+            if choose_window is not None:
+                take_alt = choose_window(
+                    primary=local_words, alternative=alt[3], floor=floor,
+                    exp_start=exp_start, exp_dur=exp_dur, verse_text=verse_text,
+                    emission=emission, total_duration=total_duration,
+                )
+            else:
+                take_alt = _avg(alt[3]) > _avg(local_words)
+            if take_alt:
+                window, win_start, win_end, local_words = alt
 
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0

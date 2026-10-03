@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""Actually re-align every chapter listed in _runs/gpu_redo_final_report.json
-(the output of tools/prepare_gpu_redo.py --apply) with today's improved
-code -- vowel-count window anchoring + same-run pacing cross-check in
-pipeline/align_verse_words.py's verse_anchored_align().
+"""Re-align a list of chapters with the verse-only aligner
+(pipeline/align_verse_words.py, process_chapter_verse_only) -- the tool behind
+every large verse-only redo.
 
-Loads the MMS_FA model exactly ONCE (it's torchaudio's universal
-multilingual forced-alignment checkpoint -- no per-language reload needed)
-and reuses it across every chapter, every language, for the whole run --
-per-chapter CLI invocation would waste ~7-9s per chapter on model loading
-alone, which at ~34,000 chapters is 65+ hours of pure overhead.
+Input: --report, a JSON file {"chapters": [{"path": "<export/timing-data/...
+_timing.json>", ...}, ...]}. Chapters are processed in the file's own order
+(grouped by iso/canon/distinct_id/book), so the caller decides priority --
+e.g. the 2026-10-03 redo lists chapters without DBT timing first.
 
-Disk safety: given only ~12GB free and this population's audio was mostly
-already purged (that's WHY these chapters need re-download at all),
-purges each edition's newly-downloaded mp3s immediately after that
-edition's chapters are done (reusing tools/purge_aligned_audio.py's own
-purge_iso_audio(), which only ever deletes an mp3 whose _timing.json +
-_words.json both already exist) -- keeps disk usage bounded across the
-whole run instead of accumulating everything before any cleanup.
+Loads the MMS_FA model once for the whole run. Per group it fetches audio and
+text from DBT (ensure_chapter_ready), aligns, and deletes each chapter's
+audio afterwards; with --prefetch-groups (default 3) one background thread
+downloads the next groups while the GPU works. Machine tuning comes from
+conf/hw.local.json, as for align_pipeline.py.
 
-Crash safety: resumable for free. Every chapter's own needs_run() check
-(does _timing.json already exist?) means re-running this exact script
-after an interruption just skips everything already completed and picks
-up where it left off -- no separate checkpoint file needed.
+Resuming: by default a chapter that already has real timing is skipped. With
+--redo-older-method it is re-aligned unless its quality file already carries
+the current ALIGNMENT_METHOD tag, so the same command can be stopped and
+restarted at any time. --backup-dir copies a chapter's existing timing /
+words / quality files before overwriting them (an existing backup is never
+overwritten, so the first, original version is what's kept).
+
+Crash safety: run it under tools/run_gpu_redo_supervisor.py, which restarts
+it after a native crash and quarantines the chapter that was in flight
+(--inflight-marker).
 
 Usage:
-    python tools/run_gpu_redo.py
-    python tools/run_gpu_redo.py --limit 500   # smoke-test a subset first
+    python tools/run_gpu_redo.py --report _runs/<list>.json --redo-older-method \
+        --backup-dir export/timing-data-backup-<date>
+    python tools/run_gpu_redo.py --report ... --limit 20   # smoke test
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor

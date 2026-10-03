@@ -7,7 +7,7 @@ TOOLS := tools
         import-contrib prepare-cross-source \
         publish-align publish-align-dry \
         quality-check quality-compare quality-report \
-        install check clean help
+        install check test clean help
 
 help: ## Show available targets
 	@echo "audio-sync — Bible audio alignment pipeline"
@@ -41,6 +41,7 @@ help: ## Show available targets
 	@echo "  ─────"
 	@echo "  make install         Install Python dependencies (+ CUDA libs if an NVIDIA GPU is detected)"
 	@echo "  make check           Verify installation"
+	@echo "  make test            Run the unit tests (no GPU needed)"
 	@echo ""
 	@echo "  Pass extra args via ARGS, e.g.:"
 	@echo "    make align ARGS=\"--iso heb\""
@@ -119,6 +120,9 @@ print('compute device:', device, '(no GPU found — alignment will run on CPU, s
 # ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
+
+test: ## Run the unit tests (pytest, no GPU needed)
+	$(PYTHON) -m pytest tests/ -q
 
 clean: ## Remove generated timing output
 	rm -rf export/timing-data/ word-timing-data/
