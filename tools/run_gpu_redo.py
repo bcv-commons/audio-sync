@@ -211,6 +211,11 @@ def main():
             if args.redo_older_method and has_real_timing(timing_path):
                 if alignment_method(quality_path) == ALIGNMENT_METHOD:
                     total_skipped += 1
+                    # Already redone (e.g. before a restart) but the prefetch
+                    # just downloaded its audio again -- nothing else will
+                    # purge it if this whole language is skipped.
+                    if prefetch is not None and getattr(config, "verse_only_mode", False):
+                        Path(chapter["audio_path"]).unlink(missing_ok=True)
                     continue
             elif not needs_run(timing_path, force=False):
                 total_skipped += 1
