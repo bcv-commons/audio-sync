@@ -1455,7 +1455,7 @@ def _requests_get_wall_clock(url: str, *, wall_clock_timeout: float, **kwargs):
     own retry-on-Timeout never triggered either). That silently blocked
     the whole worker until the external stall-watchdog's 300s no-progress
     check finally killed the ENTIRE process tree and forced a full
-    restart-from-the-start-of-the-iso-list (see watchdog-align-parallel.sh
+    restart-from-the-start-of-the-iso-list (see watchdog-align.sh
     + tools/stall_quarantine.py) — a single slow download costing far
     more than just that one chapter.
 

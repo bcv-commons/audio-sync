@@ -285,10 +285,10 @@ def build_refs_from_books(books_spec: str) -> dict[str, set[int]]:
         elif current_book and re.fullmatch(r"\d+-\d+", part):
             # Bare RANGE continuing the current book, e.g. the "9-11" in
             # "MAT:4-6,9-11". Without this the range is silently dropped as
-            # an unknown spec — and shard_align.py's own
-            # format_book_chapters() emits exactly this shape whenever a
-            # book's chapters aren't contiguous, so shard_align was
-            # formatting a spec it could not parse back. That round-trip
+            # an unknown spec — the (since removed) shard_align.py's
+            # format_book_chapters() emitted exactly this shape whenever a
+            # book's chapters weren't contiguous, so it was formatting a
+            # spec this parser could not read back. That round-trip
             # loss silently discarded chapters from every sharded run with
             # scattered chapters (confirmed 2026-09-04: the last-verse-fix
             # rollout re-ran only 1,435 of 3,510 targeted chapters, the rest
@@ -633,7 +633,7 @@ def publish_run():
 
 # needs_run() / _chapter_output_exists() moved to chapter_state.py
 # (2026-10-02) -- re-exported here unchanged so every existing caller
-# (this module, tools/run_gpu_redo.py, shard_align.py, ...) keeps working
+# (this module, tools/run_gpu_redo.py, ...) keeps working
 # with no change at its own call site. chapter_state.py also adds the
 # DEFERRED state (a defer_to_dbt redirect) these two never had to
 # recognize on their own before -- see that module's own docstring.

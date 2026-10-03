@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 import align_verse_words as avw
-import pre_publish_check as ppc
+import checks as ppc
 
 
 def _dbt(path: Path, stamps):
@@ -64,3 +64,10 @@ def test_gate_holds_back_without_dbt(tmp_path, monkeypatch):
     assert stats["gate"] == "held_back"
     assert "pos" in json.loads(item["timing_path"].read_text())
     assert ppc.is_held_back(item["quality_path"])
+
+
+def test_quality_file_carries_method_tag(tmp_path, monkeypatch):
+    from chapter_state import alignment_method
+    _, item = _run(tmp_path, monkeypatch, [0.9] * 10, with_dbt=False)
+    assert alignment_method(item["quality_path"]) == avw.ALIGNMENT_METHOD
+    assert alignment_method(tmp_path / "missing.json") is None

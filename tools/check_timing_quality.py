@@ -25,7 +25,10 @@ import json
 import sys
 from pathlib import Path
 
-from quality_report import (
+sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
+
+from checks import analyze_chapter_timing  # noqa: E402
+from quality_report import (  # noqa: E402
     TIMING_DIR,
     DOWNLOADS_DIR,
     TIMECODE_CATEGORIES,
@@ -36,72 +39,6 @@ from quality_report import (
     _parse_timing_path,
     _get_canons,
 )
-
-
-def analyze_chapter_timing(path):
-    """Check a timing.json for verse-level issues.
-
-    Returns dict with {verses, dupes, backwards, tiny, gaps, dupe_verses} or
-    None. dupe_verses is the list of verse_start strings that are the LATER
-    verse in each zero-delta transition — lets a caller cross-reference
-    with per-word confidence scores to tell apart two genuinely different
-    causes that both show up as "consecutive verses share a timestamp":
-    a real alignment failure (0.0-score fallback, several verses in a row)
-    vs. two verses genuinely spoken back-to-back with no perceptible gap
-    (high-confidence, an isolated single pair) — confirmed as distinct,
-    real cases 2026-08-10 (see internal-docs/gpu-wedge-forensics.md-
-    adjacent session history around the mms_align_words.py CTC-infeasible
-    fallback fix). See check_language()'s DUPES vs DUPES-OK vs DUPES-EMPTY
-    split — the latter (a third, even more common cause, confirmed
-    2026-09-02) is a dupe verse that's empty after cleaning (e.g. a lone
-    leftover punctuation mark on its own reference-text line), which
-    check_language() detects separately via each dupe verse's word count.
-    """
-    with open(path) as f:
-        data = json.load(f)
-
-    # Two live formats: our own pipeline output (compact {"pos": [...]})
-    # and DBT's original downloaded timecodes under downloads/BB/ (old
-    # verbose list-of-verse-dicts, an external source this tool doesn't
-    # control and which will never move to the compact format).
-    if isinstance(data, dict) and "pos" in data:
-        # pos[i] is verse (i+1)'s timestamp (no verse-0 slot — see
-        # align_words.py's write_timing_json() docstring) — the +1 keeps
-        # verse-number strings real, matching the quality file's "verses"
-        # keys (real verse numbers) that dupe_verses gets cross-referenced
-        # against below.
-        verses = [(str(i + 1), t) for i, t in enumerate(data["pos"]) if t is not None]
-    elif isinstance(data, list) and data and isinstance(data[0], dict):
-        verses = [(str(e["verse_start"]), e["timestamp"]) for e in data
-                  if str(e["verse_start"]) != "0"]
-    else:
-        return None
-
-    if len(verses) < 2:
-        return None
-
-    dupes = backwards = tiny = gaps = 0
-    dupe_verses = []
-    for i in range(1, len(verses)):
-        delta = verses[i][1] - verses[i - 1][1]
-        if delta == 0:
-            dupes += 1
-            dupe_verses.append(verses[i][0])
-        elif delta < 0:
-            backwards += 1
-        elif delta < 0.1:
-            tiny += 1
-        elif delta > 120:
-            gaps += 1
-
-    return {
-        "verses": len(verses),
-        "dupes": dupes,
-        "backwards": backwards,
-        "tiny": tiny,
-        "gaps": gaps,
-        "dupe_verses": dupe_verses,
-    }
 
 
 def analyze_chapter_words(words_path):

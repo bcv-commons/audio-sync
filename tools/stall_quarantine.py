@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Per-iso stall quarantine — stops a genuinely-poisonous language (one
-whose alignment hangs indefinitely, triggering watchdog-align-parallel.sh's
+whose alignment hangs indefinitely, triggering watchdog-align.sh's
 300s stall-kill) from blocking every language behind it in the list,
 forever, on every restart.
 
 Root cause this exists for: confirmed 2026-09-16 via a real incident —
 `cmo` was the active language at TWO CONSECUTIVE stall-kills (07:33 and
 11:02 the same day), each restart re-scanning the full ~1,170-iso list
-from #1 (shard_align.py's own design — see its module docstring) and
+from #1 (originally shard_align.py's design, now align_pipeline.py's) and
 re-hitting the same hang. A single genuinely-stuck chapter can therefore
 stall the ENTIRE remaining list indefinitely, not just waste time on its
 own language. This module breaks that: after N consecutive stall-kills
-land on the same iso, it's quarantined — shard_align.py skips it (logged,
+land on the same iso, it's quarantined — align_pipeline.py skips it (logged,
 not silently) on every subsequent run until a human clears it, rather
 than retrying forever.
 
@@ -37,7 +37,7 @@ quarantine-not-block, human-reviewable, not a blocking gate):
   _runs/stall_quarantine.json — {iso: {"quarantined_at": ..., "consecutive_stalls": N,
                                         "last_stall_at": ...}}
     Once QUARANTINE_THRESHOLD is reached, the iso moves here and
-    shard_align.py refuses to process it (skip + log) until a human
+    align_pipeline.py refuses to process it (skip + log) until a human
     removes its entry — see this module's __main__ block for the
     review/clear CLI.
 """
@@ -73,7 +73,7 @@ def _save(path: Path, data: dict) -> None:
 
 def last_active_iso(logfile: Path) -> str | None:
     """The iso from the last "===== Language: X =====" line in a
-    shard_align.py top-level log — i.e. whichever language was active
+    align_pipeline.py log — i.e. whichever language was active
     (started, not necessarily finished) right before a kill."""
     try:
         text = logfile.read_text(encoding="utf-8", errors="replace")
@@ -84,7 +84,7 @@ def last_active_iso(logfile: Path) -> str | None:
 
 
 def record_stall(logfile: Path) -> str | None:
-    """Call from watchdog-align-parallel.sh right after a STALL-triggered
+    """Call from watchdog-align.sh right after a STALL-triggered
     kill_tree(). Bumps the consecutive-stall count for whichever iso was
     active, escalating to quarantine at QUARANTINE_THRESHOLD. Returns a
     human-readable status line for the caller to log, or None if no
@@ -122,7 +122,7 @@ def is_quarantined(iso: str) -> bool:
 def clear_tracking_on_success(iso: str) -> None:
     """Call right after an iso finishes OK (align_pipeline.py's own
     per-language lifecycle block, since 2026-10-02 -- previously only
-    shard_align.py called this) -- a language that's since proven it can
+    align_pipeline.py calls this) -- a language that's since proven it can
     complete shouldn't have an old, resolved stall count held against it
     indefinitely."""
     tracking = _load(TRACKING_PATH)

@@ -28,6 +28,7 @@ Usage:
     python tools/run_gpu_redo.py --limit 500   # smoke-test a subset first
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
 import time
@@ -38,12 +39,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from align_pipeline import needs_run  # noqa: E402
-from align_verse_words import process_chapter_verse_only  # noqa: E402
+from align_verse_words import ALIGNMENT_METHOD, process_chapter_verse_only  # noqa: E402
+from chapter_state import alignment_method, has_real_timing  # noqa: E402
+import shutil  # noqa: E402
 from mms_align_words import load_mms_model, select_device  # noqa: E402
 from whisper_transcribe import discover_chapter_files  # noqa: E402
 from download_language_content import ensure_chapter_ready  # noqa: E402
 from text_processing import load_language_config  # noqa: E402
 from purge_aligned_audio import purge_iso_audio  # noqa: E402
+from hw_config import load_hw_config  # noqa: E402
+import mms_align_words  # noqa: E402
 
 OUTPUT_DIR = Path("export/timing-data")
 
@@ -86,7 +91,33 @@ def main():
                              "supervised run already confirmed crash this process. Resumable for free "
                              "via needs_run() otherwise, but a chapter that crashes BEFORE writing any "
                              "output needs an explicit exclude or it would be retried forever.")
+    parser.add_argument("--redo-older-method", action="store_true",
+                         help="Also re-align chapters that already have real timing, unless their "
+                             "quality file is tagged with the current ALIGNMENT_METHOD "
+                             "(align_verse_words.py). Without this, existing output is skipped.")
+    parser.add_argument("--backup-dir", type=str, default=None,
+                         help="Before overwriting a chapter's existing _timing/_words/_words_quality "
+                             "files, copy them here (same relative layout under export/timing-data). "
+                             "An existing backup is never overwritten, so re-runs keep the original.")
+    parser.add_argument("--prefetch-groups", type=int, default=3,
+                         help="Download this many upcoming (iso/canon/distinct_id/book) groups in a "
+                             "background thread while the current one aligns, so downloading and GPU "
+                             "work overlap instead of alternating. 0 = old sequential behaviour.")
     args = parser.parse_args()
+
+    # Same machine tuning align_pipeline.py applies (conf/hw.local.json) --
+    # without it this job ran with the built-in 2-minute model passes and
+    # took ~6.5 GB of an 8 GB card shared with the Whisper backfill.
+    hw = load_hw_config()
+    if hw.get("mms_cpu"):
+        mms_align_words._MMS_FORCE_CPU = True
+    if hw.get("mms_chunk_minutes") is not None:
+        mms_align_words._MAX_CHUNK_SAMPLES = int(hw["mms_chunk_minutes"] * 60 * 16000)
+        log(f"MMS chunk size {hw['mms_chunk_minutes']} min (conf/hw.local.json)")
+    if hw.get("ctc_chunk_threshold_cells") is not None:
+        mms_align_words._CTC_CHUNK_THRESHOLD_CELLS = hw["ctc_chunk_threshold_cells"]
+    if args.device is None and hw.get("mms_device"):
+        args.device = hw["mms_device"]
 
     redo = json.loads(Path(args.report).read_text())
     chapters = redo["chapters"]
@@ -126,7 +157,28 @@ def main():
     isos_touched_since_purge = set()
 
     group_items = sorted(groups.items())
+
+    # One background thread (not several: download_job() shares module-level
+    # stats and catalog caches) fetching the next few groups while the GPU
+    # works on the current one.
+    prefetch = None
+    pending: dict[int, object] = {}
+    if not args.no_download and args.prefetch_groups > 0:
+        prefetch = ThreadPoolExecutor(max_workers=1)
+
+    def _fetch_group(idx):
+        (f_iso, f_canon, f_did, f_book), f_chapters = group_items[idx]
+        for f_ch in sorted(f_chapters):
+            try:
+                ensure_chapter_ready(f_iso, f_canon, f_did, f_book, f_ch)
+            except Exception as e:  # a failed fetch just means discovery finds nothing below
+                log(f"{f_iso}/{f_did} {f_book} {f_ch}: fetch failed ({e})")
+
     for gi, ((iso, canon, distinct_id, book), chapter_nums) in enumerate(group_items):
+        if prefetch is not None:
+            for ahead in range(gi, min(gi + 1 + args.prefetch_groups, len(group_items))):
+                if ahead not in pending:
+                    pending[ahead] = prefetch.submit(_fetch_group, ahead)
         if iso not in config_cache:
             try:
                 config_cache[iso] = load_language_config(iso)
@@ -134,7 +186,9 @@ def main():
                 config_cache[iso] = load_language_config("default")
         config = config_cache[iso]
 
-        if not args.no_download:
+        if prefetch is not None:
+            pending.pop(gi).result()
+        elif not args.no_download:
             for ch in sorted(chapter_nums):
                 ensure_chapter_ready(iso, canon, distinct_id, book, ch)
 
@@ -154,9 +208,21 @@ def main():
             words_path = out_book_dir / f"{book}_{chapter_str}_{audio_fileset}_words.json"
             quality_path = Path(str(words_path).replace("_words.json", "_words_quality.json"))
 
-            if not needs_run(timing_path, force=False):
+            if args.redo_older_method and has_real_timing(timing_path):
+                if alignment_method(quality_path) == ALIGNMENT_METHOD:
+                    total_skipped += 1
+                    continue
+            elif not needs_run(timing_path, force=False):
                 total_skipped += 1
                 continue
+
+            if args.backup_dir:
+                for src in (timing_path, words_path, quality_path):
+                    if src.exists():
+                        dst = Path(args.backup_dir) / src.relative_to(OUTPUT_DIR)
+                        if not dst.exists():
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src, dst)
 
             item = {
                 "book": book, "chapter": ch_num, "chapter_str": chapter_str,
@@ -184,11 +250,22 @@ def main():
                 continue
             total_ok += 1
             isos_touched_since_purge.add(iso)
+            # With prefetch, a big language's purge can be deferred for many
+            # groups (see the purge block below); drop this chapter's audio
+            # now so disk use stays bounded by the prefetch window.
+            if prefetch is not None and getattr(config, "verse_only_mode", False):
+                Path(chapter["audio_path"]).unlink(missing_ok=True)
 
         if (gi + 1) % 50 == 0 or gi == len(group_items) - 1:
             log(f"... {gi + 1}/{len(group_items)} groups done "
                 f"(ok={total_ok}, failed={total_failed}, skipped={total_skipped})")
-            for iso in isos_touched_since_purge:
+            # Never purge a language whose upcoming groups are already
+            # prefetched: their chapters still carry old output, so the purge
+            # would treat the fresh audio as "already aligned" and delete it.
+            # Those languages are purged at a later purge point instead.
+            prefetched_isos = {group_items[k][0][0] for k in pending}
+            deferred_purge = isos_touched_since_purge & prefetched_isos
+            for iso in isos_touched_since_purge - deferred_purge:
                 if args.keep_fusion_mode_audio and not getattr(config_cache.get(iso), "verse_only_mode", False):
                     log(f"  keeping audio for {iso} (fusion-mode, still needs a later Whisper pass)")
                     continue
@@ -198,8 +275,10 @@ def main():
                         log(f"  purged {deleted} now-aligned mp3(s) for {iso}, {freed / 1e9:.2f} GB freed")
                 except Exception as e:
                     log(f"  purge failed for {iso} (non-fatal): {e}")
-            isos_touched_since_purge = set()
+            isos_touched_since_purge = deferred_purge
 
+    if prefetch is not None:
+        prefetch.shutdown(wait=True)
     log(f"DONE. ok={total_ok} failed={total_failed} skipped={total_skipped}")
 
 

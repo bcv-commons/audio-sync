@@ -28,7 +28,7 @@ addressed here.
 Built after a real incident (2026-09-02): downloads/BB/ grew to 336GB and
 filled the disk to 0 bytes free, stalling both the DBT and OBS batches for
 hours. A one-time manual cleanup recovered ~250GB; this module is that
-same logic, wired into pipeline/shard_align.py so it runs automatically
+same logic, wired into pipeline/align_pipeline.py so it runs automatically
 after each language finishes, instead of needing another manual sweep.
 
 Usage:

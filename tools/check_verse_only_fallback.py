@@ -34,7 +34,6 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -42,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 
 from text_processing import load_language_config  # noqa: E402
 from quality_report import find_quality_files, _parse_timing_path  # noqa: E402
+from checks import check_chapter_fallback  # noqa: E402
 
 CONFIG_DIR = Path(__file__).parent.parent / "pipeline" / "config" / "languages"
 DEFAULT_THRESHOLD = 0.2
@@ -59,66 +59,6 @@ def discover_verse_only_languages() -> list[str]:
         except Exception:
             continue
     return isos
-
-
-def check_chapter_fallback(quality_path: Path) -> dict | None:
-    """Fallback stats for one chapter's _words_quality.json.
-
-    Returns {verses, fallback_verses, fallback_rate, fallback_verse_nums}
-    or None if this isn't verse_only_mode output (no "source" field on
-    its words — the fusion-mode pipeline's quality files have per-word
-    scores but no per-word "source": "fallback"/"local"/"interpolated"
-    tag).
-
-    "interpolated" (added 2026-09-24, see align_verse_words.py's
-    _interpolate_fallback_runs()) is a verse that still has no real
-    per-word alignment — same underlying failure as "fallback" — but
-    whose verse-level start/end was corrected to interpolate between the
-    chapter's own nearest real-aligned neighbors instead of being left at
-    the raw whole-chapter pace estimate. Counted the same as "fallback"
-    here: this tool reports how often a real alignment wasn't found at
-    all, regardless of how good the resulting position estimate is.
-    """
-    try:
-        with open(quality_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-    verses = data.get("verses", {})
-    if not verses:
-        return None
-
-    total = 0
-    fallback_verses = []
-    saw_source_tag = False
-    for vnum, words in verses.items():
-        if not words:
-            continue
-        total += 1
-        # verse_only_mode's vocabulary is {"local", "fallback",
-        # "interpolated"} — fusion-mode quality files use a disjoint
-        # vocabulary ({"whisper"} only, or no "source" key at all for the
-        # common MMS-wins case), so this positively identifies
-        # verse_only_mode output rather than just detecting *some*
-        # "source" key (which fusion-mode files can also carry, and did
-        # wrongly match here at first).
-        if any(w.get("source") in ("local", "fallback", "interpolated") for w in words):
-            saw_source_tag = True
-        if words and all(w.get("source") in ("fallback", "interpolated") for w in words):
-            fallback_verses.append(vnum)
-
-    if not saw_source_tag or total == 0:
-        # Fusion-mode output (or an empty/malformed file) — not what
-        # this tool is for, see check_timing_quality.py instead.
-        return None
-
-    return {
-        "verses": total,
-        "fallback_verses": len(fallback_verses),
-        "fallback_rate": len(fallback_verses) / total,
-        "fallback_verse_nums": fallback_verses,
-    }
 
 
 def check_language_fallback(iso: str, testament: str | None = None, threshold: float = DEFAULT_THRESHOLD) -> dict | None:

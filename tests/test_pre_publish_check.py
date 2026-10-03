@@ -4,7 +4,7 @@ fallback-corruption detection, and legacy-format detection.
 import json
 from pathlib import Path
 
-from pre_publish_check import has_backwards_jump, has_fallback_corruption, is_legacy_format
+from checks import has_backwards_jump, has_fallback_corruption, is_legacy_format
 
 
 def _write(path: Path, data) -> None:

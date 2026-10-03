@@ -77,6 +77,13 @@ WINDOW_FRAC = 0.8
 MIN_WINDOW_SECONDS = 8.0
 MIN_LOCAL_SCORE = 0.35
 
+# Written to every chapter's quality file (summary.method). Bump it whenever
+# a change would make already-written output worth redoing; the redo tooling
+# (tools/run_gpu_redo.py --redo-older-method) selects on it.
+#   anchored-star-v1 (2026-10-03): wildcard-padded windows, emission once
+#   per chapter, two-sided chunk context, chapter gate.
+ALIGNMENT_METHOD = "anchored-star-v1"
+
 # Chapter gate (decided 2026-10-03 from a 121-language DBT comparison): a
 # chapter where more than GATE_MAX_LOW_SHARE of its verses score below
 # GATE_LOW_SCORE is not published as our own timing. In that sample, chapters
@@ -515,6 +522,7 @@ def process_chapter_verse_only(
             "from_whisper": 0,
             "from_mms": len(all_scores),
             "low_quality_verses": low_quality_verses,
+            "method": ALIGNMENT_METHOD,
         },
     }
 

@@ -52,11 +52,6 @@ _DEFAULTS: dict[str, Any] = {
                                    # boundary-transition) alignment; the 300M default is safe
                                    # to leave as-is on GPU hardware, where even a near-maximal
                                    # chunk computes quickly.
-    "parallel_workers": 1,        # shard_align.py's default worker count — 1 = sequential,
-                                   # identical to running align_pipeline.py directly. Only
-                                   # raise this after testing (see mms_chunk_minutes' note
-                                   # in hw.local.json.example for why guessing from VRAM
-                                   # headroom alone isn't reliable).
 }
 
 _cache: dict[str, Any] | None = None

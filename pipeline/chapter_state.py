@@ -104,3 +104,16 @@ def chapter_fully_done(
         if words_path.exists() and chapter_state(timing_path) == ChapterStatus.DONE:
             return True
     return False
+
+
+def alignment_method(quality_path: Path) -> str | None:
+    """The alignment-method tag a chapter's local quality file carries
+    (summary.method), or None for output written before tags existed.
+    Lets a redo tell old-method output from current output without
+    re-deriving it from scores."""
+    try:
+        data = json.loads(quality_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    summary = data.get("summary") if isinstance(data, dict) else None
+    return summary.get("method") if isinstance(summary, dict) else None

@@ -51,116 +51,15 @@ the exclude file); prints a one-line summary either way.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
+
+from checks import has_backwards_jump, has_fallback_corruption, is_held_back, is_legacy_format  # noqa: E402
+
 TIMING_DIR = Path("export/timing-data")
 DEFAULT_OUT = Path("_runs/pre_publish_quarantine.txt")
-
-# A chapter whose word-quality summary is this null-heavy or this
-# low-scoring essentially never happens from real alignment — even a
-# genuinely hard chapter has SOME well-scored words. These thresholds are
-# deliberately conservative (real corruption is null_count == total_words,
-# avg_score == 0.0 exactly) to leave headroom above legitimately rough
-# chapters without false-flagging them.
-_FALLBACK_NULL_FRACTION = 0.9
-_FALLBACK_AVG_SCORE_MAX = 0.02
-
-
-def has_backwards_jump(timing_path: Path) -> bool:
-    """True if any verse's timestamp precedes the previous verse's.
-
-    Handles the new compact format ({"pos": [...]}), the old verbose
-    per-verse-dict list this whole corpus is still in until reprocessed,
-    and safely no-ops on shapes that are neither (e.g. OBS's story/segment
-    timing files, which also live under export/timing-data/ but aren't
-    Bible-chapter timing at all).
-    """
-    try:
-        with open(timing_path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-
-    if isinstance(data, dict) and "pos" in data:
-        verses = [t for t in data["pos"] if t is not None]
-    elif isinstance(data, list) and data and isinstance(data[0], dict) and "verse_start" in data[0]:
-        verses = [e["timestamp"] for e in data if str(e.get("verse_start")) != "0"]
-    else:
-        return False
-
-    return any(verses[i] < verses[i - 1] for i in range(1, len(verses)))
-
-
-def has_fallback_corruption(quality_path: Path) -> bool:
-    """True if a chapter's alignment has collapsed to near-total fallback/
-    failure — nearly every word has a null timestamp and/or zero
-    confidence score.
-
-    This is the on-disk fingerprint of a poisoned CUDA context: each
-    individual word/verse failure looks like an isolated, plausible case
-    (a verse's audio genuinely too short for its text, say), but a whole
-    CHAPTER with this shape essentially never happens from real alignment
-    — even a genuinely hard chapter has some well-scored words. Unlike a
-    backwards jump, this failure mode doesn't corrupt monotonicity or
-    produce an error — the pipeline logs it as a normal success, which is
-    exactly how 4,926 chapters were silently corrupted in a single
-    2026-08-12 run before this check existed (confirmed: every one had
-    summary.avg_score == 0.0 and null_count == total_words).
-
-    Path-agnostic: applies equally to the fusion pipeline's
-    *_words_quality.json (source values "mms"/"whisper"/"mms_gap_fill"/
-    "mms_drift_fix") and verse-only mode's (source
-    "local"/"fallback"/"interpolated") — both write the same
-    {"summary": {"total_words", "null_count", "avg_score", ...}} shape
-    (align_words.py / align_verse_words.py), and a poisoned context
-    corrupts either pipeline identically.
-    """
-    try:
-        with open(quality_path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-
-    summary = data.get("summary")
-    if not summary:
-        return False
-    total = summary.get("total_words", 0)
-    if not total:
-        return False
-    null_fraction = summary.get("null_count", 0) / total
-    avg_score = summary.get("avg_score", 1.0)
-    return null_fraction >= _FALLBACK_NULL_FRACTION or avg_score <= _FALLBACK_AVG_SCORE_MAX
-
-
-def is_legacy_format(timing_path: Path) -> bool:
-    """True if this *_timing.json is still the old per-verse-dict list
-    shape instead of the compact {"pos": [...]} dict.
-
-    Excludes export/timing-data/obs/ — OBS's story/segment timing files
-    are also a JSON list, but that's their own unrelated Contract-B shape
-    (see pipeline/align_obs_words.py), not this pipeline's legacy format.
-    """
-    if "/obs/" in timing_path.as_posix():
-        return False
-    try:
-        with open(timing_path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-    return isinstance(data, list)
-
-
-def is_held_back(quality_path: Path) -> bool:
-    """True if the verse-only chapter gate held this chapter back (too many
-    low-score verses and no usable DBT timing to defer to) -- see
-    align_verse_words.py's GATE_LOW_SCORE / GATE_MAX_LOW_SHARE."""
-    try:
-        with open(quality_path) as f:
-            return (json.load(f).get("summary") or {}).get("gate") == "held_back"
-    except (json.JSONDecodeError, OSError):
-        return False
 
 
 def main():
