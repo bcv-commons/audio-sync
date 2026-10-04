@@ -101,6 +101,15 @@ Verse-only output carries a few extra safeguards:
   redoing; `tools/run_gpu_redo.py --redo-older-method` then re-aligns
   exactly the chapters with an older tag (backing up the old files with
   `--backup-dir`), so long redo runs can be stopped and resumed freely.
+- **Redo hygiene.** `run_gpu_redo.py` never downloads the alternate
+  (dramatized) recording of a chapter, deletes all audio of a group once it is
+  done, treats a chapter as current when the recording that would be aligned
+  already is, and writes a heartbeat (`<marker>.hb`) for every chapter and
+  group it reaches; `tools/redo_hang_watch.py` restarts a worker whose
+  heartbeat is older than 30 minutes (the supervisor quarantines the chapter
+  being aligned, if any, with reason `HANG`). A daily health/progress report
+  is written to `_runs/daily_redo_report_<date>.txt` by a systemd user timer
+  (`audio-sync-redo-report.timer`, 07:00 UTC).
 - **Non-DBT audio.** Editions listed in `config/helloao.toml` (e.g. BSB read
   by Hays, `eng/ENGBSBHAY`) get their audio from helloAO, not DBT; every
   tool that fetches audio must take that route for them.

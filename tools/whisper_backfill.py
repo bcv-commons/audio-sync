@@ -293,6 +293,8 @@ def main():
                 result = transcribe_audio(audio_path, args.model, whisper_lang, _model=model)
             except Exception as e:
                 log(f"  {iso}/{distinct_id} {book} {chapter_str}: transcribe EXCEPTION ({e})")
+                if non_dbt:
+                    audio_path.unlink(missing_ok=True)   # purge_iso_audio() only sweeps downloads/BB
                 total_failed += 1
                 iso_failed += 1
                 processed += 1

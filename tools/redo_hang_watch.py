@@ -54,6 +54,29 @@ def worker_pid(marker: Path) -> int | None:
     return None
 
 
+def process_start_epoch(pid: int) -> float:
+    """Wall-clock start of a process (from /proc/<pid>/stat, not the mtime of
+    /proc/<pid>, which is not the start time)."""
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    start_ticks = int(fields[19])                       # field 22 of stat
+    boot = next(float(l.split()[1]) for l in Path("/proc/stat").read_text().splitlines() if l.startswith("btime"))
+    return boot + start_ticks / os.sysconf("SC_CLK_TCK")
+
+
+def progress_age_minutes(marker: Path, process_started: float, now: float) -> float:
+    """Minutes since the worker last showed progress: the newest of its
+    in-flight marker (rewritten per aligned chapter), its heartbeat file
+    <marker>.hb (touched for every chapter and group it reaches, skipped ones
+    too -- without it a long run of skips looked like a hang), and the process
+    start (a fresh worker has not written either yet). The marker may not
+    exist: the worker removes it between chapters."""
+    beats = [process_started]
+    for f in (marker, Path(str(marker) + ".hb")):
+        if f.exists():
+            beats.append(f.stat().st_mtime)
+    return (now - max(beats)) / 60
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--marker", action="append", required=True, help="A worker's --inflight-marker path")
@@ -70,23 +93,18 @@ def main():
         now = time.time()
         for m in markers:
             pid = worker_pid(m)
-            if pid is None or not m.exists():
+            if pid is None:
                 continue
             # A freshly started worker has not rewritten the marker yet; age
             # it from the later of the marker and the process start.
-            started = (Path(f"/proc/{pid}")).stat().st_mtime
-            hb = Path(str(m) + ".hb")        # touched on every chapter/group the worker reaches,
-            beats = [m.stat().st_mtime, started]  # including skipped ones
-            if hb.exists():
-                beats.append(hb.stat().st_mtime)
-            age_min = (now - max(beats)) / 60
+            age_min = progress_age_minutes(m, process_start_epoch(pid), now)
             if age_min < args.stale_minutes:
                 continue
             restarts[m] = [t for t in restarts[m] if now - t < 3600]
             try:
-                chapter = json.loads(m.read_text()).get("timing_path", "?")
+                chapter = json.loads(m.read_text()).get("timing_path", "none (not aligning a chapter)")
             except (OSError, json.JSONDecodeError):
-                chapter = "?"
+                chapter = "none (not aligning a chapter)"
             if len(restarts[m]) >= args.max_restarts:
                 log(f"HUNG again ({age_min:.0f} min) pid {pid} on {chapter} -- already restarted "
                     f"{len(restarts[m])}x this hour, NOT intervening; check the GPU (nvidia-smi)")

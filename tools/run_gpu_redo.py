@@ -51,6 +51,7 @@ from download_language_content import ensure_chapter_ready  # noqa: E402
 from text_processing import load_language_config  # noqa: E402
 from purge_aligned_audio import purge_iso_audio  # noqa: E402
 from hw_config import load_hw_config  # noqa: E402
+import download_language_content  # noqa: E402
 import mms_align_words  # noqa: E402
 
 OUTPUT_DIR = Path("export/timing-data")
@@ -60,6 +61,28 @@ DOWNLOADS_DIR = Path("downloads/BB")
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def chapter_is_current(timing: Path) -> bool:
+    """True if the recording that would be aligned already has current-method output.
+
+    Discovery aligns the standard recording when one exists and only falls back
+    to the dramatized (2DA/2SA) one when it does not. So a list entry for the
+    dramatized copy next to a standard recording can never change anything, and
+    judging every entry on its own left hundreds of such entries in the list;
+    each still cost a download and a no-op group (found 2026-10-04). Conversely
+    a current dramatized copy says nothing about a stale standard recording.
+    """
+    book_dir = Path("downloads/BB") / timing.relative_to(OUTPUT_DIR).parent
+    texts = sorted(book_dir.glob(timing.name[:7] + "_*.txt"))
+    text = texts[0] if texts else None
+    files = list(timing.parent.glob(timing.name[:7] + "_*_words_quality.json"))
+    standard = [q for q in files if "2DA" not in q.name and "2SA" not in q.name]
+    for q in (standard or files):
+        tag = alignment_method(q)
+        if tag is not None and is_current_method(tag, text):
+            return True
+    return False
 
 
 def main():
@@ -119,6 +142,7 @@ def main():
         import torch
         if torch.cuda.is_available():
             torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, 0)
+    download_language_content.SKIP_ALT_AUDIO = True
     hw = load_hw_config()
     if hw.get("mms_cpu"):
         mms_align_words._MMS_FORCE_CPU = True
@@ -139,30 +163,18 @@ def main():
         chapters = [c for c in chapters if (c["path"] if isinstance(c, dict) else c) not in excluded]
         if before - len(chapters) > 0:
             log(f"Excluded {before - len(chapters)} chapter(s) via --exclude-chapters-file")
+    unalignable_path = Path(args.report).with_suffix(".unalignable.json")
+    unalignable = set(json.loads(unalignable_path.read_text())) if unalignable_path.exists() else set()
+    if unalignable:
+        before = len(chapters)
+        chapters = [c for c in chapters if (c["path"] if isinstance(c, dict) else c) not in unalignable]
+        log(f"Skipping {before - len(chapters)} chapter(s) recorded as unalignable in {unalignable_path.name} "
+            f"(no verified text/recording was found for them on an earlier run)")
     if args.redo_older_method:
         # Drop chapters already done with the current method up front, so a
         # restart doesn't re-download their audio only to skip them.
-        def _text_for(timing: Path) -> Path | None:
-            book_dir = Path("downloads/BB") / timing.relative_to(OUTPUT_DIR).parent
-            found = sorted(book_dir.glob(timing.name[:7] + "_*.txt"))
-            return found[0] if found else None
-
-        def _current(c) -> bool:
-            # Chapter-level, over every recording of the chapter: when a
-            # standard and a dramatized recording both exist only the standard
-            # one is aligned, so a list entry for the other recording can never
-            # change anything. Judging each entry on its own left hundreds of
-            # such entries in the list; every one still cost a download of
-            # both recordings and a no-op group (found 2026-10-04).
-            timing = Path(c["path"] if isinstance(c, dict) else c)
-            for q in timing.parent.glob(timing.name[:7] + "_*_words_quality.json"):
-                tag = alignment_method(q)
-                if tag is not None and is_current_method(tag, _text_for(timing)):
-                    return True
-            return False
-
         before = len(chapters)
-        chapters = [c for c in chapters if not _current(c)]
+        chapters = [c for c in chapters if not chapter_is_current(Path(c["path"] if isinstance(c, dict) else c))]
         if before - len(chapters):
             log(f"Skipping {before - len(chapters)} chapter(s) already aligned with the current method")
     if args.limit:
@@ -173,6 +185,7 @@ def main():
     # trusting a separate field, since prepare_gpu_redo.py's report only
     # stores {"path": ..., "reason": ...}.
     groups = defaultdict(set)
+    group_paths = defaultdict(list)
     for entry in chapters:
         p = Path(entry["path"])
         book = p.parent.name
@@ -182,6 +195,7 @@ def main():
         stem = p.name.replace("_timing.json", "")
         chapter_str = stem.split("_", 2)[1]
         groups[(iso, canon, distinct_id, book)].add(int(chapter_str))
+        group_paths[(iso, canon, distinct_id, book)].append(entry["path"])
 
     log(f"Loaded {len(chapters)} chapters across {len(groups)} (iso/canon/distinct_id/book) groups")
 
@@ -213,16 +227,33 @@ def main():
                 log(f"{f_iso}/{f_did} {f_book} {f_ch}: fetch failed ({e})")
 
     def _beat() -> None:
-        """Progress heartbeat for tools/redo_hang_watch.py. The in-flight
-        marker is only rewritten when a chapter is actually aligned, so a long
-        run of skipped chapters/groups looked like a hang to the watcher
-        (it killed a healthy worker on 2026-10-03 and quarantined a good
-        chapter)."""
+        """Progress heartbeat for tools/redo_hang_watch.py, and clear the
+        in-flight marker. The marker names the chapter being aligned, so it
+        must only exist while one is: the supervisor quarantines whatever it
+        names when the worker dies or is killed, and a stale marker would
+        blame an already-finished chapter for a hang elsewhere (a stuck
+        download, discovery). The heartbeat covers everything else, so a long
+        run of skipped chapters is not mistaken for a hang (it killed a healthy
+        worker on 2026-10-03 and quarantined a good chapter)."""
         if args.inflight_marker:
+            Path(args.inflight_marker).unlink(missing_ok=True)
             try:
                 Path(args.inflight_marker + ".hb").touch()
             except OSError:
                 pass
+
+    def _drop_group_audio(canon, iso, distinct_id, book, chapter_nums) -> None:
+        """Delete every mp3 of a finished group's chapters. download_job() also
+        fetches each chapter's alternate recording (e.g. N2DA next to N1DA),
+        which this tool never aligns; nothing else deletes those and they added
+        up to ~0.45 GB/hour (found 2026-10-04). Also covers groups where nothing
+        was discovered, and failed chapters."""
+        if prefetch is None or args.keep_fusion_mode_audio:
+            return
+        group_dir = DOWNLOADS_DIR / canon / iso / distinct_id / book
+        for ch_num in chapter_nums:
+            for stale in group_dir.glob(f"{book}_{ch_num:03d}_*.mp3"):
+                stale.unlink(missing_ok=True)
 
     for gi, ((iso, canon, distinct_id, book), chapter_nums) in enumerate(group_items):
         _beat()
@@ -248,6 +279,11 @@ def main():
         if not found:
             log(f"{iso}/{distinct_id} {book} {sorted(chapter_nums)}: no chapters discovered after fetch attempt -- skipping")
             total_skipped += len(chapter_nums)
+            _drop_group_audio(canon, iso, distinct_id, book, chapter_nums)
+            # Remember it: a restart would otherwise re-download and re-fail
+            # these (e.g. an audio-only edition with no catalog-verified text).
+            unalignable.update(e for e in group_paths.get((iso, canon, distinct_id, book), []))
+            unalignable_path.write_text(json.dumps(sorted(unalignable)))
             continue
 
         for chapter in found:
@@ -313,15 +349,8 @@ def main():
             if prefetch is not None and (getattr(config, "verse_only_mode", False) or not args.keep_fusion_mode_audio):
                 Path(chapter["audio_path"]).unlink(missing_ok=True)
 
-        # download_job() also fetches each chapter's alternate recording
-        # (e.g. N2DA next to N1DA), which this tool never aligns. Nothing
-        # deletes those, and they added up to ~0.45 GB/hour (found
-        # 2026-10-04). The group is finished, so drop every mp3 of its chapters.
-        if prefetch is not None and not args.keep_fusion_mode_audio:
-            group_dir = DOWNLOADS_DIR / canon / iso / distinct_id / book
-            for ch_num in chapter_nums:
-                for stale in group_dir.glob(f"{book}_{ch_num:03d}_*.mp3"):
-                    stale.unlink(missing_ok=True)
+        _beat()
+        _drop_group_audio(canon, iso, distinct_id, book, chapter_nums)
 
         if (gi + 1) % 50 == 0 or gi == len(group_items) - 1:
             log(f"... {gi + 1}/{len(group_items)} groups done "
