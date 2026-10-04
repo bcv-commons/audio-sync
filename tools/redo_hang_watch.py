@@ -2,8 +2,9 @@
 """Hang detection for supervised run_gpu_redo.py workers.
 
 run_gpu_redo.py rewrites its --inflight-marker file right before every
-chapter, so the marker's age is how long the current chapter has been
-running. A normal chapter takes seconds; even Psalm 119 takes a few minutes.
+chapter it aligns and touches <marker>.hb at every chapter and group it
+reaches (skipped ones too), so the newest of the two is how long the worker
+has gone without progress. A normal chapter takes seconds; even Psalm 119 takes a few minutes.
 If a marker stays unchanged for longer than --stale-minutes, the worker is
 treated as hung (a GPU wedge, a stuck download, a deadlock): this script
 sends that worker SIGUSR1 (no core dump of a multi-GB process). The
@@ -74,7 +75,11 @@ def main():
             # A freshly started worker has not rewritten the marker yet; age
             # it from the later of the marker and the process start.
             started = (Path(f"/proc/{pid}")).stat().st_mtime
-            age_min = (now - max(m.stat().st_mtime, started)) / 60
+            hb = Path(str(m) + ".hb")        # touched on every chapter/group the worker reaches,
+            beats = [m.stat().st_mtime, started]  # including skipped ones
+            if hb.exists():
+                beats.append(hb.stat().st_mtime)
+            age_min = (now - max(beats)) / 60
             if age_min < args.stale_minutes:
                 continue
             restarts[m] = [t for t in restarts[m] if now - t < 3600]

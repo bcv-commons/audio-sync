@@ -54,6 +54,7 @@ from hw_config import load_hw_config  # noqa: E402
 import mms_align_words  # noqa: E402
 
 OUTPUT_DIR = Path("export/timing-data")
+DOWNLOADS_DIR = Path("downloads/BB")
 
 
 def log(msg):
@@ -147,9 +148,18 @@ def main():
             return found[0] if found else None
 
         def _current(c) -> bool:
+            # Chapter-level, over every recording of the chapter: when a
+            # standard and a dramatized recording both exist only the standard
+            # one is aligned, so a list entry for the other recording can never
+            # change anything. Judging each entry on its own left hundreds of
+            # such entries in the list; every one still cost a download of
+            # both recordings and a no-op group (found 2026-10-04).
             timing = Path(c["path"] if isinstance(c, dict) else c)
-            tag = alignment_method(timing.with_name(timing.name.replace("_timing.json", "_words_quality.json")))
-            return tag is not None and is_current_method(tag, _text_for(timing))
+            for q in timing.parent.glob(timing.name[:7] + "_*_words_quality.json"):
+                tag = alignment_method(q)
+                if tag is not None and is_current_method(tag, _text_for(timing)):
+                    return True
+            return False
 
         before = len(chapters)
         chapters = [c for c in chapters if not _current(c)]
@@ -202,7 +212,20 @@ def main():
             except Exception as e:  # a failed fetch just means discovery finds nothing below
                 log(f"{f_iso}/{f_did} {f_book} {f_ch}: fetch failed ({e})")
 
+    def _beat() -> None:
+        """Progress heartbeat for tools/redo_hang_watch.py. The in-flight
+        marker is only rewritten when a chapter is actually aligned, so a long
+        run of skipped chapters/groups looked like a hang to the watcher
+        (it killed a healthy worker on 2026-10-03 and quarantined a good
+        chapter)."""
+        if args.inflight_marker:
+            try:
+                Path(args.inflight_marker + ".hb").touch()
+            except OSError:
+                pass
+
     for gi, ((iso, canon, distinct_id, book), chapter_nums) in enumerate(group_items):
+        _beat()
         if prefetch is not None:
             for ahead in range(gi, min(gi + 1 + args.prefetch_groups, len(group_items))):
                 if ahead not in pending:
@@ -228,6 +251,7 @@ def main():
             continue
 
         for chapter in found:
+            _beat()
             ch_num = chapter["chapter"]
             chapter_str = chapter["chapter_str"]
             audio_fileset = chapter["audio_fileset"]
@@ -288,6 +312,16 @@ def main():
             # now so disk use stays bounded by the prefetch window.
             if prefetch is not None and (getattr(config, "verse_only_mode", False) or not args.keep_fusion_mode_audio):
                 Path(chapter["audio_path"]).unlink(missing_ok=True)
+
+        # download_job() also fetches each chapter's alternate recording
+        # (e.g. N2DA next to N1DA), which this tool never aligns. Nothing
+        # deletes those, and they added up to ~0.45 GB/hour (found
+        # 2026-10-04). The group is finished, so drop every mp3 of its chapters.
+        if prefetch is not None and not args.keep_fusion_mode_audio:
+            group_dir = DOWNLOADS_DIR / canon / iso / distinct_id / book
+            for ch_num in chapter_nums:
+                for stale in group_dir.glob(f"{book}_{ch_num:03d}_*.mp3"):
+                    stale.unlink(missing_ok=True)
 
         if (gi + 1) % 50 == 0 or gi == len(group_items) - 1:
             log(f"... {gi + 1}/{len(group_items)} groups done "
