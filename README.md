@@ -80,7 +80,9 @@ There are two modes, chosen per language (`verse_only_mode` in
   verse is aligned on its own inside a search window around where reading
   pace says it should be (`align_verse_words.py`) — twice, in a wide and a
   narrow window, keeping the better candidate (alignment score, small
-  penalty for a gap after the previous verse). The verse's text is
+  penalty for a gap after the previous verse). For scripts whose vowels are
+  combining marks (Indic scripts, Tibetan, Khmer, Lao, Thai, Thaana, Kayah)
+  the verse text keeps its vowel signs (`clean_for_alignment_keep_vowel_signs`). The verse's text is
   padded with MMS's `<star>` wildcard so the neighbouring verses' speech in
   the window is absorbed instead of smearing the verse. The model runs once
   per chapter and each window is a slice of that output. OBS stories use

@@ -348,6 +348,53 @@ def clean_for_alignment(text: str, config: LanguageConfig) -> str:
     return text
 
 
+# Scripts whose vowels (and stacked consonants) are combining marks.
+# clean_for_alignment() strips every combining mark, which turns these texts
+# into bare consonant strings ("भारत का" -> "भरत क"; Tibetan also loses its
+# syllable separator and glues phrases into one word). Keeping the marks was
+# measured 2026-10-03 on verse-only alignment: 54 languages, verses scoring
+# below 0.5 8.1% -> 5.5%, chapters held back by the gate 8 -> 4 (Tibetan
+# 75% -> 23% low-scoring), and 5.5% -> 5.4% of verses >1 s off DBT. Myanmar,
+# Arabic, Hebrew and fusion mode got slightly worse, so they are not listed
+# and keep the plain cleaning.
+VOWEL_SIGN_SCRIPTS = (
+    "DEVANAGARI", "BENGALI", "GURMUKHI", "GUJARATI", "ORIYA", "TAMIL", "TELUGU",
+    "KANNADA", "MALAYALAM", "TIBETAN", "KHMER", "LAO", "THAI", "THAANA", "KAYAH",
+)
+
+
+def _vowel_sign_mark(c: str) -> bool:
+    return unicodedata.category(c)[0] == "M" and unicodedata.name(c, "").startswith(VOWEL_SIGN_SCRIPTS)
+
+
+def uses_vowel_sign_script(text: str) -> bool:
+    """True if text contains combining marks of a VOWEL_SIGN_SCRIPTS script."""
+    return any(_vowel_sign_mark(c) for c in unicodedata.normalize("NFC", text))
+
+
+def clean_for_alignment_keep_vowel_signs(text: str, config: LanguageConfig) -> str:
+    """clean_for_alignment(), but keeping the combining marks (vowel signs,
+    viramas, stacked consonants) of VOWEL_SIGN_SCRIPTS and treating the
+    Tibetan tsheg as the word separator it is. Identical to
+    clean_for_alignment() for text without such marks. Used by the
+    verse-only aligner only (align_verse_words.py)."""
+    if not uses_vowel_sign_script(text):
+        return clean_for_alignment(text, config)
+    text = unicodedata.normalize("NFC", text).replace("\u0f0b", " ").replace("\u0f0c", " ")
+    for old, new in config.char_replacements.items():
+        text = text.replace(old, new)
+    for original, replacement in config.pronunciation_map.items():
+        text = text.replace(original, replacement)
+    kept = []
+    for c in text:
+        cat = unicodedata.category(c)
+        if cat[0] in "LN" or c.isspace() or _vowel_sign_mark(c):
+            kept.append(c)
+        elif cat[0] != "M":
+            kept.append(" ")          # punctuation etc. separates words
+    return re.sub(r"\s+", " ", "".join(kept)).strip()
+
+
 def normalize_text(text: str, config: LanguageConfig) -> str:
     """Normalize text for fuzzy matching.
 

@@ -16,7 +16,7 @@ conf/hw.local.json, as for align_pipeline.py.
 
 Resuming: by default a chapter that already has real timing is skipped. With
 --redo-older-method it is re-aligned unless its quality file already carries
-the current ALIGNMENT_METHOD tag, so the same command can be stopped and
+the current method tag (align_verse_words.is_current_method), so the same command can be stopped and
 restarted at any time. --backup-dir copies a chapter's existing timing /
 words / quality files before overwriting them (an existing backup is never
 overwritten, so the first, original version is what's kept).
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "pipeline"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from align_pipeline import needs_run  # noqa: E402
-from align_verse_words import ALIGNMENT_METHOD, process_chapter_verse_only  # noqa: E402
+from align_verse_words import is_current_method, process_chapter_verse_only  # noqa: E402
 from chapter_state import alignment_method, has_real_timing  # noqa: E402
 import shutil  # noqa: E402
 from mms_align_words import load_mms_model, select_device  # noqa: E402
@@ -96,7 +96,7 @@ def main():
                              "output needs an explicit exclude or it would be retried forever.")
     parser.add_argument("--redo-older-method", action="store_true",
                          help="Also re-align chapters that already have real timing, unless their "
-                             "quality file is tagged with the current ALIGNMENT_METHOD "
+                             "quality file carries the current method tag "
                              "(align_verse_words.py). Without this, existing output is skipped.")
     parser.add_argument("--backup-dir", type=str, default=None,
                          help="Before overwriting a chapter's existing _timing/_words/_words_quality "
@@ -141,12 +141,20 @@ def main():
     if args.redo_older_method:
         # Drop chapters already done with the current method up front, so a
         # restart doesn't re-download their audio only to skip them.
+        def _text_for(timing: Path) -> Path | None:
+            book_dir = Path("downloads/BB") / timing.relative_to(OUTPUT_DIR).parent
+            found = sorted(book_dir.glob(timing.name[:7] + "_*.txt"))
+            return found[0] if found else None
+
+        def _current(c) -> bool:
+            timing = Path(c["path"] if isinstance(c, dict) else c)
+            tag = alignment_method(timing.with_name(timing.name.replace("_timing.json", "_words_quality.json")))
+            return tag is not None and is_current_method(tag, _text_for(timing))
+
         before = len(chapters)
-        chapters = [c for c in chapters if alignment_method(
-            Path((c["path"] if isinstance(c, dict) else c).replace("_timing.json", "_words_quality.json"))
-        ) != ALIGNMENT_METHOD]
+        chapters = [c for c in chapters if not _current(c)]
         if before - len(chapters):
-            log(f"Skipping {before - len(chapters)} chapter(s) already aligned with {ALIGNMENT_METHOD}")
+            log(f"Skipping {before - len(chapters)} chapter(s) already aligned with the current method")
     if args.limit:
         chapters = chapters[: args.limit]
 
@@ -229,7 +237,7 @@ def main():
             quality_path = Path(str(words_path).replace("_words.json", "_words_quality.json"))
 
             if args.redo_older_method and has_real_timing(timing_path):
-                if alignment_method(quality_path) == ALIGNMENT_METHOD:
+                if is_current_method(alignment_method(quality_path), chapter["text_path"]):
                     total_skipped += 1
                     # Already redone (e.g. before a restart) but the prefetch
                     # just downloaded its audio again -- nothing else will

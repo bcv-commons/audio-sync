@@ -127,3 +127,23 @@ class TestSofriaJsonVerseReading:
         verses = read_verse_texts(p, _default_config())
         assert len(verses) == 176
         assert all(len(v) < 100 for v in verses)
+
+
+# ── vowel-sign scripts (verse-only cleaning) ─────────────────────────────────
+
+from text_processing import clean_for_alignment_keep_vowel_signs, load_language_config, uses_vowel_sign_script
+
+
+def test_keep_vowel_signs_devanagari_bengali_tibetan():
+    c = load_language_config("default")
+    assert clean_for_alignment_keep_vowel_signs("भारत का, पुत्र!", c) == "भारत का पुत्र"
+    assert clean_for_alignment_keep_vowel_signs("প্রিয় সন্তানেরা", c) == "প্রিয় সন্তানেরা"
+    assert clean_for_alignment_keep_vowel_signs("དེ་ཡང་ཐོག་མ།", c) == "དེ ཡང ཐོག མ"
+
+
+def test_keep_vowel_signs_leaves_other_scripts_as_before():
+    from text_processing import clean_for_alignment
+    c = load_language_config("default")
+    for s in ["ပြင်", "الْحَمْدُ", "Café — naïve", "שָׁלוֹם"]:
+        assert not uses_vowel_sign_script(s) or s == "ပြင်"
+        assert clean_for_alignment_keep_vowel_signs(s, c) == clean_for_alignment(s, c)

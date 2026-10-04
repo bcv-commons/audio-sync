@@ -38,7 +38,6 @@ Usage:
 """
 
 import json
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -49,14 +48,12 @@ from mms_align_words import (
     align_window,
     compute_file_emission,
     load_audio,
-    load_mms_model,
-    select_device,
 )
 from text_processing import (
-    clean_for_alignment,
+    clean_for_alignment_keep_vowel_signs,
     format_verse_id,
-    load_language_config,
     read_verse_texts,
+    uses_vowel_sign_script,
 )
 from vowel_pacing import count_vowels
 
@@ -101,6 +98,33 @@ MIN_LOCAL_SCORE = 0.35
 #   anchored-star-v3 (2026-10-03): wide + narrow candidate per verse
 #   (see ALT_WINDOW).
 ALIGNMENT_METHOD = "anchored-star-v3"
+#   anchored-star-v4 (2026-10-03): v3 + vowel signs kept for
+#   VOWEL_SIGN_SCRIPTS (text_processing.clean_for_alignment_keep_vowel_signs).
+#   Only chapters whose text uses those scripts get v4 -- for every other
+#   chapter v4 would be byte-identical to v3, so v3 stays current there and
+#   the redo does not redo them (see expected_method / is_current_method).
+VOWEL_SIGN_METHOD = "anchored-star-v4"
+
+
+def expected_method(verse_texts: list[str]) -> str:
+    """The method tag a chapter with this (uncleaned) text gets today."""
+    return VOWEL_SIGN_METHOD if any(uses_vowel_sign_script(v) for v in verse_texts) else ALIGNMENT_METHOD
+
+
+def is_current_method(tag: str | None, text_path: Path | None, config=None) -> bool:
+    """Whether a chapter tagged `tag` is already aligned with today's method.
+    v3 output counts as current unless its text uses a vowel-sign script."""
+    if tag == VOWEL_SIGN_METHOD:
+        return True
+    if tag != ALIGNMENT_METHOD:
+        return False
+    if text_path is None or not Path(text_path).exists():
+        return True
+    try:
+        raw = Path(text_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return True
+    return not uses_vowel_sign_script(raw)
 
 # Chapter gate (decided 2026-10-03 from a 121-language DBT comparison): a
 # chapter where more than GATE_MAX_LOW_SHARE of its verses score below
@@ -493,7 +517,7 @@ def process_chapter_verse_only(
 
     verse_texts = read_verse_texts(text_path, config)
 
-    cleaned_verses = [clean_for_alignment(v, config) for v in verse_texts]
+    cleaned_verses = [clean_for_alignment_keep_vowel_signs(v, config) for v in verse_texts]
     non_empty_verses = [v for v in cleaned_verses if v]
     total_words = sum(len(v.split()) for v in non_empty_verses)
 
@@ -525,7 +549,7 @@ def process_chapter_verse_only(
     result_iter = iter(results)
     for vi, verse_text in enumerate(verse_texts):
         verse_num = vi + 1
-        cleaned = clean_for_alignment(verse_text, config)
+        cleaned = clean_for_alignment_keep_vowel_signs(verse_text, config)
 
         if not cleaned:
             pos.append(round(prev_time, 2))
@@ -575,7 +599,7 @@ def process_chapter_verse_only(
             "from_whisper": 0,
             "from_mms": len(all_scores),
             "low_quality_verses": low_quality_verses,
-            "method": ALIGNMENT_METHOD,
+            "method": expected_method(verse_texts),
         },
     }
 

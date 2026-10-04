@@ -36,7 +36,7 @@ def _run(tmp_path, monkeypatch, scores, with_dbt):
     class Cfg:
         mms_fallback_threshold = 0.3
     monkeypatch.setattr(avw, "read_verse_texts", lambda p, c: txt.read_text().split("\n"))
-    monkeypatch.setattr(avw, "clean_for_alignment", lambda v, c: v)
+    monkeypatch.setattr(avw, "clean_for_alignment_keep_vowel_signs", lambda v, c: v)
     item = {"book": "MAT", "chapter": 1, "chapter_str": "001", "audio_path": mp3, "text_path": txt,
             "timing_path": out / "MAT_001_XN1DA_timing.json", "words_path": out / "MAT_001_XN1DA_words.json",
             "quality_path": out / "MAT_001_XN1DA_words_quality.json"}
@@ -71,3 +71,15 @@ def test_quality_file_carries_method_tag(tmp_path, monkeypatch):
     _, item = _run(tmp_path, monkeypatch, [0.9] * 10, with_dbt=False)
     assert alignment_method(item["quality_path"]) == avw.ALIGNMENT_METHOD
     assert alignment_method(tmp_path / "missing.json") is None
+
+
+def test_method_tag_depends_on_script(tmp_path):
+    assert avw.expected_method(["In the beginning"]) == avw.ALIGNMENT_METHOD
+    assert avw.expected_method(["भारत का"]) == avw.VOWEL_SIGN_METHOD
+    latin = tmp_path / "a.txt"; latin.write_text("In the beginning\n")
+    deva = tmp_path / "b.txt"; deva.write_text("भारत का\n")
+    assert avw.is_current_method(avw.ALIGNMENT_METHOD, latin)
+    assert not avw.is_current_method(avw.ALIGNMENT_METHOD, deva)
+    assert avw.is_current_method(avw.VOWEL_SIGN_METHOD, deva)
+    assert not avw.is_current_method("anchored-star-v2", latin)
+    assert not avw.is_current_method(None, latin)

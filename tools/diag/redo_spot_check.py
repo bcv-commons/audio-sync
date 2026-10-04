@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Spot-check the verse-only redo while it runs.
 
-For every chapter already tagged with the current ALIGNMENT_METHOD:
+For every chapter already tagged with the current method (v3, or v4 for
+vowel-sign scripts):
   - per language: chapters redone, chapter-gate outcome (pass / held_back /
     defer_to_dbt), share of verses scoring below the gate score;
   - where DBT has its own timing for the same fileset on disk: share of
@@ -21,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "pipeline"))
-from align_verse_words import ALIGNMENT_METHOD, GATE_LOW_SCORE  # noqa: E402
+from align_verse_words import ALIGNMENT_METHOD, GATE_LOW_SCORE, VOWEL_SIGN_METHOD  # noqa: E402
 
 TIMING_DIR = Path("export/timing-data")
 DOWNLOADS_DIR = Path("downloads/BB")
@@ -68,7 +69,7 @@ def main():
             except (OSError, json.JSONDecodeError):
                 continue
             summary = data.get("summary") or {}
-            if summary.get("method") != ALIGNMENT_METHOD:
+            if summary.get("method") not in (ALIGNMENT_METHOD, VOWEL_SIGN_METHOD):
                 continue
             rel = q.relative_to(TIMING_DIR)
             L = langs[rel.parts[1]]
@@ -101,7 +102,7 @@ def main():
     for L in langs.values():
         for k, v in L.items():
             tot[k] += v
-    print(f"Redone chapters (method {ALIGNMENT_METHOD}): {tot['chapters']} in {len(langs)} languages")
+    print(f"Redone chapters (method {ALIGNMENT_METHOD} / {VOWEL_SIGN_METHOD}): {tot['chapters']} in {len(langs)} languages")
     print(f"  gate: pass {tot['pass']}, held_back {tot['held_back']}, defer_to_dbt {tot['defer_to_dbt']}")
     if tot["verses"]:
         print(f"  verses scoring below {GATE_LOW_SCORE}: {tot['low_verses']}/{tot['verses']} "
