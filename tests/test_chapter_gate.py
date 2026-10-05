@@ -79,6 +79,8 @@ def test_method_tag_depends_on_script(tmp_path):
     latin = tmp_path / "a.txt"; latin.write_text("In the beginning\n")
     deva = tmp_path / "b.txt"; deva.write_text("भारत का\n")
     assert avw.is_current_method(avw.ALIGNMENT_METHOD, latin)
+    assert not avw.is_current_method(avw.ALIGNMENT_METHOD, tmp_path / "missing.txt")
+    assert not avw.is_current_method(avw.ALIGNMENT_METHOD, None)
     assert not avw.is_current_method(avw.ALIGNMENT_METHOD, deva)
     assert avw.is_current_method(avw.VOWEL_SIGN_METHOD, deva)
     assert not avw.is_current_method("anchored-star-v2", latin)

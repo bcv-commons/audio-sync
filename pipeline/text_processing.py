@@ -390,7 +390,9 @@ def clean_for_alignment_keep_vowel_signs(text: str, config: LanguageConfig) -> s
         cat = unicodedata.category(c)
         if cat[0] in "LN" or c.isspace() or _vowel_sign_mark(c):
             kept.append(c)
-        elif cat[0] != "M":
+        elif cat[0] == "M" or cat == "Cf":
+            continue                  # other marks; zero-width (non-)joiners sit INSIDE words
+        else:
             kept.append(" ")          # punctuation etc. separates words
     return re.sub(r"\s+", " ", "".join(kept)).strip()
 

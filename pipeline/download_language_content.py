@@ -72,6 +72,12 @@ API_RATE_DELAY = 0.0  # seconds between API calls, set via --rate-delay
 
 # Directories
 OUTPUT_DIR = Path("downloads/BB")
+
+# The alternate recording (the dramatized one next to a standard reading) is
+# only ever aligned when no standard recording exists, so a tool that only
+# aligns (tools/run_gpu_redo.py) sets this to skip fetching it -- it
+# doubled download time and filled the disk with unused audio.
+SKIP_ALT_AUDIO = False
 ERROR_LOG_DIR = Path("download_log")
 # CROSSREF_PATH / _load_crossref() below is MONO's own naming-convention
 # ebible crossref — same unverified-guessing category as the old helloAO ID
@@ -2063,7 +2069,7 @@ def download_chapter(
     # Download alt audio (if available and requested) — failure is not
     # critical, so its return value is intentionally ignored (matches the
     # pre-existing `pass` here, just routed through the claim guard now).
-    if alt_audio_fileset and "audio" in content_types:
+    if alt_audio_fileset and "audio" in content_types and not SKIP_ALT_AUDIO:
         alt_audio_file = base_dir / f"{book}_{chapter:03d}_{alt_audio_fileset}.mp3"
         _fetch_with_claim(
             alt_audio_file, force, stats, f"{alt_audio_file.name} (alt)",

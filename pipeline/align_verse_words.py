@@ -113,17 +113,20 @@ def expected_method(verse_texts: list[str]) -> str:
 
 def is_current_method(tag: str | None, text_path: Path | None, config=None) -> bool:
     """Whether a chapter tagged `tag` is already aligned with today's method.
-    v3 output counts as current unless its text uses a vowel-sign script."""
+    v3 output counts as current unless its text uses a vowel-sign script (or
+    the text is unavailable, so that cannot be ruled out)."""
     if tag == VOWEL_SIGN_METHOD:
         return True
     if tag != ALIGNMENT_METHOD:
         return False
+    # Without the text we cannot tell whether this chapter needs v4, so it
+    # counts as not current: the redo then fetches the text and decides.
     if text_path is None or not Path(text_path).exists():
-        return True
+        return False
     try:
         raw = Path(text_path).read_text(encoding="utf-8", errors="ignore")
     except OSError:
-        return True
+        return False
     return not uses_vowel_sign_script(raw)
 
 # Chapter gate (decided 2026-10-03 from a 121-language DBT comparison): a
@@ -187,8 +190,6 @@ def verse_anchored_align(
     min_window_seconds: float = MIN_WINDOW_SECONDS,
     min_local_score: float = MIN_LOCAL_SCORE,
     alt_window: tuple[float, float] | None = ALT_WINDOW,
-    choose_window=None,
-    reanchor_below: float | None = None,
 ) -> list[dict]:
     """Align each verse independently within a window anchored to an
     expected-pace position. Adapted from align_obs_words.py's
@@ -232,12 +233,18 @@ def verse_anchored_align(
     for i, (verse_text, wc) in enumerate(zip(non_empty_verses, pace_weights)):
         exp_start = expected_starts[i]
         exp_dur = total_duration * wc / total_pace_weight
-        def _try_window(frac, min_sec, lower=None):
+        min_required = exp_dur * 1.3 + 2.0
+
+        def _bounds(frac, min_sec):
             w = max(exp_dur * frac, min_sec)
-            ws = max(floor if lower is None else lower, exp_start - w)
+            ws = max(floor, exp_start - w)
             we = min(total_duration, exp_start + exp_dur + w)
             if we - ws < min_required:
                 we = min(total_duration, ws + min_required)
+            return w, ws, we
+
+        def _try_window(bounds):
+            w, ws, we = bounds
             if we - ws < 1.0:
                 return w, ws, we, []
             try:
@@ -255,36 +262,23 @@ def verse_anchored_align(
             sc = [x["score"] for x in words if x["score"] > 0]
             return sum(sc) / len(sc) if sc else 0.0
 
-        min_required = exp_dur * 1.3 + 2.0
-        window, win_start, win_end, local_words = _try_window(window_frac, min_window_seconds)
+        def _merit(words):
+            if not words or words[0]["start"] is None:
+                return 0.0
+            return _avg(words) - WINDOW_GAP_PENALTY * abs(words[0]["start"] - floor)
+
+        primary = _bounds(window_frac, min_window_seconds)
+        window, win_start, win_end, local_words = _try_window(primary)
         if alt_window is not None:
             # Same verse, second window size; keep the better of the two
-            # (default rule: see ALT_WINDOW / WINDOW_GAP_PENALTY).
-            # choose_window can replace that rule (True = take the alternative).
-            alt = _try_window(*alt_window)
-            if choose_window is not None:
-                take_alt = choose_window(
-                    primary=local_words, alternative=alt[3], floor=floor,
-                    exp_start=exp_start, exp_dur=exp_dur, verse_text=verse_text,
-                    emission=emission, total_duration=total_duration,
-                )
-            else:
-                def _merit(words):
-                    if not words or words[0]["start"] is None:
-                        return 0.0
-                    return _avg(words) - WINDOW_GAP_PENALTY * abs(words[0]["start"] - floor)
-                take_alt = bool(alt[3]) and (not local_words or _merit(alt[3]) > _merit(local_words))
-            if take_alt:
-                window, win_start, win_end, local_words = alt
-        if reanchor_below is not None and _avg(local_words) < reanchor_below and results:
-            # Low confidence usually means the floor (the previous verse's
-            # end) is already past this verse -- an earlier overshoot that
-            # would otherwise drag every following verse late. Retry with the
-            # window allowed to start back at the previous verse's START.
-            retry = _try_window(*(alt_window or (window_frac, min_window_seconds)),
-                                lower=results[-1]["start"])
-            if _avg(retry[3]) > _avg(local_words):
-                window, win_start, win_end, local_words = retry
+            # (rule: see ALT_WINDOW / WINDOW_GAP_PENALTY). Clamped to the
+            # chapter and the floor the two often coincide (short chapters,
+            # first/last verse): the same window gives the same answer.
+            alt_bounds = _bounds(*alt_window)
+            if alt_bounds[1:] != primary[1:]:
+                alt = _try_window(alt_bounds)
+                if alt[3] and (not local_words or _merit(alt[3]) > _merit(local_words)):
+                    window, win_start, win_end, local_words = alt
 
         scores = [w["score"] for w in local_words if w["score"] > 0]
         local_avg = sum(scores) / len(scores) if scores else 0.0
@@ -349,6 +343,13 @@ def verse_anchored_align(
         # last verse's own alt-window rescue (used_alt_window) -- that path
         # already has its own tested, floor-independent rationale (see
         # above) and re-litigating it here isn't worth the added risk.
+        # Measured 2026-10-04 (/code-review flagged this): the pacing cross-check
+        # below is judged against the window of the candidate that won, which is
+        # the wide one whenever it won, so it rarely triggers. Judging it against
+        # the narrow (pre-padding) size instead made results WORSE on the DBT
+        # sample (6.94% -> 7.44% of verses >1 s off, 90 verse starts changed,
+        # 16 languages worse): where the reading runs ahead of the pace estimate
+        # the far match is the right one and the cross-check rejects it.
         natural_win_end = exp_start + exp_dur + window
         if local_words and local_avg >= min_local_score and not used_alt_window:
             cand_start = local_words[0]["start"]

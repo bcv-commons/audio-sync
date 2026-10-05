@@ -36,6 +36,12 @@ def test_progress_age_uses_newest_of_marker_heartbeat_and_start(tmp_path):
 
 # ── "is this chapter already done" ──────────────────────────────────────────
 
+def _text(chapter: str):
+    d = Path("downloads/BB/nt/abc/ABCXYZ/MAT")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"MAT_{chapter}_ABCXYZN_ET.txt").write_text("In the beginning\n")
+
+
 def _quality(path: Path, method: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"summary": {"method": method}}))
@@ -43,6 +49,8 @@ def _quality(path: Path, method: str):
 
 def test_chapter_is_current_looks_at_every_recording(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    for c in ("001", "002", "003"):
+        _text(c)
     out = Path("export/timing-data/nt/abc/ABCXYZ/MAT")
     standard = out / "MAT_001_ABCXYZN1DA_timing.json"
     drama = out / "MAT_001_ABCXYZN2DA_timing.json"
@@ -55,6 +63,18 @@ def test_chapter_is_current_looks_at_every_recording(tmp_path, monkeypatch):
     _quality(out / "MAT_002_ABCXYZN1DA_words_quality.json", "anchored-star-v1")
     assert not redo.chapter_is_current(out / "MAT_002_ABCXYZN1DA_timing.json")
     assert not redo.chapter_is_current(out / "MAT_003_ABCXYZN1DA_timing.json")
+
+
+def test_current_dramatized_copy_does_not_hide_a_stale_standard_recording(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _text("001"); _text("002")
+    out = Path("export/timing-data/nt/abc/ABCXYZ/MAT")
+    _quality(out / "MAT_001_ABCXYZN1DA_words_quality.json", "anchored-star-v1")
+    _quality(out / "MAT_001_ABCXYZN2DA_words_quality.json", ALIGNMENT_METHOD)
+    assert not redo.chapter_is_current(out / "MAT_001_ABCXYZN1DA_timing.json")
+    # no standard recording: the dramatized one is what gets aligned
+    _quality(out / "MAT_002_ABCXYZN2DA_words_quality.json", ALIGNMENT_METHOD)
+    assert redo.chapter_is_current(out / "MAT_002_ABCXYZN2DA_timing.json")
 
 
 # ── supervisor: a hung worker is quarantined and restarted ───────────────────
@@ -86,3 +106,12 @@ def test_supervisor_quarantines_a_hung_worker_and_restarts(tmp_path):
     quarantined = json.loads((tmp_path / "q.json").read_text())["chapters"]
     assert quarantined == [{"path": "x/CH_1_timing.json", "reason": "HANG"}]
     assert "Attempt 2" in run.stdout + run.stderr
+
+
+def test_chapter_without_text_on_disk_is_not_current(tmp_path, monkeypatch):
+    # v3 output cannot be called current without the text: a vowel-sign script
+    # chapter would need v4
+    monkeypatch.chdir(tmp_path)
+    out = Path("export/timing-data/nt/abc/ABCXYZ/MAT")
+    _quality(out / "MAT_001_ABCXYZN1DA_words_quality.json", ALIGNMENT_METHOD)
+    assert not redo.chapter_is_current(out / "MAT_001_ABCXYZN1DA_timing.json")

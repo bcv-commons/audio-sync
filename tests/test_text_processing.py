@@ -147,3 +147,11 @@ def test_keep_vowel_signs_leaves_other_scripts_as_before():
     for s in ["ပြင်", "الْحَمْدُ", "Café — naïve", "שָׁלוֹם"]:
         assert not uses_vowel_sign_script(s) or s == "ပြင်"
         assert clean_for_alignment_keep_vowel_signs(s, c) == clean_for_alignment(s, c)
+
+
+def test_keep_vowel_signs_zero_width_joiners_do_not_split_words():
+    c = load_language_config("default")
+    malayalam = "ന്‍ ക്‌വ"   # chillu (ZWJ) and a ZWNJ inside a word
+    out = clean_for_alignment_keep_vowel_signs(malayalam, c)
+    assert "‍" not in out and "‌" not in out
+    assert len(out.split()) == 2
